@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "blueprint",
+  "version": "0.1.0",
+  "identifier": "kr.blueprint.plant",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1421",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      { "label": "field", "title": "blueprint 현장 순시 · 정비 단말", "width": 1280, "height": 860 },
+      { "label": "console", "title": "blueprint 1.2GW 발전소 관제 콘솔 (주제어실)", "width": 1920, "height": 1080, "maximized": true }
+    ],
+    "security": { "csp": null }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
+  }
+}

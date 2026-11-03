@@ -1,0 +1,264 @@
+{
+  "version": 1,
+  "as_of": "2026-11-04",
+  "note": "모두 합성 데이터입니다. 실제 발전소 · 설비 · 사람이 아닙니다. 정의는 docs/synthetic-plant-data.md 에 있습니다.",
+  "plant": {
+    "name": "제1발전소 (합성)",
+    "kind": "1.2GW 초초임계압(USC) 석탄화력",
+    "units": [
+      { "code": "10", "label": "1호기", "capacity_mw": 1200 },
+      { "code": "20", "label": "2호기", "capacity_mw": 1200 },
+      { "code": "00", "label": "공용설비", "capacity_mw": 0 }
+    ]
+  },
+  "sectors": [
+    { "key": "boiler", "code": "Sector01Boiler", "building": "101동", "label": "보일러동", "kks": "10UHA", "drawing": "PID-101-HAD", "blurb": "과열기 · 재열기 · 미분탄기 · 버너 계통" },
+    { "key": "turbine", "code": "Sector02Turbine", "building": "102동", "label": "터빈건물", "kks": "10UMA", "drawing": "PID-102-MAA", "blurb": "고압 · 중압 · 저압터빈 · 발전기 · 윤활유 계통" },
+    { "key": "feedwater", "code": "Sector03Feedwater", "building": "103동", "label": "급수·보조펌프동", "kks": "10ULB", "drawing": "PID-103-LAB", "blurb": "주급수펌프 · 급수조절밸브 · 탈기기" },
+    { "key": "electric", "code": "Sector04Electric", "building": "104동", "label": "전기·제어동", "kks": "10UBA", "drawing": "PID-104-BBA", "blurb": "6.9kV 차단기 · 변압기 · UPS · 주제어실" },
+    { "key": "env", "code": "Sector05EnvSafety", "building": "105동", "label": "환경·통풍설비동", "kks": "10UQA", "drawing": "PID-105-HLB", "blurb": "유인통풍기 · 탈질 · 탈황 · 집진기" }
+  ],
+  "floors": [
+    { "code": "B1F", "label": "지하 1층", "elevation_m": -6.0 },
+    { "code": "1F", "label": "1층", "elevation_m": 0.0 },
+    { "code": "2F", "label": "2층", "elevation_m": 9.0 },
+    { "code": "3F", "label": "3층 운전층", "elevation_m": 18.0 },
+    { "code": "4F", "label": "4층", "elevation_m": 27.0 },
+    { "code": "5F", "label": "5층 보일러 상부", "elevation_m": 65.0 },
+    { "code": "OUT", "label": "옥외", "elevation_m": 0.0 }
+  ],
+  "drawings": [
+    { "id": "PID-101-HAD", "sector": "boiler", "title": "보일러 연소 및 증기 발생 계통도", "rev": "Rev.5", "issued": "2026-09-17", "signer": "E102" },
+    { "id": "PID-102-MAA", "sector": "turbine", "title": "주증기 터빈 및 발전기 계통도", "rev": "Rev.4", "issued": "2026-06-02", "signer": "E118" },
+    { "id": "PID-103-LAB", "sector": "feedwater", "title": "주급수펌프 및 고압급수 제어 계통도", "rev": "Rev.3", "issued": "2026-03-15", "signer": "E102" },
+    { "id": "PID-104-BBA", "sector": "electric", "title": "소내 전력 및 6.9kV 배전 계통도", "rev": "Rev.2", "issued": "2025-12-08", "signer": "E118" },
+    { "id": "PID-105-HLB", "sector": "env", "title": "연소가스 처리 및 통풍 계통도", "rev": "Rev.2", "issued": "2026-01-20", "signer": "E102" }
+  ],
+  "equipment": [
+    { "kks": "10HFC10AJ001", "name": "미분탄기 A", "sector": "boiler", "floor": "1F", "drawing": "PID-101-HAD", "kind": "mill", "bbox": [0.140, 0.130, 0.305, 0.255] },
+    { "kks": "10HLA10AN001", "name": "압입통풍기 A", "sector": "boiler", "floor": "1F", "drawing": "PID-101-HAD", "kind": "fan", "bbox": [0.325, 0.130, 0.490, 0.255] },
+    { "kks": "10HHD10AV001", "name": "연소 버너", "sector": "boiler", "floor": "3F", "drawing": "PID-101-HAD", "kind": "burner", "bbox": [0.510, 0.130, 0.675, 0.255] },
+    { "kks": "10HAD10BB001", "name": "수냉벽 · 노", "sector": "boiler", "floor": "3F", "drawing": "PID-101-HAD", "kind": "furnace", "bbox": [0.140, 0.310, 0.305, 0.435] },
+    { "kks": "10HAH10BB001", "name": "최종과열기", "sector": "boiler", "floor": "5F", "drawing": "PID-101-HAD", "kind": "superheater", "bbox": [0.325, 0.310, 0.490, 0.435] },
+    { "kks": "10HAJ10BB001", "name": "재열기", "sector": "boiler", "floor": "5F", "drawing": "PID-101-HAD", "kind": "reheater", "bbox": [0.510, 0.490, 0.675, 0.615] },
+
+    { "kks": "10MAA10AA001", "name": "주증기밸브", "sector": "turbine", "floor": "3F", "drawing": "PID-102-MAA", "kind": "valve", "bbox": [0.140, 0.130, 0.305, 0.255] },
+    { "kks": "10MAA10ST001", "name": "고압터빈", "sector": "turbine", "floor": "3F", "drawing": "PID-102-MAA", "kind": "turbine", "bbox": [0.325, 0.130, 0.490, 0.255] },
+    { "kks": "10MAB10ST001", "name": "중압터빈", "sector": "turbine", "floor": "3F", "drawing": "PID-102-MAA", "kind": "turbine", "bbox": [0.510, 0.130, 0.675, 0.255] },
+    { "kks": "10MAC10ST001", "name": "저압터빈", "sector": "turbine", "floor": "3F", "drawing": "PID-102-MAA", "kind": "turbine", "bbox": [0.695, 0.130, 0.860, 0.255] },
+    { "kks": "10MAX10AP001", "name": "제어유 펌프", "sector": "turbine", "floor": "1F", "drawing": "PID-102-MAA", "kind": "pump", "bbox": [0.140, 0.310, 0.305, 0.435] },
+    { "kks": "10MAD10AB001", "name": "고압터빈 1번 베어링", "sector": "turbine", "floor": "3F", "drawing": "PID-102-MAA", "kind": "bearing", "bbox": [0.325, 0.310, 0.490, 0.435] },
+    { "kks": "10MKA10GS001", "name": "발전기", "sector": "turbine", "floor": "3F", "drawing": "PID-102-MAA", "kind": "generator", "bbox": [0.510, 0.310, 0.675, 0.435] },
+    { "kks": "10MAG10AC001", "name": "복수기", "sector": "turbine", "floor": "B1F", "drawing": "PID-102-MAA", "kind": "condenser", "bbox": [0.695, 0.310, 0.860, 0.435] },
+    { "kks": "10MAV10AH001", "name": "윤활유 냉각기", "sector": "turbine", "floor": "1F", "drawing": "PID-102-MAA", "kind": "cooler", "bbox": [0.325, 0.490, 0.490, 0.615] },
+
+    { "kks": "10LCA10AP001", "name": "복수펌프 A", "sector": "feedwater", "floor": "B1F", "drawing": "PID-103-LAB", "kind": "pump", "bbox": [0.140, 0.130, 0.305, 0.255] },
+    { "kks": "10LCC10AC001", "name": "저압급수가열기", "sector": "feedwater", "floor": "2F", "drawing": "PID-103-LAB", "kind": "heater", "bbox": [0.325, 0.130, 0.490, 0.255] },
+    { "kks": "10LAA10BB001", "name": "탈기기", "sector": "feedwater", "floor": "4F", "drawing": "PID-103-LAB", "kind": "deaerator", "bbox": [0.510, 0.130, 0.675, 0.255] },
+    { "kks": "10PAB10AP001", "name": "해수 순환수펌프 A", "sector": "feedwater", "floor": "B1F", "drawing": "PID-103-LAB", "kind": "pump", "bbox": [0.695, 0.490, 0.860, 0.615] },
+    { "kks": "10LAB10AP001", "name": "주급수펌프 A", "sector": "feedwater", "floor": "1F", "drawing": "PID-103-LAB", "kind": "pump", "bbox": [0.325, 0.310, 0.490, 0.435] },
+    { "kks": "10LAB20AA102", "name": "주급수 유량조절밸브", "sector": "feedwater", "floor": "2F", "drawing": "PID-103-LAB", "kind": "valve", "bbox": [0.695, 0.310, 0.860, 0.435] },
+
+    { "kks": "10BAT10GT001", "name": "주변압기", "sector": "electric", "floor": "OUT", "drawing": "PID-104-BBA", "kind": "transformer", "bbox": [0.140, 0.130, 0.305, 0.255] },
+    { "kks": "10BBT10GT001", "name": "소내보조변압기", "sector": "electric", "floor": "OUT", "drawing": "PID-104-BBA", "kind": "transformer", "bbox": [0.325, 0.130, 0.490, 0.255] },
+    { "kks": "10BBA10CB001", "name": "6.9kV 급수펌프 차단기", "sector": "electric", "floor": "1F", "drawing": "PID-104-BBA", "kind": "breaker", "bbox": [0.695, 0.130, 0.860, 0.255] },
+    { "kks": "10BBA20CB001", "name": "6.9kV 복수펌프 차단기", "sector": "electric", "floor": "1F", "drawing": "PID-104-BBA", "kind": "breaker", "bbox": [0.695, 0.310, 0.860, 0.435] },
+    { "kks": "10BBA30CB001", "name": "6.9kV 통풍기 차단기", "sector": "electric", "floor": "1F", "drawing": "PID-104-BBA", "kind": "breaker", "bbox": [0.695, 0.490, 0.860, 0.615] },
+    { "kks": "10BJA10GH001", "name": "480V MCC", "sector": "electric", "floor": "2F", "drawing": "PID-104-BBA", "kind": "mcc", "bbox": [0.140, 0.490, 0.305, 0.615] },
+    { "kks": "10BRA10GU001", "name": "무정전 전원장치(UPS)", "sector": "electric", "floor": "2F", "drawing": "PID-104-BBA", "kind": "ups", "bbox": [0.325, 0.490, 0.490, 0.615] },
+    { "kks": "10CJA10CR001", "name": "주제어실 DCS", "sector": "electric", "floor": "3F", "drawing": "PID-104-BBA", "kind": "control", "bbox": [0.510, 0.490, 0.675, 0.615] },
+
+    { "kks": "10HNA10AT001", "name": "탈질 설비(SCR)", "sector": "env", "floor": "2F", "drawing": "PID-105-HLB", "kind": "scr", "bbox": [0.140, 0.130, 0.305, 0.255] },
+    { "kks": "10HLC10AT001", "name": "전기집진기", "sector": "env", "floor": "1F", "drawing": "PID-105-HLB", "kind": "esp", "bbox": [0.325, 0.130, 0.490, 0.255] },
+    { "kks": "10HLB10AN001", "name": "유인통풍기 A", "sector": "env", "floor": "1F", "drawing": "PID-105-HLB", "kind": "fan", "bbox": [0.510, 0.310, 0.675, 0.435] },
+    { "kks": "10HTB10BB001", "name": "탈황 흡수탑", "sector": "env", "floor": "2F", "drawing": "PID-105-HLB", "kind": "fgd", "bbox": [0.695, 0.130, 0.860, 0.255] },
+    { "kks": "10HTA10BB001", "name": "연돌", "sector": "env", "floor": "OUT", "drawing": "PID-105-HLB", "kind": "stack", "bbox": [0.695, 0.490, 0.860, 0.615] }
+  ],
+  "sensors": [
+    { "tag": "10HFC10CT001", "kks": "10HFC10AJ001", "label": "미분탄기 출구 온도", "unit": "°C", "normal": 75.0, "alarm_high": 95.0, "trip_high": 110.0, "deadband": 1.0, "max_slew": 10.0 },
+    { "tag": "10HLA10CE001", "kks": "10HLA10AN001", "label": "압입통풍기 전류", "unit": "A", "normal": 220.0, "alarm_high": 300.0, "deadband": 5.0, "max_slew": 80.0 },
+    { "tag": "10HAD10CP101", "kks": "10HAD10BB001", "label": "노내 압력", "unit": "kPa", "normal": -0.1, "alarm_high": 0.5, "trip_high": 1.5, "deadband": 0.03, "max_slew": 1.0 },
+    { "tag": "10HAH10CT001", "kks": "10HAH10BB001", "label": "과열기 출구 증기 온도", "unit": "°C", "normal": 610.0, "alarm_high": 625.0, "trip_high": 645.0, "deadband": 1.0, "max_slew": 20.0 },
+    { "tag": "10HAJ10CT001", "kks": "10HAJ10BB001", "label": "재열기 출구 온도", "unit": "°C", "normal": 620.0, "alarm_high": 635.0, "trip_high": 645.0, "deadband": 1.0, "max_slew": 20.0 },
+
+    { "tag": "10MAA10CP001", "kks": "10MAA10ST001", "label": "주증기 압력", "unit": "MPa", "normal": 26.0, "alarm_low": 22.0, "trip_low": 18.0, "deadband": 0.1, "max_slew": 3.0 },
+    { "tag": "10MAD10CY001", "kks": "10MAD10AB001", "label": "베어링 진동", "unit": "µm", "normal": 45.0, "alarm_high": 200.0, "trip_high": 250.0, "deadband": 3.0, "max_slew": 60.0 },
+    { "tag": "10MAV10CT001", "kks": "10MAV10AH001", "label": "윤활유 출구 온도", "unit": "°C", "normal": 45.0, "alarm_high": 55.0, "trip_high": 65.0, "deadband": 0.5, "max_slew": 5.0 },
+    { "tag": "10MKA10CE001", "kks": "10MKA10GS001", "label": "발전기 출력", "unit": "MW", "normal": 1200.0, "alarm_low": 900.0, "deadband": 5.0, "max_slew": 200.0 },
+    { "tag": "10MAG10CP001", "kks": "10MAG10AC001", "label": "복수기 압력", "unit": "kPa", "normal": 5.0, "alarm_high": 10.0, "trip_high": 15.0, "deadband": 0.1, "max_slew": 2.0 },
+    { "tag": "10MAX10CP001", "kks": "10MAX10AP001", "label": "제어유 압력", "unit": "MPa", "normal": 14.0, "alarm_low": 11.0, "deadband": 0.1, "max_slew": 3.0 },
+
+    { "tag": "10LCA10CF001", "kks": "10LCA10AP001", "label": "복수 유량", "unit": "t/h", "normal": 1500.0, "alarm_low": 1100.0, "deadband": 15.0, "max_slew": 300.0 },
+    { "tag": "10LAA10CL001", "kks": "10LAA10BB001", "label": "탈기기 수위", "unit": "%", "normal": 50.0, "alarm_low": 30.0, "alarm_high": 70.0, "deadband": 0.5, "max_slew": 5.0 },
+    { "tag": "10LAB10CP001", "kks": "10LAB10AP001", "label": "토출 압력", "unit": "MPa", "normal": 28.5, "alarm_high": 29.0, "trip_high": 33.0, "deadband": 0.05, "max_slew": 3.0 },
+    { "tag": "10LAB10CY001", "kks": "10LAB10AP001", "label": "베어링 진동", "unit": "µm", "normal": 44.0, "alarm_high": 120.0, "trip_high": 180.0, "deadband": 3.0, "max_slew": 60.0 },
+    { "tag": "10LAB20CG102", "kks": "10LAB20AA102", "label": "밸브 개도", "unit": "%", "normal": 78.0, "alarm_low": 45.0, "deadband": 0.5, "max_slew": 100.0 },
+    { "tag": "10LAB20CF001", "kks": "10LAB20AA102", "label": "급수 유량", "unit": "t/h", "normal": 1850.0, "alarm_low": 1400.0, "deadband": 15.0, "max_slew": 800.0 },
+
+    { "tag": "10BAT10CT001", "kks": "10BAT10GT001", "label": "변압기 유온", "unit": "°C", "normal": 65.0, "alarm_high": 85.0, "trip_high": 95.0, "deadband": 0.5, "max_slew": 3.0 },
+    { "tag": "10BBA10CE001", "kks": "10BBA10CB001", "label": "차단기 전류", "unit": "A", "normal": 410.0, "alarm_high": 520.0, "trip_high": 600.0, "deadband": 5.0, "max_slew": 400.0 },
+
+    { "tag": "10HNA10CQ001", "kks": "10HNA10AT001", "label": "NH3 슬립", "unit": "ppm", "normal": 1.5, "alarm_high": 3.0, "trip_high": 5.0, "deadband": 0.1, "max_slew": 2.0 },
+    { "tag": "10HLB10CE001", "kks": "10HLB10AN001", "label": "유인통풍기 전류", "unit": "A", "normal": 360.0, "alarm_low": 250.0, "deadband": 5.0, "max_slew": 200.0 },
+    { "tag": "10HTB10CQ001", "kks": "10HTB10BB001", "label": "SO2 배출 농도", "unit": "ppm", "normal": 20.0, "alarm_high": 50.0, "deadband": 1.0, "max_slew": 20.0 }
+  ],
+  "edges": [
+    { "from": "10MKA10GS001", "to": "10BAT10GT001", "medium": "power", "label": "발전 출력 22kV", "lag": [0.0, 0.2] },
+    { "from": "10BAT10GT001", "to": "10BBT10GT001", "medium": "power", "label": "소내 공급", "lag": [0.0, 0.2] },
+    { "from": "10BBT10GT001", "to": "10BBA10CB001", "medium": "power", "label": "6.9kV 모선", "lag": [0.0, 0.2] },
+    { "from": "10BBT10GT001", "to": "10BBA20CB001", "medium": "power", "label": "6.9kV 모선", "lag": [0.0, 0.2] },
+    { "from": "10BBT10GT001", "to": "10BBA30CB001", "medium": "power", "label": "6.9kV 모선", "lag": [0.0, 0.2] },
+    { "from": "10BBT10GT001", "to": "10BJA10GH001", "medium": "power", "label": "480V 공급", "lag": [0.0, 0.2] },
+    { "from": "10BJA10GH001", "to": "10BRA10GU001", "medium": "power", "label": "UPS 입력", "lag": [0.0, 0.2] },
+    { "from": "10BRA10GU001", "to": "10CJA10CR001", "medium": "power", "label": "제어 전원", "lag": [0.0, 0.2] },
+    { "from": "10BBA10CB001", "to": "10LAB10AP001", "medium": "power", "label": "6.9kV 전원", "lag": [0.0, 0.5], "flow_tag": "10BBA10CE001" },
+    { "from": "10BBA20CB001", "to": "10LCA10AP001", "medium": "power", "label": "6.9kV 전원", "lag": [0.0, 0.5] },
+    { "from": "10BBA30CB001", "to": "10HLB10AN001", "medium": "power", "label": "6.9kV 전원", "lag": [0.0, 0.5] },
+
+    { "from": "10MAG10AC001", "to": "10LCA10AP001", "medium": "condensate", "label": "복수", "lag": [1.0, 6.0] },
+    { "from": "10LCA10AP001", "to": "10LCC10AC001", "medium": "condensate", "label": "복수", "lag": [1.0, 5.0], "flow_tag": "10LCA10CF001" },
+    { "from": "10LCC10AC001", "to": "10LAA10BB001", "medium": "condensate", "label": "복수", "lag": [1.0, 5.0] },
+    { "from": "10LAA10BB001", "to": "10LAB10AP001", "medium": "feedwater", "label": "급수", "lag": [0.5, 3.0] },
+    { "from": "10LAB10AP001", "to": "10LAB20AA102", "medium": "feedwater", "label": "고압급수", "lag": [0.2, 2.0] },
+    { "from": "10LAB20AA102", "to": "10HAD10BB001", "medium": "feedwater", "label": "고압급수", "lag": [1.5, 8.0], "flow_tag": "10LAB20CF001" },
+    { "from": "10HAD10BB001", "to": "10HAH10BB001", "medium": "steam", "label": "포화증기", "lag": [0.5, 4.0] },
+    { "from": "10HAH10BB001", "to": "10MAA10AA001", "medium": "steam", "label": "주증기", "lag": [0.5, 3.0] },
+    { "from": "10MAA10AA001", "to": "10MAA10ST001", "medium": "steam", "label": "주증기", "lag": [0.1, 1.0] },
+    { "from": "10MAA10ST001", "to": "10HAJ10BB001", "medium": "steam", "label": "저온 재열증기", "lag": [1.0, 5.0] },
+    { "from": "10HAJ10BB001", "to": "10MAB10ST001", "medium": "steam", "label": "고온 재열증기", "lag": [1.0, 5.0] },
+    { "from": "10MAB10ST001", "to": "10MAC10ST001", "medium": "steam", "label": "크로스오버 증기", "lag": [0.5, 3.0] },
+    { "from": "10MAC10ST001", "to": "10MAG10AC001", "medium": "steam", "label": "배기 증기", "lag": [0.5, 3.0] },
+
+    { "from": "10MAA10ST001", "to": "10MAD10AB001", "medium": "shaft", "label": "회전축", "lag": [0.0, 0.5] },
+    { "from": "10MAA10ST001", "to": "10MKA10GS001", "medium": "shaft", "label": "터빈-발전기 축", "lag": [0.0, 0.5] },
+    { "from": "10MAC10ST001", "to": "10MKA10GS001", "medium": "shaft", "label": "터빈-발전기 축", "lag": [0.0, 0.5] },
+    { "from": "10MAV10AH001", "to": "10MAD10AB001", "medium": "oil", "label": "윤활유", "lag": [2.0, 20.0] },
+    { "from": "10MAX10AP001", "to": "10MAA10AA001", "medium": "oil", "label": "제어유", "lag": [0.2, 2.0] },
+    { "from": "10PAB10AP001", "to": "10MAG10AC001", "medium": "seawater", "label": "냉각 해수", "lag": [5.0, 30.0] },
+
+    { "from": "10HFC10AJ001", "to": "10HHD10AV001", "medium": "fuel", "label": "미분탄", "lag": [1.0, 6.0] },
+    { "from": "10HLA10AN001", "to": "10HHD10AV001", "medium": "air", "label": "연소 공기", "lag": [0.5, 3.0] },
+    { "from": "10HHD10AV001", "to": "10HAD10BB001", "medium": "gas", "label": "화염 · 연소가스", "lag": [0.1, 1.0] },
+    { "from": "10HAD10BB001", "to": "10HNA10AT001", "medium": "gas", "label": "연소가스", "lag": [1.0, 6.0] },
+    { "from": "10HNA10AT001", "to": "10HLC10AT001", "medium": "gas", "label": "연소가스", "lag": [1.0, 5.0] },
+    { "from": "10HLC10AT001", "to": "10HLB10AN001", "medium": "gas", "label": "연소가스", "lag": [0.5, 3.0] },
+    { "from": "10HLB10AN001", "to": "10HTB10BB001", "medium": "gas", "label": "연소가스", "lag": [1.0, 5.0] },
+    { "from": "10HTB10BB001", "to": "10HTA10BB001", "medium": "gas", "label": "배출가스", "lag": [2.0, 10.0] },
+    { "from": "10HLB10AN001", "to": "10HAD10BB001", "medium": "draft", "label": "흡인 통풍", "lag": [0.5, 4.0] }
+  ],
+  "connectors": [
+    { "id": "OPC-102-104", "from": "10MKA10GS001", "to": "10BAT10GT001", "out_bbox": [0.882, 0.310, 0.988, 0.410], "in_bbox": [0.012, 0.130, 0.118, 0.230] },
+    { "id": "OPC-104-103A", "from": "10BBA10CB001", "to": "10LAB10AP001", "out_bbox": [0.882, 0.130, 0.988, 0.230], "in_bbox": [0.012, 0.310, 0.118, 0.410] },
+    { "id": "OPC-104-103B", "from": "10BBA20CB001", "to": "10LCA10AP001", "out_bbox": [0.882, 0.310, 0.988, 0.410], "in_bbox": [0.012, 0.130, 0.118, 0.230] },
+    { "id": "OPC-104-105", "from": "10BBA30CB001", "to": "10HLB10AN001", "out_bbox": [0.882, 0.490, 0.988, 0.590], "in_bbox": [0.012, 0.310, 0.118, 0.410] },
+    { "id": "OPC-102-103", "from": "10MAG10AC001", "to": "10LCA10AP001", "out_bbox": [0.882, 0.130, 0.988, 0.230], "in_bbox": [0.012, 0.490, 0.118, 0.590] },
+    { "id": "OPC-103-101", "from": "10LAB20AA102", "to": "10HAD10BB001", "out_bbox": [0.882, 0.310, 0.988, 0.410], "in_bbox": [0.012, 0.310, 0.118, 0.410] },
+    { "id": "OPC-101-102A", "from": "10HAH10BB001", "to": "10MAA10AA001", "out_bbox": [0.882, 0.310, 0.988, 0.410], "in_bbox": [0.012, 0.130, 0.118, 0.230] },
+    { "id": "OPC-102-101", "from": "10MAA10ST001", "to": "10HAJ10BB001", "out_bbox": [0.882, 0.490, 0.988, 0.590], "in_bbox": [0.012, 0.490, 0.118, 0.590] },
+    { "id": "OPC-101-102B", "from": "10HAJ10BB001", "to": "10MAB10ST001", "out_bbox": [0.882, 0.490, 0.988, 0.590], "in_bbox": [0.012, 0.310, 0.118, 0.410] },
+    { "id": "OPC-103-102", "from": "10PAB10AP001", "to": "10MAG10AC001", "out_bbox": [0.882, 0.490, 0.988, 0.590], "in_bbox": [0.012, 0.490, 0.118, 0.590] },
+    { "id": "OPC-101-105", "from": "10HAD10BB001", "to": "10HNA10AT001", "out_bbox": [0.882, 0.130, 0.988, 0.230], "in_bbox": [0.012, 0.130, 0.118, 0.230] },
+    { "id": "OPC-105-101", "from": "10HLB10AN001", "to": "10HAD10BB001", "out_bbox": [0.882, 0.310, 0.988, 0.410], "in_bbox": [0.012, 0.130, 0.118, 0.230] }
+  ],
+  "voting": [
+    { "tag": "10MAA10CP001", "logic": "2oo3", "channels": ["A", "B", "C"], "tolerance": 1.0 }
+  ],
+  "moc": [
+    { "moc_no": "MOC-2026-1104", "kks": "10LAB10AP001", "tag": "10LAB10CP001", "param": "alarm_high", "old": 29.0, "new": 31.0, "unit": "MPa", "design_limit": 33.0, "approved_by": "E102", "approved_on": "2026-11-03", "status": "approved", "reason": "주급수펌프 A 임펠러 상향 교체 후 토출 압력 운전 범위 조정" },
+    { "moc_no": "MOC-2026-0917", "kks": "10HAH10BB001", "tag": "10HAH10CT001", "param": "alarm_high", "old": 620.0, "new": 625.0, "unit": "°C", "design_limit": 645.0, "approved_by": "E102", "approved_on": "2026-09-10", "status": "closed", "reason": "Rev.5 정식 도면 개정에 반영 완료" },
+    { "moc_no": "MOC-2026-1021", "kks": "10MAV10AH001", "tag": "10MAV10CT001", "param": "alarm_high", "old": 55.0, "new": 57.0, "unit": "°C", "design_limit": 65.0, "approved_by": "E118", "approved_on": null, "status": "pending", "reason": "윤활유 냉각기 튜브 교체 검토 중 (승인 전)" }
+  ],
+  "personnel": [
+    { "id": "OP-201", "name": "정민호", "role": "교대감독", "authorized_sectors": ["*"] },
+    { "id": "OP-202", "name": "윤서진", "role": "교대감독 파트장", "authorized_sectors": ["*"] },
+    { "id": "E102", "name": "김태현", "role": "기술책임자", "authorized_sectors": ["feedwater", "boiler"] },
+    { "id": "E118", "name": "최유나", "role": "기술책임자", "authorized_sectors": ["turbine", "electric"] },
+    { "id": "E205", "name": "이승민", "role": "현장 운전원", "authorized_sectors": ["turbine", "feedwater"] },
+    { "id": "E301", "name": "박지훈", "role": "계측제어 담당", "authorized_sectors": ["*"] },
+    { "id": "E207", "name": "한도윤", "role": "현장 운전원", "authorized_sectors": ["boiler", "env"] }
+  ],
+  "aop": [
+    {
+      "id": "AOP-103-FW02",
+      "title": "급수 유량 저하 · 급수조절밸브 고착",
+      "sectors": ["feedwater", "boiler"],
+      "triggers": ["10LAB20CG102", "10LAB20CF001", "10HAH10CT001"],
+      "steps": [
+        "103동 2층(EL.+9.0m) 보조 급수 바이패스 밸브를 수동으로 열어 급수 유량을 정상 수준으로 회복한다",
+        "과열기 출구 온도가 트립 한계에 가까우면 출력을 감발한다",
+        "급수조절밸브 포지셔너와 구동부를 현장 점검한다"
+      ],
+      "risk_actions": ["보조 급수 바이패스 개방", "출력 감발"],
+      "high_risk": true
+    },
+    {
+      "id": "AOP-102-TB01",
+      "title": "터빈 베어링 진동 고",
+      "sectors": ["turbine"],
+      "triggers": ["10MAD10CY001"],
+      "steps": [
+        "출력을 감발하고 베어링 진동 추이를 감시한다",
+        "윤활유 출구 온도와 공급 압력을 확인한다",
+        "진동이 트립 한계에 도달하면 터빈을 수동 정지한다"
+      ],
+      "risk_actions": ["출력 감발", "터빈 수동 정지"],
+      "high_risk": true
+    },
+    {
+      "id": "AOP-102-IC01",
+      "title": "계측 채널 편차 (전송기 이상)",
+      "sectors": ["turbine"],
+      "triggers": ["10MAA10CP001"],
+      "steps": [
+        "편차가 난 채널을 보팅 논리에서 우회하고 남은 채널로 감시한다",
+        "트립을 보류하고 현장 게이지로 실측값을 다시 확인한다",
+        "계측제어 담당이 전송기 영점과 배선을 점검한다"
+      ],
+      "risk_actions": ["트립 보류"],
+      "high_risk": false
+    },
+    {
+      "id": "AOP-105-DR01",
+      "title": "노내 압력 상승 · 유인통풍기 이상",
+      "sectors": ["env", "boiler"],
+      "triggers": ["10HAD10CP101", "10HLB10CE001"],
+      "steps": [
+        "유인통풍기 전류와 입구 댐퍼 개도를 확인한다",
+        "노내 압력이 오르면 압입통풍기 풍량과 연료 투입을 줄인다",
+        "유인통풍기 실속이 계속되면 출력을 감발한다"
+      ],
+      "risk_actions": ["연료 감소", "출력 감발"],
+      "high_risk": true
+    },
+    {
+      "id": "AOP-COM-IC02",
+      "title": "계측값 고정 (전송기 동결)",
+      "sectors": ["*"],
+      "triggers": [],
+      "steps": [
+        "고정된 계측값을 감시 대상에서 빼고 예비 계측이나 현장 순시로 감시한다",
+        "계측제어 담당이 전송기와 입출력 카드를 점검한다"
+      ],
+      "risk_actions": [],
+      "high_risk": false
+    },
+    {
+      "id": "AOP-COM-EMI01",
+      "title": "순간 잡음 (스파이크)",
+      "sectors": ["*"],
+      "triggers": [],
+      "steps": [
+        "잡음으로 걸러진 값은 감시 기록에 남기고 계속 감시한다",
+        "같은 잡음이 반복되면 계측 케이블 차폐와 접지를 점검한다"
+      ],
+      "risk_actions": [],
+      "high_risk": false
+    }
+  ],
+  "history": [
+    { "date": "2026-03-15", "drawing": "PID-103-LAB", "kind": "revision", "rev": "Rev.3", "note": "계획예방정비 후 정식 도면 개정" },
+    { "date": "2026-05-20", "kks": "10LAB10AP001", "kind": "like_for_like", "note": "베어링 동일 사양 교체 (도면 변경 없음)" },
+    { "date": "2026-09-17", "drawing": "PID-101-HAD", "kind": "revision", "rev": "Rev.5", "note": "과열기 경보 한계 MOC-2026-0917 반영" },
+    { "date": "2026-10-28", "kks": "10LAB10AP001", "kind": "moc", "moc": "MOC-2026-1104", "note": "임펠러 상향 교체 · Red-line 반영 대기" }
+  ]
+}
