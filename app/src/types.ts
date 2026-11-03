@@ -92,6 +92,30 @@ export interface Plant {
   aops: Aop[];
   /** 도면별 배관 꺾은선 (도면 생성기가 그린 그대로, 정규화 좌표). `via` 는 도면 간 점프 커넥터 */
   pipes: Record<string, Pipe[]>;
+  /** A0 종합 도면 (Part 8-4): 마스터 도면 배치와 격자 타일 */
+  a0: A0Info[];
+}
+
+export interface A0Tile {
+  id: string;
+  row: number;
+  col: number;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+export interface A0Info {
+  id: string;
+  title: string;
+  rev: string;
+  pixel_size: [number, number];
+  sheet_px: [number, number];
+  grid: { rows: number; cols: number; overlap: number };
+  sheets: { drawing: string; x: number; y: number }[];
+  tiles: A0Tile[];
+  equipment: Record<string, { bbox: [number, number, number, number]; tile: string | null }>;
 }
 
 export interface Pipe {
@@ -279,6 +303,7 @@ export interface Analysis {
   } | null;
   chain: ChainEvent[];
   draft: AopDraft | null;
+  interlock: Interlock | null;
   metrics: Metrics[];
   stages: StageRecord[];
   sds: { sds_id: string; trigger_kind: string; gate_state_vector: string[]; decomposed_confidences: [string, number][]; min_confidence: number | null; center_ms: number };
@@ -287,6 +312,29 @@ export interface Analysis {
   next: string;
   reason: string;
   notes: string[];
+}
+
+/** 절차서에 딸린 선행 절차 인터록 (Part 8-4). 단계가 모두 passed 여야 확정할 수 있습니다. */
+export interface Interlock {
+  aop_id: string;
+  target: string;
+  fault: string;
+  steps: InterlockStep[];
+}
+
+export type InterlockCheck = { kind: "below"; tag: string; value: number } | { kind: "at_least"; tag: string; value: number } | { kind: "loto" };
+
+export interface InterlockStep {
+  no: number;
+  req_depth: number;
+  kks: string;
+  text: string;
+  check: InterlockCheck;
+  status: "passed" | "pending";
+  observed: number | null;
+  unit: string | null;
+  source: "dcs" | "field" | "supervisor" | null;
+  evidence: string | null;
 }
 
 export interface Report {
@@ -346,6 +394,7 @@ export interface Detail {
   analysis: Analysis;
   timeline: Timeline;
   flows: EdgeFlow[];
+  issues: IssueReport;
   scenario: string | null;
   sim_time: string;
 }
@@ -392,4 +441,25 @@ export interface ArchiveDoc {
   auto: boolean;
   closed_at: string;
   retention_until: string;
+}
+
+/** 단일 · 절차 · 복합 이슈 분해 (Part 8-6) */
+export interface IssueReport {
+  kind: "single" | "procedural" | "compound";
+  codes: string[];
+  label: string;
+  subs: SubIssue[];
+  open: number;
+  resolved: number;
+}
+
+export interface SubIssue {
+  n: number;
+  kind: "equipment" | "cascade" | "sensor" | "procedure" | "moc";
+  kks: string | null;
+  depth: number | null;
+  title: string;
+  detail: string;
+  resolution: string;
+  resolved: boolean;
 }

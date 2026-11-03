@@ -28,6 +28,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SEED = os.path.join(ROOT, "core", "fixtures", "synthetic_db.json")
 FROM_S = -60
 LENGTH = 151  # -60 .. +90
+# 처음 시나리오를 만든 뒤에 원장에 더한 센서. 같은 난수 흐름에서 뽑으면 뒤따르는 기존 센서 값이 모두 바뀌므로
+# 센서마다 따로 시드를 잡은 난수로 뽑습니다 (기존 시나리오 값은 그대로).
+LATE_TAGS = ["10LAB20CG103"]
 
 
 def ramp(points, t):
@@ -41,19 +44,25 @@ def ramp(points, t):
 
 
 class Builder:
-    def __init__(self, db, rng):
+    def __init__(self, db, rng, late_seed=0):
         self.db = db
         self.rng = rng
+        self.late_seed = late_seed
         self.sensors = {s["tag"]: s for s in db["sensors"]}
 
-    def baseline(self, tag, value=None):
+    def baseline(self, tag, value=None, rng=None):
         s = self.sensors[tag]
         v = s["normal"] if value is None else value
         sigma = s["deadband"] * 0.12
-        return [round(v + self.rng.gauss(0.0, sigma), 3) for _ in range(LENGTH)]
+        rng = rng or self.rng
+        return [round(v + rng.gauss(0.0, sigma), 3) for _ in range(LENGTH)]
 
     def all_normal(self):
-        return {tag: self.baseline(tag) for tag in self.sensors}
+        series = {tag: self.baseline(tag) for tag in self.sensors if tag not in LATE_TAGS}
+        for tag in LATE_TAGS:
+            if tag in self.sensors:
+                series[tag] = self.baseline(tag, rng=random.Random(f"{self.late_seed}/{tag}"))
+        return series
 
     def shape(self, tag, points, noise=True):
         """꼭짓점 꺾은선 + 작은 잡음. 꺾은선이 움직이는 구간에는 잡음을 줄입니다."""
@@ -220,7 +229,7 @@ def main():
     scenarios = []
     for i, make in enumerate([scenario_p1, scenario_p2, lambda b: scenario_p3(b, False), lambda b: scenario_p3(b, True), scenario_p4, scenario_p5, scenario_p6, scenario_p7]):
         # 시나리오마다 따로 시드를 줘서 하나를 고쳐도 다른 시나리오 값이 바뀌지 않게 합니다.
-        scenarios.append(make(Builder(db, random.Random(seed + i))))
+        scenarios.append(make(Builder(db, random.Random(seed + i), late_seed=seed + i)))
     doc = {
         "version": 1,
         "note": "합성 사건 시나리오입니다. scripts/gen_plant_cases.py 가 만들었습니다. 실제 계측이 아닙니다.",

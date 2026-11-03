@@ -191,6 +191,68 @@ pub struct AopRow {
     pub high_risk: bool,
 }
 
+/// A0 대형 종합 도면 (기획 Part 8-4 1절). 마스터 도면들을 한 장에 앉힌 배치이고, 판독은 격자 타일로 나눠 합니다.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct A0Row {
+    pub id: String,
+    pub title: String,
+    pub rev: String,
+    pub size_mm: [u32; 2],
+    pub dpi: u32,
+    pub pixel_size: [u32; 2],
+    /// 마스터 도면 한 장의 픽셀 크기
+    pub sheet_px: [u32; 2],
+    pub grid: A0Grid,
+    pub sheets: Vec<A0Sheet>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct A0Grid {
+    pub rows: u32,
+    pub cols: u32,
+    /// 이웃 타일과 겹치는 비율 (타일 크기 기준)
+    pub overlap: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct A0Sheet {
+    pub drawing: String,
+    pub x: u32,
+    pub y: u32,
+}
+
+/// 절차서에 딸린 선행 절차 인터록 (기획 Part 8-4 3절). 단계 순서대로 확인해야 그 절차서를 확정할 수 있습니다.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct InterlockRow {
+    pub aop_id: String,
+    /// 깊이 0 이 되는 설비 (절차서가 다루는 고장 설비)
+    pub target: String,
+    pub fault: String,
+    pub steps: Vec<InterlockStepRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct InterlockStepRow {
+    pub no: u32,
+    /// 대상에서 본 홉 깊이 (음수 상류, 0 은 대상 자신이나 나란한 우회 설비)
+    pub req_depth: i32,
+    pub kks: String,
+    pub check: InterlockCheck,
+    pub text: String,
+}
+
+/// 단계가 확인하는 조건
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InterlockCheck {
+    /// 계측값이 이 값 이하
+    Below { tag: String, value: f64 },
+    /// 계측값이 이 값 이상
+    AtLeast { tag: String, value: f64 },
+    /// 현장 안전작업허가 · 잠금표지(LOTO) 서명
+    Loto,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct HistoryRow {
     pub date: NaiveDate,
@@ -221,6 +283,10 @@ struct Seed {
     moc: Vec<MocRow>,
     personnel: Vec<PersonRow>,
     aop: Vec<AopRow>,
+    #[serde(default)]
+    a0_drawings: Vec<A0Row>,
+    #[serde(default)]
+    interlocks: Vec<InterlockRow>,
     history: Vec<HistoryRow>,
 }
 
@@ -366,6 +432,38 @@ impl Lattice {
         for m in &s.moc {
             if self.sensor(&m.tag).is_none() || self.person(&m.approved_by).is_none() {
                 bail!("MOC {} 의 태그나 승인자가 없습니다", m.moc_no);
+            }
+        }
+        for a0 in &s.a0_drawings {
+            for sh in &a0.sheets {
+                let fits = sh.x + a0.sheet_px[0] <= a0.pixel_size[0] && sh.y + a0.sheet_px[1] <= a0.pixel_size[1];
+                if self.drawing(&sh.drawing).is_none() || !fits {
+                    bail!("A0 도면 {} 의 {} 배치가 올바르지 않습니다", a0.id, sh.drawing);
+                }
+            }
+            if a0.grid.rows == 0 || a0.grid.cols == 0 || !(0.0..0.5).contains(&a0.grid.overlap) {
+                bail!("A0 도면 {} 의 타일 격자가 올바르지 않습니다", a0.id);
+            }
+        }
+        for il in &s.interlocks {
+            if self.aop(&il.aop_id).is_none() || self.equipment(&il.target).is_none() {
+                bail!("인터록 {} 의 절차서나 대상 설비가 없습니다", il.aop_id);
+            }
+            let mut last = 0;
+            for st in &il.steps {
+                if st.no <= last {
+                    bail!("인터록 {} 의 단계 번호가 차례대로가 아닙니다", il.aop_id);
+                }
+                last = st.no;
+                if let InterlockCheck::Below { tag, .. } | InterlockCheck::AtLeast { tag, .. } = &st.check {
+                    if self.sensor(tag).is_none_or(|x| x.kks != st.kks) {
+                        bail!("인터록 {} 단계 {} 의 센서 {tag} 가 설비 {} 의 것이 아닙니다", il.aop_id, st.no, st.kks);
+                    }
+                }
+                // 단계가 적어 둔 깊이가 계통 그래프의 깊이와 같아야 합니다 (깊이 순서 강제의 근거).
+                if crate::graph::depth_of(self, &il.target, &st.kks) != Some(st.req_depth) {
+                    bail!("인터록 {} 단계 {} 의 설비 {} 는 대상에서 깊이 {} 가 아닙니다", il.aop_id, st.no, st.kks, st.req_depth);
+                }
             }
         }
         Ok(())
@@ -517,6 +615,23 @@ impl Lattice {
 
     pub fn aop(&self, id: &str) -> Option<&AopRow> {
         self.seed.aop.iter().find(|a| a.id == id.trim())
+    }
+
+    pub fn a0_drawings(&self) -> &[A0Row] {
+        &self.seed.a0_drawings
+    }
+
+    pub fn a0(&self, id: &str) -> Option<&A0Row> {
+        self.seed.a0_drawings.iter().find(|a| a.id == id)
+    }
+
+    pub fn interlocks(&self) -> &[InterlockRow] {
+        &self.seed.interlocks
+    }
+
+    /// 절차서에 딸린 선행 절차 인터록
+    pub fn interlock_for(&self, aop_id: &str) -> Option<&InterlockRow> {
+        self.seed.interlocks.iter().find(|i| i.aop_id == aop_id.trim())
     }
 
     /// 경보 · 원인 태그로 표준 절차서를 고릅니다. 앞의 태그가 먼저입니다 (원인 태그를 앞에 둡니다).

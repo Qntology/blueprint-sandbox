@@ -637,6 +637,38 @@ def save(path, img, gt, extra):
         f.write("\n")
 
 
+def a0_sheet(plant, a0, masters_dir):
+    """A0 종합 도면 (Part 8-4). 마스터 도면들을 원장 배치(`a0_drawings`)대로 한 장에 앉힙니다.
+    글자 크기는 마스터 그대로라 A0 전체 높이의 0.4 % 쯤입니다 (실제 A0 도면의 KKS 글씨 2.5 ~ 3.5 mm 와 같은 비율)."""
+    W, H = a0["pixel_size"]
+    c = Canvas(W, H, random.Random(a0["id"]))
+    c.d.rectangle((20, 20, W - 20, H - 20), outline=INK, width=6)
+    c.d.rectangle((40, 40, W - 40, H - 40), outline=INK, width=2)
+    c.text(160, 260, f"{a0['title']}  ·  A0 {a0['size_mm'][0]} × {a0['size_mm'][1]} mm  ·  {a0['dpi']} DPI", 64, BOLD, kind="label")
+    c.text(160, 380, "마스터 계통도 5장을 한 장에 모은 종합도입니다. 각 칸의 표제란은 원 도면의 것입니다.", 40, GOTHIC, fill=GRAY, kind="label")
+    gt = []
+    for sh in a0["sheets"]:
+        img = Image.open(os.path.join(masters_dir, f"{sh['drawing']}.png")).convert("RGB")
+        c.img.paste(img, (sh["x"], sh["y"]))
+        c.d.rectangle((sh["x"] - 4, sh["y"] - 4, sh["x"] + img.width + 4, sh["y"] + img.height + 4), outline=INK, width=3)
+    for e in plant.db["equipment"]:
+        sh = next((s for s in a0["sheets"] if s["drawing"] == e["drawing"]), None)
+        if sh is None:
+            continue
+        sw, shh = a0["sheet_px"]
+        x0, y0, x1, y1 = e["bbox"]
+        gt.append({"kks": e["kks"], "bbox": [round((sh["x"] + x0 * sw) / W, 5), round((sh["y"] + y0 * shh) / H, 5), round((sh["x"] + x1 * sw) / W, 5), round((sh["y"] + y1 * shh) / H, 5)]})
+    # A0 자체 표제란 (오른쪽 아래, 비어 있는 칸)
+    tx0, ty0, tx1, ty1 = 4846, 2630, 6846, 4030
+    c.d.rectangle((tx0, ty0, tx1, ty1), outline=INK, width=4)
+    c.text(tx0 + 60, ty0 + 80, f"도면번호: {a0['id']} ({a0['rev']})", 60, BOLD, kind="title")
+    c.text(tx0 + 60, ty0 + 200, a0["title"], 48, BOLD, kind="label")
+    c.text(tx0 + 60, ty0 + 300, f"격자 {a0['grid']['rows']} × {a0['grid']['cols']} 타일 · 겹침 {int(a0['grid']['overlap'] * 100)}%", 40, GOTHIC, fill=GRAY, kind="label")
+    for i, line in enumerate(GUIDE_LINES):
+        c.text(tx0 + 60, ty0 + 520 + i * 70, line, 30, GOTHIC, fill=GRAY, kind="guide")
+    return c, gt
+
+
 def main():
     masters = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "core", "fixtures", "drawings")
     field = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, "out", "field")
@@ -650,6 +682,13 @@ def main():
         # 앱에 들어가는 파일이라 팔레트로 줄여 저장합니다.
         img = c.img.convert("P", palette=Image.ADAPTIVE, colors=64)
         save(os.path.join(masters, f"{d['id']}.png"), img, c.gt, {"drawing": d["id"], "rev": d["rev"], "pipes": c.pipes})
+    # A0 종합 도면은 크고(수 MB) 마스터에서 다시 만들 수 있어 저장소에 넣지 않습니다 (out/a0).
+    a0_dir = os.path.join(os.path.dirname(field), "a0")
+    os.makedirs(a0_dir, exist_ok=True)
+    for a0 in db.get("a0_drawings", []):
+        c, gt = a0_sheet(plant, a0, masters)
+        img = c.img.convert("P", palette=Image.ADAPTIVE, colors=64)
+        save(os.path.join(a0_dir, f"{a0['id']}.png"), img, c.gt, {"drawing": a0["id"], "rev": a0["rev"], "equipment": gt, "grid": a0["grid"]})
     scenarios = json.load(open(os.path.join(ROOT, "core", "fixtures", "plant_scenarios.json"), encoding="utf-8"))["scenarios"]
     for s in scenarios:
         for scan in s["scans"]:
@@ -663,6 +702,7 @@ def main():
             save(os.path.join(field, scan["image"]), img, gt, {"scenario": s["id"], "kind": scan["kind"], "skew": round(deg, 3), "truth": truth})
     print(f"마스터 도면 {len(db['drawings'])}장: {masters}")
     print(f"현장 스캔: {field}")
+    print(f"A0 종합 도면: {a0_dir}")
 
 
 if __name__ == "__main__":

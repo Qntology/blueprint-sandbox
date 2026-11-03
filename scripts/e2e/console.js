@@ -19,7 +19,7 @@ const flag = (name) => {
   return i >= 0 ? args[i + 1] : null;
 };
 const SHOTS = flag("--shots") || path.join(ROOT, "out", "shots");
-const ONLY = (flag("--only") || "P2,P1,P3,P3F,P4").split(",");
+const ONLY = (flag("--only") || "P2,P1,P3,P3F,P4,A0,SEARCH,PHYS").split(",");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 현장 단말 화면에 나오면 안 되는 내부 정보 (core/src/privacy.rs FIELD_FORBIDDEN).
 // "원장 수치" 만 뺍니다. 기획안의 소명 화면 안내문 "(… 내부 원장 수치 및 판정 코드는 화면에 표시되지 않습니다)" 에 들어 있습니다.
@@ -144,7 +144,20 @@ async function p2(c) {
   await c.locator("button", { hasText: "공동 결재 없이 확정 시도" }).click();
   await waitText(c, "차단");
   await shot(c, "P2-8-rubber-stamp");
+  // 선행 절차 인터록 (Part 8-4): Step 1 은 DCS 값으로 통과, Step 2 (바이패스 개방) 가 남아 확정이 잠깁니다.
   await c.locator(".drawer label.check", { hasText: "공동 결재" }).locator("input").check();
+  await c.locator(".drawer button", { hasText: "선행 절차를 건너뛰고 확정 시도" }).click();
+  await waitText(c, "Step 2");
+  await shot(c, "P2-8b-interlock-blocked");
+  await c.locator(".il-step", { hasText: "Step 2" }).locator("input").fill("65");
+  await c.locator(".il-step", { hasText: "Step 2" }).locator("button", { hasText: "현장 값 확인" }).click();
+  await waitText(c, "남은 선행 절차: Step 3");
+  await c.locator(".il-step", { hasText: "Step 3" }).locator("button", { hasText: "무전 확인" }).click();
+  await waitText(c, "모두 확인");
+  await sleep(800);
+  await shot(c, "P2-8c-interlock-done");
+  const cosign = c.locator(".drawer label.check", { hasText: "공동 결재" }).locator("input");
+  if (!(await cosign.isChecked())) await cosign.check();
   await c.locator(".drawer button", { hasText: "조치확정" }).click();
   await waitText(c, "확정했습니다");
   await waitText(c, "보관 문서", 30000);
@@ -237,10 +250,88 @@ async function p4(c) {
   results.push({ id: "P4", ok: true });
 }
 
+// A0 종합 도면 (Part 8-4): 4×4 타일 격자, 선택 설비 타일 강조, 타일 확대
+// 앞 흐름이 남긴 검색 목록 · 서랍을 닫습니다.
+async function tidy(c) {
+  if (await c.locator(".search-results").count()) await c.locator(".search-input").press("Escape");
+  const close = c.locator(".drawer header button", { hasText: "닫기" });
+  if (await close.count()) await close.first().click();
+  await sleep(300);
+}
+
+async function a0(c) {
+  await tidy(c);
+  await c.locator(".tab", { hasText: "P&ID" }).click();
+  await c.locator(".chip", { hasText: "A0 종합" }).click();
+  await c.waitForSelector(".a0-sheet img", { timeout: 30000 });
+  await sleep(1200);
+  await shot(c, "A0-1-sheet");
+  await c.locator(".a0-tile", { hasText: "B4" }).first().click({ position: { x: 30, y: 30 } });
+  await sleep(1000);
+  await shot(c, "A0-2-zoom-B4");
+  await c.locator("button", { hasText: "전체 보기" }).click();
+  await c.locator(".chip", { hasText: "PID-103-LAB" }).click();
+  results.push({ id: "A0", ok: true });
+}
+
+// 자연어 검색 (logis-center 방식)
+async function searchFlow(c) {
+  await tidy(c);
+  const queries = [
+    ["103동 2층 밸브", "10LAB20AA10"],
+    ["주급수 유량조절밸브 상류 1홉", "10LAB10AP001"],
+    ["105동 밸브 유인통풍기", "10HLB10AN001"],
+    ["승인 대기 MOC", "MOC-2026-1021"],
+  ];
+  let k = 0;
+  for (const [q, want] of queries) {
+    k += 1;
+    const box = c.locator(".search-input");
+    await box.fill(q);
+    await box.press("Enter");
+    await c.waitForSelector(".search-results", { timeout: 15000 });
+    const first = await c.locator(".search-hit").first().innerText();
+    assert(first.includes(want), `검색 '${q}' 첫 결과에 ${want} 가 없습니다: ${first}`);
+    await shot(c, `SEARCH-${k}`);
+    await box.press("Escape");
+  }
+  await tidy(c);
+  results.push({ id: "SEARCH", ok: true });
+}
+
+// 물리엔진 폐루프 (Part 8-5): 정상 운전 → 밸브 고착 주입 → SDS 추적 → 사건 → 완화 조치 (보조 모드면 교대감독 실행) → 회복
+async function phys(c) {
+  await tidy(c);
+  await c.locator("button", { hasText: "물리엔진 · 자율 대응" }).click();
+  await c.locator(".drawer button", { hasText: "시뮬레이터 시작" }).click();
+  await sleep(4000);
+  await c.locator(".drawer button", { hasText: "급수밸브 18% 고착 주입" }).click();
+  await waitText(c, "인과 사슬 잠금", 90000);
+  await shot(c, "PHYS-1-chain");
+  await waitText(c, "Tier 1 자율 대응", 240000);
+  await shot(c, "PHYS-2-mitigation");
+  const run = c.locator(".drawer button", { hasText: "완화 조치 실행" });
+  if (await run.count()) await run.click();
+  // 유량은 곧 돌아오지만 과열기는 이류 지연(4.2초) 뒤에 꺾입니다. 과열기 자신이 회복으로 넘어간 뒤 고점을 읽습니다.
+  await waitText(c, "10HAH10CT001 완화 조치 → 회복 중", 180000);
+  await sleep(2000);
+  await shot(c, "PHYS-3-recovering");
+  const text = await c.locator(".physics").innerText();
+  const peak = Number((text.match(/과열기 고점 ([0-9.]+)/) || [])[1]);
+  const proposed = Number((text.match(/제안 t = ([0-9.]+)s/) || [])[1]);
+  const locked = Number((text.match(/t = ([0-9.]+)s · 10HAH10CT001 SLEW \(변곡\) → 인과 사슬 잠금/) || [])[1]);
+  const minimum = (text.match(/최솟값\(확신도\) ([0-9.]+|없음)/) || [])[1];
+  const record = { id: "PHYS", peak, locked, proposed, minimum };
+  assert(peak > 0 && peak < 645, `과열기 고점 ${peak} ℃ 가 트립(645) 아래여야 합니다 (${JSON.stringify(record)})`);
+  await c.locator(".drawer header button", { hasText: "닫기" }).click();
+  results.push({ ...record, ok: true });
+}
+
 (async () => {
   const browser = await connect();
   const { consolePage: c, fieldPage: f } = await pages(browser);
-  await waitText(c, "Zoro-1", 600000).catch(() => {});
+  // 화면의 단계 이름에도 "Zoro-1" 이 있으니, 아래 상태 줄이 모델을 다 연 뒤의 문구로 바뀔 때까지 기다립니다.
+  await waitText(c, "엔진: Zoro-1", 900000);
   for (const id of ONLY) {
     try {
       if (id === "P2") await p2(c);
@@ -248,6 +339,9 @@ async function p4(c) {
       if (id === "P3") await p3(c, f, false);
       if (id === "P3F") await p3(c, f, true);
       if (id === "P4") await p4(c);
+      if (id === "A0") await a0(c);
+      if (id === "SEARCH") await searchFlow(c);
+      if (id === "PHYS") await phys(c);
     } catch (e) {
       results.push({ id, ok: false, error: String(e) });
       await shot(c, `${id}-error-console`).catch(() => {});

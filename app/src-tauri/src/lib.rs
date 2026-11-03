@@ -9,6 +9,8 @@
 //! DCS 연계가 없어서 합성 시나리오를 재생하는 시뮬레이터로 알람을 넣습니다 (`inject_scenario`).
 //! 스캐너는 `BLUEPRINT_SCANNER_DIR` 폴더(기본 `%LOCALAPPDATA%\blueprint\scanner`)의 이미지로 대신합니다.
 
+mod physics_mode;
+
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
@@ -19,6 +21,10 @@ use blueprint_core::ai::accel;
 use blueprint_core::ai::document::DocumentReader;
 use blueprint_core::case::{DeviationExcuse, FieldKind, ReadTimings, Signature};
 use blueprint_core::extract::{extract, DocKind, Extracted, PageText};
+use blueprint_core::interlock::Evidence;
+use blueprint_core::issues;
+use blueprint_core::audit::AuditCategory;
+use blueprint_core::tiling;
 use blueprint_core::field::{self, FieldError, FieldForm, FieldState};
 use blueprint_core::graph::undirected_distance;
 use blueprint_core::lattice::Lattice;
@@ -58,6 +64,28 @@ const DRAWING_META: [&str; 5] = [
     include_str!("../../../core/fixtures/drawings/PID-104-BBA.json"),
     include_str!("../../../core/fixtures/drawings/PID-105-HLB.json"),
 ];
+
+/// A0 종합 도면 (Part 8-4): 배치 · 격자 타일 · 설비마다 A0 좌표와 든 타일
+fn a0_views(db: &Lattice) -> Value {
+    let views: Vec<Value> = db
+        .a0_drawings()
+        .iter()
+        .map(|a0| {
+            let grid = tiling::a0_tiles(a0);
+            let page = (a0.pixel_size[0], a0.pixel_size[1]);
+            let equipment: serde_json::Map<String, Value> = db
+                .equipment_all()
+                .iter()
+                .filter_map(|e| {
+                    let g = tiling::a0_bbox(db, a0, &e.kks)?;
+                    Some((e.kks.clone(), json!({ "bbox": g, "tile": tiling::tile_of(&grid, g, page).map(|t| t.id.clone()) })))
+                })
+                .collect();
+            json!({ "id": a0.id, "title": a0.title, "rev": a0.rev, "pixel_size": a0.pixel_size, "sheet_px": a0.sheet_px, "grid": a0.grid, "sheets": a0.sheets, "tiles": grid, "equipment": equipment })
+        })
+        .collect();
+    Value::Array(views)
+}
 
 fn drawing_pipes() -> Value {
     let mut out = serde_json::Map::new();
@@ -106,6 +134,8 @@ struct Desk {
     /// 지금 현장 운전원이 넣은 문서에서 읽은 값 (화면을 거치지 않고 접수로 갑니다)
     field_scans: Mutex<Vec<Extracted>>,
     field_timings: Mutex<Option<ReadTimings>>,
+    /// 물리엔진 · 자율 대응 모드 (Part 8-5)
+    physics: Mutex<physics_mode::PhysicsState>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -356,6 +386,7 @@ struct PlantDto {
     connectors: Vec<ConnectorDto>,
     aops: Value,
     pipes: Value,
+    a0: Value,
 }
 
 /// 계통 전체 (콘솔 창 전용). 센서 기준치에는 반영된 MOC 오버레이를 겹칩니다.
@@ -417,6 +448,7 @@ fn plant_topology(window: Window, desk: State<'_, Desk>) -> Result<PlantDto, Str
         connectors,
         aops: json!(db.aops()),
         pipes: drawing_pipes(),
+        a0: a0_views(db),
     })
 }
 
@@ -605,6 +637,8 @@ struct DetailDto {
     analysis: Value,
     timeline: TimelineDto,
     flows: Value,
+    /// 단일 · 절차 · 복합 이슈 분해 (Part 8-6)
+    issues: Value,
     scenario: Option<String>,
     sim_time: String,
 }
@@ -653,6 +687,8 @@ fn incident_detail(window: Window, desk: State<'_, Desk>, id: String) -> Result<
         .collect();
     let now_ms = s.incident.now_ms();
     let flows = mining::edge_flows(&desk.db, Some(&s.incident.telemetry), now_ms, Some(&s.analysis));
+    let intercepted: Vec<String> = engine.store.audit().of(&id).iter().filter(|e| e.category == AuditCategory::IllegalActionIntercepted).map(|e| e.detail.clone()).collect();
+    let issues = issues::decompose(&desk.db, &s.analysis, &s.incident.reports, &intercepted);
     Ok(DetailDto {
         id: id.clone(),
         state: if s.status == SessionStatus::AwaitingField { "awaiting_field" } else { "review" },
@@ -667,6 +703,7 @@ fn incident_detail(window: Window, desk: State<'_, Desk>, id: String) -> Result<
         analysis: json!(s.analysis),
         timeline: timeline(&s.incident.telemetry, now_ms),
         flows: json!(flows),
+        issues: json!(issues),
         scenario: s.incident.scenario.clone(),
         sim_time: plant::local(s.incident.received_at).format("%H:%M:%S").to_string(),
     })
@@ -800,6 +837,48 @@ fn decide_incident(window: Window, app: AppHandle, desk: State<'_, Desk>, input:
     }
     let (ok, message) = outcome_text(&outcome);
     Ok(DecisionReply { ok, message, finalized })
+}
+
+#[derive(Debug, Deserialize)]
+struct InterlockInput {
+    id: String,
+    supervisor_id: String,
+    step: u32,
+    /// 계측 조건 단계: 현장 무전 · 휴대 계측으로 받은 값
+    value: Option<f64>,
+    /// LOTO 단계: 교대감독의 현장 무전 확인으로 갈음 (사번 날인)
+    #[serde(default)]
+    radio: bool,
+}
+
+/// 선행 절차 인터록 단계 하나를 채웁니다 (콘솔 창 전용, Part 8-4). 순서를 건너뛰면 가드레일이 막고 감사 기록에 남깁니다.
+#[tauri::command(async)]
+fn record_interlock(window: Window, app: AppHandle, desk: State<'_, Desk>, input: InterlockInput) -> Result<DecisionReply, String> {
+    console_only(&window)?;
+    let supervisor = input.supervisor_id.trim();
+    if supervisor.is_empty() {
+        return Err("교대감독 사번을 머리에 적어 주세요".to_string());
+    }
+    let evidence = match (input.radio, input.value) {
+        (true, _) => Evidence::RadioLoto { supervisor: supervisor.to_string() },
+        (false, Some(value)) => Evidence::Value { value, how: "교대감독 입력 (현장 무전)".into() },
+        (false, None) => return Err("값을 넣어 주세요".to_string()),
+    };
+    let result = lock(&desk.engine).record_interlock(&input.id, input.step, evidence, supervisor, Utc::now());
+    notify_console(&app);
+    let outcome = result.map_err(|e| format!("{e:#}"))?;
+    let (ok, message) = outcome_text(&outcome);
+    Ok(DecisionReply { ok, message, finalized: false })
+}
+
+/// 자연어 검색 (콘솔 창 전용). 원장 · 진행 중 사건 · 보관 문서를 찾고, 계측 조건은 지금 값(물리엔진 · 재생 중 시나리오)으로 봅니다.
+#[tauri::command(async)]
+fn search(window: Window, desk: State<'_, Desk>, query: String) -> Result<blueprint_core::search::SearchResult, String> {
+    console_only(&window)?;
+    let live = physics_mode::live_snapshot(&desk).or_else(|| lock(&desk.live).as_ref().map(|l| (l.telemetry.clone(), l.sim_now().timestamp_millis())));
+    let engine = lock(&desk.engine);
+    let corpus = blueprint_core::search::Corpus::build(&desk.db, live.as_ref().map(|(t, at)| (t, *at)), Some(&engine.store));
+    Ok(blueprint_core::search::search(&desk.db, &corpus, &query))
 }
 
 /// 작업자 실명 열람 요청 (콘솔 창 전용). 허용 · 거부 모두 감사 기록에 남습니다.
@@ -1201,6 +1280,7 @@ pub fn run() {
         field_case: Mutex::new(None),
         field_scans: Mutex::new(Vec::new()),
         field_timings: Mutex::new(None),
+        physics: Mutex::new(physics_mode::PhysicsState::default()),
     };
     tauri::Builder::default()
         .manage(Jobs::default())
@@ -1227,6 +1307,13 @@ pub fn run() {
             mermaid_source,
             mining_overview,
             decide_incident,
+            record_interlock,
+            search,
+            physics_mode::physics_start,
+            physics_mode::physics_stop,
+            physics_mode::physics_inject,
+            physics_mode::physics_execute,
+            physics_mode::physics_status,
             request_unmask,
             set_automation,
             console_status,

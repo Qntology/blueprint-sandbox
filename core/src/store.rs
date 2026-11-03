@@ -17,6 +17,7 @@ use crate::lattice::SensorRow;
 use crate::state_machine::analysis::Analysis;
 use crate::state_machine::gate4_5_finalize::ArchiveRow;
 use crate::verdict::Judgement;
+use crate::tsdb::LiveRing;
 
 /// 세션이 어디서 기다리는지
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -39,6 +40,8 @@ pub struct Session {
     pub opened_at: DateTime<Utc>,
     /// 현장 재점검 요청 메모
     pub field_request: Option<String>,
+    /// 자율 대응 완화 조치 (Part 8-5)
+    pub mitigation: Option<crate::mitigation::Mitigation>,
 }
 
 /// 기준치에 겹친 MOC 변경
@@ -59,9 +62,19 @@ pub struct Store {
     archive: Vec<ArchiveRow>,
     audit: AuditLog,
     overlays: Vec<MocOverlay>,
+    /// 실시간 계측 60초 링버퍼 (Part 8-4 시계열 질의: 촬영 시각 값 · 구간 요약 · 변곡점 시차)
+    live: LiveRing,
 }
 
 impl Store {
+    pub fn live(&self) -> &LiveRing {
+        &self.live
+    }
+
+    pub fn live_mut(&mut self) -> &mut LiveRing {
+        &mut self.live
+    }
+
     pub fn open(&mut self, session: Session) -> Result<()> {
         let id = session.incident.id.clone();
         if self.active.contains_key(&id) {

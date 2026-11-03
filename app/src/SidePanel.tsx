@@ -1,10 +1,37 @@
 import { useMemo } from "react";
 import { fmt, hopDepths, level, sensorsOf, valueAt } from "./plant";
-import type { Detail, Plant, VerdictInfo } from "./types";
+import type { Detail, IssueReport, Plant, VerdictInfo } from "./types";
 
 const LEVEL_TEXT = { normal: "정상", warn: "주의", alarm: "경보", trip: "트립 한계" };
 
 /** 우측 속성 패널: 선택 설비의 계측 · 기준치와 마인드맵 홉 뎁스 목록 (기획 Part 8 6.2절) */
+const ISSUE_ICON: Record<string, string> = { equipment: "🔥", cascade: "⚠️", sensor: "📟", procedure: "🛑", moc: "📝" };
+
+/** 다중 이슈 분해 트리 (Part 8-6): 단일 · 절차 · 설비 이슈를 쪼개 하나씩 해결 여부를 보여 줍니다. */
+function IssueTree({ issues, onSelect }: { issues: IssueReport; onSelect: (kks: string) => void }) {
+  if (!issues.subs.length) return null;
+  return (
+    <div className={`issues ${issues.kind}`}>
+      <div className="issues-head">
+        <b>이슈 분류</b> {issues.label}
+        <span className="muted">
+          {" "}
+          · {issues.codes.join(" · ")} · 하위 {issues.subs.length}건 (해결 {issues.resolved} / 미해결 {issues.open})
+        </span>
+      </div>
+      {issues.subs.map((s) => (
+        <button key={s.n} className={`issue ${s.kind} ${s.resolved ? "resolved" : ""}`} onClick={() => s.kks && onSelect(s.kks)} disabled={!s.kks}>
+          <span className="issue-title">
+            {ISSUE_ICON[s.kind]} [이슈 #{s.n}: {s.title}]{s.depth != null ? ` (Depth ${s.depth > 0 ? "+" : ""}${s.depth})` : ""} {s.resolved ? "✓" : ""}
+          </span>
+          <span>{s.detail}</span>
+          <span className="muted">➔ {s.resolution}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export function SidePanel({ plant, detail, selected, onSelect, t, catalog }: { plant: Plant | null; detail: Detail | null; selected: string | null; onSelect: (kks: string) => void; t: number | null; catalog: Record<string, VerdictInfo> }) {
   const eq = plant?.equipment.find((e) => e.kks === selected);
   const depths = useMemo(() => (plant && selected ? [...hopDepths(plant.edges, selected, 3)].sort((a, b) => a[1] - b[1]) : []), [plant, selected]);
@@ -17,6 +44,7 @@ export function SidePanel({ plant, detail, selected, onSelect, t, catalog }: { p
   const verdict = detail?.judgement?.verdict;
   return (
     <section className="side">
+      {detail?.issues && <IssueTree issues={detail.issues} onSelect={onSelect} />}
       {isRoot && <div className="callout adverse">🔥 [근본 원인 후보] {eq.name}</div>}
       {isAlarm && !isRoot && <div className="callout procedural">⚠️ [경보 설비] {eq.name}</div>}
       {!isRoot && !isAlarm && <div className="callout">[선택 설비] {eq.name}</div>}

@@ -21,6 +21,7 @@ use crate::case::{AlarmKind, FieldKind, Incident};
 use crate::causal::{event_chain, ChainEvent};
 use crate::decision::DecisionModel;
 use crate::drafting::{draft_aop, AopDraft, TextWriter};
+use crate::interlock::{self, InterlockState};
 use crate::lattice::Lattice;
 use crate::plant::fmt_value;
 use crate::sds::{trigger_at, SdsSnapshot, SdsTrigger, TriggerKind};
@@ -63,6 +64,8 @@ pub struct Analysis {
     /// 신호 전파 체인
     pub chain: Vec<ChainEvent>,
     pub draft: Option<AopDraft>,
+    /// 절차서에 딸린 선행 절차 인터록 (Part 8-4). 다 끝나야 확정할 수 있습니다.
+    pub interlock: Option<InterlockState>,
     /// 경보 · 원인 센서의 60초 요약
     pub metrics: Vec<TimeSeriesMetrics>,
     pub stages: Vec<StageRecord>,
@@ -261,6 +264,9 @@ pub fn analyze(db: &Lattice, incident: &Incident, brains: Brains<'_>, sds_id: &s
     let start = telemetry.start_ms().unwrap_or(now) + BASELINE_SECS * 1000;
     let chain = event_chain(db, &telemetry, start.max(now - 60_000), now);
 
+    // 선행 절차 인터록: 초안 절차서에 딸린 단계를 지금 계측 · 현장 보고로 먼저 봅니다.
+    let interlock = draft.as_ref().and_then(|d| interlock::evaluate(db, &d.aop_id, &telemetry, now, &incident.reports));
+
     let sds = SdsSnapshot {
         sds_id: sds_id.to_string(),
         trigger_kind: trigger.kind.code().to_string(),
@@ -281,6 +287,7 @@ pub fn analyze(db: &Lattice, incident: &Incident, brains: Brains<'_>, sds_id: &s
         substantive: Some(substantive),
         chain,
         draft,
+        interlock,
         metrics,
         stages,
         sds,
@@ -369,6 +376,7 @@ fn placeholder(route: Route, trigger: SdsTrigger, mut stages: Vec<StageRecord>, 
         substantive: None,
         chain: Vec::new(),
         draft: None,
+        interlock: None,
         metrics: Vec::new(),
         stages,
         sds,

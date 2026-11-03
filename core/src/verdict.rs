@@ -39,13 +39,17 @@ pub enum Verdict {
     G3AdverseUpstreamCause,
     G3ViolationHighRisk,
     G3InterceptRubberStamp,
+    /// 선행 절차(인터록) 단계를 건너뛰거나 끝내지 않은 채 확정하려 함 (Part 8-4)
+    G3InterceptInterlockOrder,
+    /// 설비를 멈추지 않는 우회 완화 조치(바이패스 개방)가 적격 (Part 8-5 Tier 1)
+    G3EligibleAutoBypassMitigation,
     // Gate 4: 조치 절차서 문서
     G4AopDraftVerified,
     G4BlockInternalLeak,
     G4InterceptDocCorruption,
 }
 
-pub const ALL: [Verdict; 23] = [
+pub const ALL: [Verdict; 25] = [
     Verdict::Sec01Boiler,
     Verdict::Sec02Turbine,
     Verdict::Sec03Feedwater,
@@ -66,6 +70,8 @@ pub const ALL: [Verdict; 23] = [
     Verdict::G3AdverseUpstreamCause,
     Verdict::G3ViolationHighRisk,
     Verdict::G3InterceptRubberStamp,
+    Verdict::G3InterceptInterlockOrder,
+    Verdict::G3EligibleAutoBypassMitigation,
     Verdict::G4AopDraftVerified,
     Verdict::G4BlockInternalLeak,
     Verdict::G4InterceptDocCorruption,
@@ -112,6 +118,8 @@ impl Verdict {
             Verdict::G3AdverseUpstreamCause => "G3_ADVERSE_UPSTREAM_CAUSE",
             Verdict::G3ViolationHighRisk => "G3_VIOLATION_HIGH_RISK",
             Verdict::G3InterceptRubberStamp => "G3_INTERCEPT_RUBBER_STAMP",
+            Verdict::G3InterceptInterlockOrder => "G3_INTERCEPT_INTERLOCK_ORDER",
+            Verdict::G3EligibleAutoBypassMitigation => "G3_ELIGIBLE_AUTO_BYPASS_MITIGATION",
             Verdict::G4AopDraftVerified => "G4_AOP_DRAFT_VERIFIED",
             Verdict::G4BlockInternalLeak => "G4_BLOCK_INTERNAL_LEAK",
             Verdict::G4InterceptDocCorruption => "G4_INTERCEPT_DOC_CORRUPTION",
@@ -145,6 +153,8 @@ impl Verdict {
             Verdict::G3AdverseUpstreamCause => "상류 설비 파급 원인",
             Verdict::G3ViolationHighRisk => "단위 설비 단독 고장 (고위험)",
             Verdict::G3InterceptRubberStamp => "근거 없는 고위험 승인 차단",
+            Verdict::G3InterceptInterlockOrder => "선행 절차(인터록) 미완료 차단",
+            Verdict::G3EligibleAutoBypassMitigation => "우회 밸브 완화 조치 적격",
             Verdict::G4AopDraftVerified => "조치 절차서 초안 검증",
             Verdict::G4BlockInternalLeak => "현장 단말 내부 정보 차단",
             Verdict::G4InterceptDocCorruption => "초안 수치 불일치 차단",
@@ -153,7 +163,7 @@ impl Verdict {
 
     pub fn class(self) -> OutcomeClass {
         match self {
-            Verdict::G3EligibleNormal | Verdict::G2MocVerified => OutcomeClass::Favorable,
+            Verdict::G3EligibleNormal | Verdict::G2MocVerified | Verdict::G3EligibleAutoBypassMitigation => OutcomeClass::Favorable,
             Verdict::G3AdverseUpstreamCause | Verdict::G3ViolationHighRisk | Verdict::G2RejectContradictionLock => OutcomeClass::Adverse,
             _ => OutcomeClass::Procedural,
         }
