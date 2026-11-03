@@ -1,0 +1,25 @@
+[package]
+name = "blueprint-models"
+version = "0.1.0"
+edition = "2021"
+description = "blueprint 모델 폴더(AppData) · zoro-gravity 모델 가져오기 · 다운로드 · 삭제"
+license = "Apache-2.0"
+
+[lib]
+name = "blueprint_models"
+path = "src/lib.rs"
+
+[[bin]]
+name = "blueprint-models"
+path = "src/main.rs"
+required-features = ["download"]
+
+[dependencies]
+anyhow = "1"
+dirs = "6"
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+
+[features]
+# 코어 엔진은 폴더 위치만 씁니다(default-features = false). 다운로드와 가져오기는 앱과 명령줄 도구가 합니다.
+default = ["download"]
+download = ["dep:ureq"]

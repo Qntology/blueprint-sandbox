@@ -1,0 +1,29 @@
+# blueprint — 1.2GW 화력발전소 P&ID · 신호 기반 이상 위치 탐색 및 원인 진단 워크스페이스
+#
+# AI 엔진(SigLIP2 크롭 · gocr 문서 인식 · Zoro-1 판단 · 글쓰기)은 zoro-gravity 의 `core/src/ai` 를 그대로 가져왔고,
+# 모델 파일도 zoro-gravity 와 같습니다. AMD GPU 연동(ROCm · Vulkan)은 Qntology 의 candle 포크를 씁니다.
+# 참고 구현: https://github.com/Qntology/zoro-gravity (5-Gate 파이프라인 · 가중치 상주 관리 · 앱 구조)
+
+[workspace]
+members = ["core", "tools/model-settings", "app/src-tauri"]
+resolver = "2"
+
+[patch.crates-io]
+# 포크의 candle-core · candle-nn 으로 바꿉니다. GitHub 의 Qntology master 를 받습니다 (zoro-gravity 와 같은 방식).
+# 로컬 워킹트리로 바꾸려면 git 줄을 주석 처리하고 아래 path 줄의 주석을 푸세요.
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
+# candle-core = { path = "../candle-rocm-vulkan/candle-core" }
+# candle-nn = { path = "../candle-rocm-vulkan/candle-nn" }
+
+[profile.dev]
+incremental = true
+[profile.dev.package.candle-core]
+opt-level = 3
+[profile.dev.package.candle-nn]
+opt-level = 3
+[profile.dev.package.candle-rocm]
+opt-level = 3
+
+[profile.release]
+opt-level = 3

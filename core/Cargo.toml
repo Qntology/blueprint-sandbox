@@ -1,0 +1,38 @@
+[package]
+name = "blueprint-core"
+version = "0.1.0"
+edition = "2021"
+description = "blueprint 발전소 관제 코어: P&ID · KKS 시드 대장, 계통 마인드맵, 시계열 · SDS, 5-Gate 진단 파이프라인, candle 기반 Zoro-1 판단 · 글쓰기"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+# AMD ROCm/HIP 백엔드. `rocm` 기능을 켰을 때만 빌드합니다.
+candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+half = "2"
+hex = "0.4"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+memmap2 = "0.9"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
+zeroize = "1"
+# 모델 폴더(AppData) 위치만 씁니다. 다운로드와 가져오기는 앱이 합니다.
+blueprint-models = { path = "../tools/model-settings", default-features = false }
+
+[features]
+# AMD GPU 기본 경로. Vulkan 은 SDK 없이 드라이버의 vulkan-1.dll 만 있으면 됩니다.
+default = ["vulkan"]
+vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
+# ROCm/HIP. HIP SDK(hipcc, amdhip64, rocblas)가 설치돼 있어야 합니다.
+rocm = ["dep:candle-rocm", "candle-core/rocm", "candle-nn/rocm"]
+# NVIDIA CUDA. 커널을 빌드 때 nvcc 로 컴파일하므로 CUDA Toolkit 이 있어야 합니다.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# Apple Metal. macOS 에서만 빌드되고 따로 설치할 것은 없습니다.
+metal = ["candle-core/metal", "candle-nn/metal"]
