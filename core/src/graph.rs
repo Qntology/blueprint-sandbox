@@ -45,6 +45,21 @@ pub fn hop_depths(db: &Lattice, center: &str, max_hops: usize) -> Vec<Hop> {
     hops
 }
 
+/// 대상 설비에서 본 설비의 깊이. 방향을 지킨 홉 깊이가 있으면 그것이고, 대상과 같은 상류 · 같은 하류에 나란히 붙은
+/// 우회 설비(바이패스 밸브)는 0 입니다. 인터록 단계의 `req_depth` 를 원장 로딩 때 이것으로 검사합니다.
+pub fn depth_of(db: &Lattice, target: &str, kks: &str) -> Option<i32> {
+    if kks == target {
+        return Some(0);
+    }
+    if let Some(h) = hop_depths(db, target, MAX_HOPS).into_iter().find(|h| h.kks == kks) {
+        return Some(h.depth);
+    }
+    let ins = |k: &str| db.in_edges(k).into_iter().map(|e| e.from.clone()).collect::<Vec<_>>();
+    let outs = |k: &str| db.out_edges(k).into_iter().map(|e| e.to.clone()).collect::<Vec<_>>();
+    let shares = |a: Vec<String>, b: Vec<String>| a.iter().any(|x| b.contains(x));
+    (shares(ins(target), ins(kks)) && shares(outs(target), outs(kks))).then_some(0)
+}
+
 fn bfs(db: &Lattice, start: &str, max_hops: usize, upstream: bool) -> HashMap<String, usize> {
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut queue = VecDeque::from([(start.to_string(), 0usize)]);

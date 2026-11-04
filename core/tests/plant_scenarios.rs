@@ -16,6 +16,7 @@ use blueprint_core::audit::AuditCategory;
 use blueprint_core::case::{FieldReport, Signature};
 use blueprint_core::decision::{DecisionModel, DecisionTask};
 use blueprint_core::drafting::TextWriter;
+use blueprint_core::interlock::Evidence;
 use blueprint_core::lattice::Lattice;
 use blueprint_core::policy::AutomationPolicy;
 use blueprint_core::scenario::{Scenario, ScenarioSet};
@@ -195,13 +196,29 @@ fn p2_names_the_stuck_valve_two_hops_up_and_forces_a_cosign() {
     assert!(matches!(stamp, Outcome::Blocked { verdict: Verdict::G3InterceptRubberStamp, .. }), "{stamp:?}");
     let wrong = e.confirm(&id, "OP-201", SupervisorDecision::ApproveHighRisk(Justification::ApplyProcedure { team_lead_cosign: true, procedure_ref: "AOP-102-TB01".into() }), f.now("P2")).unwrap();
     assert!(matches!(wrong, Outcome::Blocked { .. }), "다른 절차서 번호는 막힙니다");
-    let ok = e
-        .confirm(&id, "OP-201", SupervisorDecision::ApproveHighRisk(Justification::ApplyProcedure { team_lead_cosign: true, procedure_ref: "AOP-103-FW02".into() }), f.now("P2"))
-        .unwrap();
+    let cosign = || SupervisorDecision::ApproveHighRisk(Justification::ApplyProcedure { team_lead_cosign: true, procedure_ref: "AOP-103-FW02".into() });
+
+    // 선행 절차 인터록 (Part 8-4): Step 1 (상류 펌프 토출압력 29.4 ≤ 30.0) 은 DCS 값으로 이미 통과, Step 2 (바이패스 개방) 가 남았습니다.
+    let il = e.store.active(&id).unwrap().analysis.interlock.clone().unwrap();
+    assert!(il.steps[0].passed() && !il.steps[1].passed() && !il.steps[2].passed(), "{il:?}");
+    let early = e.confirm(&id, "OP-201", cosign(), f.now("P2")).unwrap();
+    assert!(matches!(&early, Outcome::Blocked { verdict: Verdict::G3InterceptInterlockOrder, reason } if reason.contains("Step 2")), "공동 결재가 맞아도 선행 절차가 남으면 막힙니다: {early:?}");
+    // 순서를 건너뛰면 막고, 개도가 모자라면 받지 않습니다.
+    let skip = e.record_interlock(&id, 3, Evidence::RadioLoto { supervisor: "OP-201".into() }, "OP-201", f.now("P2")).unwrap();
+    assert!(matches!(skip, Outcome::Blocked { verdict: Verdict::G3InterceptInterlockOrder, .. }), "{skip:?}");
+    let short = e.record_interlock(&id, 2, Evidence::Value { value: 30.0, how: "현장 무전".into() }, "OP-201", f.now("P2")).unwrap();
+    assert!(matches!(short, Outcome::Blocked { .. }), "{short:?}");
+    let opened = e.record_interlock(&id, 2, Evidence::Value { value: 65.0, how: "현장 무전".into() }, "OP-201", f.now("P2")).unwrap();
+    assert!(matches!(&opened, Outcome::SupervisorReview { reason, .. } if reason.contains("Step 3")), "{opened:?}");
+    let loto = e.record_interlock(&id, 3, Evidence::RadioLoto { supervisor: "OP-201".into() }, "OP-201", f.now("P2")).unwrap();
+    assert!(matches!(&loto, Outcome::SupervisorReview { reason, .. } if reason.contains("모두")), "{loto:?}");
+
+    let ok = e.confirm(&id, "OP-201", cosign(), f.now("P2")).unwrap();
     assert!(matches!(ok, Outcome::Finalized { .. }), "{ok:?}");
     assert_eq!(e.store.archive()[0].final_code, "APPROVED_HIGH_RISK:G3_ADVERSE_UPSTREAM_CAUSE");
+    // 무입증 확정 · 다른 절차서 번호 · 선행 절차 미완료 확정 · 순서 건너뛰기, 네 번 막았습니다.
     let intercepted = e.store.audit().of(&id).iter().filter(|ev| ev.category == AuditCategory::IllegalActionIntercepted).count();
-    assert_eq!(intercepted, 2);
+    assert_eq!(intercepted, 4);
 }
 
 #[test]
@@ -356,4 +373,60 @@ fn unmasking_a_worker_needs_a_high_risk_case_and_is_always_logged() {
     assert_eq!(e.request_unmask(&id, "OP-201", f.now("P3")).unwrap(), None, "정상 변경 건은 실명 열람 거부");
     let cats: Vec<AuditCategory> = e.store.audit().of(&id).iter().map(|ev| ev.category).collect();
     assert!(cats.contains(&AuditCategory::PrivacyUnmaskDenied));
+}
+
+/// Part 8-5 폐루프: 물리엔진 고장 → SDS 추적 → 사건 → 네 기준 판단 → Tier 1 자동 우회 개방 → 온도 회복.
+/// 판단 대역은 완화 조치에 0.97 을 줍니다 (실제 모델 값은 docs/verification.md).
+#[test]
+fn closed_loop_auto_bypass_recovers_the_superheater_before_trip() {
+    use blueprint_core::physics::{incident_from, Command, Fault, PlantSim, Tracker, TrackState};
+    use blueprint_core::tsdb::LiveRing;
+
+    let db = Lattice::embedded().unwrap();
+    let (mut e, _) = engine(Some(Verdict::G3EligibleAutoBypassMitigation));
+    let t0 = Utc::now();
+    e.enable_automation("OP-201", "발전처 자동화 운영 지침 4.2 (Tier 1 우회 완화)", t0).unwrap();
+    let mut sim = PlantSim::new(&db, t0.timestamp_millis(), 5);
+    let mut ring = LiveRing::default();
+    let mut tracker = Tracker::new();
+    sim.run_into(&mut ring, 250);
+    sim.inject(Fault::ValveStuck { open_pct: 18.0 });
+    let mut opened = None;
+    for _ in 0..40 {
+        sim.run_into(&mut ring, 10);
+        if let Some(call) = tracker.observe(&db, &ring) {
+            opened = Some(call);
+            break;
+        }
+    }
+    let call = opened.expect("과열기 선행 경보에서 사건을 엽니다");
+    let incident = incident_from(&db, &call, &ring, "INC-PHYS-1");
+    let out = e.run(&db, incident, Utc::now()).unwrap();
+    assert_eq!(verdict_of(&out), Some(Verdict::G3AdverseUpstreamCause), "{out:?}");
+    let m = e.propose_mitigation(&db, "INC-PHYS-1", Utc::now()).unwrap().expect("바이패스 완화 조치");
+    assert!(m.auto && m.executed_at.is_some(), "자동화 모드 · 규칙 통과 · 최솟값 0.97 → 자동 실행: {m:?}");
+    assert_eq!(m.decided.axes.len(), 4, "네 기준을 따로 묻습니다");
+    assert!(e.store.audit().of("INC-PHYS-1").iter().any(|ev| ev.category == AuditCategory::AutoFinalized));
+    // 사건의 판정(상류 원인 · 고위험 절차서)은 자동 확정되지 않고 교대감독에게 남습니다.
+    assert!(e.store.active("INC-PHYS-1").is_some());
+
+    let blueprint_core::mitigation::Action::OpenBypass { open_pct, .. } = m.action;
+    sim.command(Command::SetBypass { open_pct });
+    tracker.mitigating(&["10HAH10CT001"], sim.now_ms(), "바이패스 자동 개방");
+    let mut peak: f64 = 0.0;
+    for _ in 0..90 {
+        sim.run_into(&mut ring, 10);
+        tracker.observe(&db, &ring);
+        peak = peak.max(sim.true_value("10HAH10CT001").unwrap());
+    }
+    let last = sim.true_value("10HAH10CT001").unwrap();
+    assert!(peak < 645.0, "트립 한계 전에 꺾입니다: 고점 {peak}");
+    assert!(last < peak - 3.0, "내려오고 있습니다 (열 시정수 약 140초): {peak} → {last}");
+    assert!(tracker.events.iter().any(|ev| ev.to == TrackState::Recovering), "{:?}", tracker.events);
+    // 우회가 열렸으니 인터록 Step 2 (바이패스 ≥ 50 %) 는 이제 계측값으로 채워집니다.
+    let mut il = e.store.active("INC-PHYS-1").unwrap().analysis.interlock.clone().unwrap();
+    // 1초 간격 계열은 정각 초에서 끝나므로 그 시각으로 묻습니다.
+    let now = sim.now_ms() - sim.now_ms().rem_euclid(1000);
+    blueprint_core::interlock::refresh_all(&mut il, &ring.snapshot(), now, &[]);
+    assert!(il.steps[1].passed(), "{:?}", il.steps[1]);
 }

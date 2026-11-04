@@ -1,16 +1,18 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlarmQueue } from "./AlarmQueue";
 import { MiningLanes, MiningPanel } from "./MiningPanel";
 import { ModelSettings } from "./ModelSettings";
 import { PlantTopologyView } from "./PlantTopologyView";
 import { SidePanel } from "./SidePanel";
+import { PhysicsPanel } from "./PhysicsPanel";
+import { SearchBox } from "./SearchBox";
 import { StageBar, StageDrawer } from "./StagePanel";
 import { TimeScrubber } from "./TimeScrubber";
 import type { ArchiveDoc, ConsoleStatus, Detail, IncidentRow, Plant, ScenarioInfo, VerdictInfo } from "./types";
 
-export type DrawerKey = 1 | 2 | 3 | 4 | 5 | "sds" | "archive" | null;
+export type DrawerKey = 1 | 2 | 3 | 4 | 5 | "sds" | "archive" | "physics" | null;
 
 /** 주제어실(MCR) 통합 관제 콘솔 (기획 Part 8-1). 세 뷰 · 우측 패널 · 단계 바가 하나의 선택 설비(`selectedKks`)로 맞물립니다. */
 export function OfficerView() {
@@ -53,6 +55,7 @@ export function OfficerView() {
   }, [refresh]);
 
   // 사건을 고르면 상세를 받고, 선택 설비를 근본 원인(없으면 경보 설비)으로 옮깁니다.
+  const archiveShown = useRef<string | null>(null);
   const loadDetail = useCallback((id: string, keepSelection = false) => {
     setArchive(null);
     invoke<Detail>("incident_detail", { id })
@@ -67,7 +70,11 @@ export function OfficerView() {
         setDetail(null);
         invoke<ArchiveDoc>("archive_detail", { id }).then((a) => {
           setArchive(a);
-          setDrawer("archive");
+          // 확정 직후 한 번만 보관 문서를 엽니다. 목록이 새로 올 때마다 다시 열면 닫아도 계속 화면을 가립니다.
+          if (archiveShown.current !== id) {
+            archiveShown.current = id;
+            setDrawer("archive");
+          }
         });
       });
   }, []);
@@ -118,6 +125,7 @@ export function OfficerView() {
       <header className="console-header">
         <strong className="brand">⚡ blueprint 1.2GW 발전소 관제 콘솔</strong>
         <span className="muted">{plant?.kind}</span>
+        <SearchBox onSelect={(kks) => setSelectedKks(kks)} onPick={(id) => pick(id)} />
         <span className="grow" />
         <label className="inline">
           교대감독 사번
@@ -148,6 +156,9 @@ export function OfficerView() {
             </option>
           ))}
         </select>
+        <button className="plain physics-open" onClick={() => setDrawer("physics")}>
+          ⚡ 물리엔진 · 자율 대응
+        </button>
         <button className="plain" onClick={() => setSettingsOpen((o) => !o)}>
           {settingsOpen ? "모델 설정 닫기" : "모델 설정"}
         </button>
@@ -215,7 +226,29 @@ export function OfficerView() {
         <span>감사 기록 {status?.audit_count ?? 0}건</span>
         {status?.audit_last[0] && <span className="audit-tail">{status.audit_last[0]}</span>}
       </footer>
-      {drawer !== null && (
+      {drawer === "physics" && plant && (
+        <div className="drawer">
+          <header>
+            <strong>⚡ [물리엔진 이벤트 시뮬레이터 & Zoro-1 자율 대응 (Part 8-5)] 명령은 시뮬레이터에만 들어갑니다</strong>
+            <span className="grow" />
+            <button className="plain" onClick={() => setDrawer(null)}>
+              [X 닫기]
+            </button>
+          </header>
+          <div className="drawer-body">
+            <PhysicsPanel
+              plant={plant}
+              supervisor={supervisor}
+              automation={!!status?.automation}
+              onOpenIncident={(id) => {
+                setDrawer(null);
+                pick(id);
+              }}
+            />
+          </div>
+        </div>
+      )}
+      {drawer !== null && drawer !== "physics" && (
         <StageDrawer
           which={drawer}
           detail={detail}

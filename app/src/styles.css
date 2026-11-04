@@ -276,3 +276,82 @@ button.big { padding: 20px 40px; font-size: 21px; border-radius: 8px; }
 .notice-doc { margin: 0; padding: 14px; font: inherit; font-size: 17px; white-space: pre-wrap; background: #f6f8fa; border: 1px solid #c8ced6; border-radius: 6px; }
 .spinner { width: 42px; height: 42px; border: 4px solid #c8ced6; border-top-color: #0b6bcb; border-radius: 50%; animation: spin 1s linear infinite; align-self: center; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* 선행 절차 인터록 (Part 8-4) */
+.interlock { margin: 6px 0 10px; padding: 8px; background: #121722; border: 1px solid var(--line); border-radius: 6px; }
+.interlock h4 { margin: 0 0 6px; }
+.il-step { padding: 6px 8px; margin-top: 6px; border-left: 3px solid var(--yellow); background: #171c27; }
+.il-step.passed { border-left-color: var(--green); opacity: 0.9; }
+.il-head { font-size: 12px; color: var(--muted); }
+.il-evidence { font-size: 12px; color: #9fb0cc; margin-top: 2px; }
+.il-evidence.warn { color: var(--yellow); }
+.il-input { display: flex; gap: 6px; margin-top: 4px; }
+.il-input input { width: 140px; }
+
+/* A0 종합 도면 · 타일 (Part 8-4) */
+.a0-chip { border-style: dashed; }
+.a0-view { display: flex; flex-direction: column; gap: 6px; min-height: 0; }
+.a0-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; font-size: 12px; }
+.a0-sheet { position: relative; width: 100%; max-height: calc(100vh - 330px); overflow: hidden; background: #fff; border: 1px solid var(--line); border-radius: 4px; }
+.a0-canvas { position: absolute; inset: 0; transform-origin: 0 0; transition: transform 0.35s ease; }
+.a0-canvas img { position: absolute; image-rendering: auto; }
+.a0-tile { position: absolute; border: 1px dashed rgba(58, 160, 255, 0.55); cursor: zoom-in; }
+.a0-tile span { position: absolute; left: 4px; top: 2px; font: bold 13px/1 "Malgun Gothic", sans-serif; color: #1c5fa8; background: rgba(255, 255, 255, 0.8); padding: 1px 4px; border-radius: 3px; }
+.a0-tile.selected { background: rgba(58, 160, 255, 0.10); border: 2px solid #3aa0ff; }
+.a0-tile.root { background: rgba(255, 77, 79, 0.10); border: 2px solid #ff4d4f; }
+.a0-tile.alarm span { color: #c76b00; }
+.a0-eq { position: absolute; padding: 0; background: transparent; border: 2px solid transparent; border-radius: 2px; }
+.a0-eq:hover { border-color: rgba(58, 160, 255, 0.8); }
+.a0-eq.selected { border-color: #3aa0ff; box-shadow: 0 0 0 2px rgba(58, 160, 255, 0.35); }
+.a0-eq.root { border-color: #ff4d4f; }
+.a0-eq.alarm { border-color: #ff9f43; }
+.a0-minimap { position: absolute; right: 8px; bottom: 8px; display: grid; gap: 2px; padding: 4px; background: rgba(16, 19, 26, 0.85); border-radius: 4px; }
+.a0-mini { padding: 2px 6px; font-size: 10px; color: #cbd5e1; background: #222938; border: 1px solid #364055; }
+.a0-mini.selected { border-color: #3aa0ff; color: #fff; }
+.a0-mini.root { background: #4a1d20; }
+.a0-mini.zoomed { outline: 2px solid #f6c453; }
+
+/* 다중 이슈 분해 트리 (Part 8-6) */
+.issues { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; padding: 8px; background: #141925; border: 1px solid var(--line); border-left: 4px solid #59606e; border-radius: 6px; }
+.issues.compound { border-left-color: var(--red); }
+.issues.procedural { border-left-color: var(--amber); }
+.issues.single { border-left-color: var(--blue); }
+.issues-head { font-size: 12px; }
+.issue { display: flex; flex-direction: column; gap: 1px; align-items: stretch; text-align: left; padding: 5px 7px; font-size: 11px; color: var(--text); background: #1a2030; border: 1px solid #2a3244; }
+.issue:disabled { cursor: default; opacity: 1; }
+.issue.resolved { opacity: 0.6; }
+.issue.procedure { border-color: #5c4a1a; }
+.issue.equipment { border-color: #5c2a2a; }
+.issue-title { font-weight: bold; }
+
+/* 물리엔진 · 자율 대응 (Part 8-5) */
+.physics-open { border: 1px solid var(--amber); }
+.physics-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 6px; }
+.physics-latest { display: flex; flex-wrap: wrap; gap: 12px; font-size: 11px; color: #9fb0cc; margin-top: 6px; }
+.physics-log { max-height: 260px; overflow-y: auto; font-size: 11px; }
+.physics-signals { max-height: 150px; }
+.mitigation { margin-top: 8px; padding: 8px; background: #13202a; border: 1px solid #2c5b4a; border-radius: 6px; }
+.mitigation.done { border-color: var(--green); }
+.bar-line { display: grid; grid-template-columns: 1fr 120px 44px; gap: 6px; align-items: center; font-size: 11px; }
+.bar-line .bar { height: 8px; background: #222938; border-radius: 4px; overflow: hidden; }
+.bar-line .bar i { display: block; height: 100%; background: linear-gradient(90deg, #2f80ed, #4fd1c5); }
+
+/* 자연어 검색 (logis-center 방식) */
+.search { position: relative; flex: 1; min-width: 260px; max-width: 560px; }
+.search-input { width: 100%; padding: 5px 8px; font-size: 12px; color: var(--text); background: #0f131a; border: 1px solid var(--line); border-radius: 4px; }
+.search-results { position: absolute; z-index: 50; left: 0; top: 34px; width: min(760px, 90vw); max-height: 70vh; overflow-y: auto; padding: 8px; background: #121722; border: 1px solid var(--blue); border-radius: 6px; box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5); }
+.search-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 12px; margin-bottom: 4px; }
+.search-head .cond { padding: 1px 6px; border-radius: 10px; font-size: 11px; }
+.search-head .cond.on { background: #1d3a5c; color: #cfe3ff; }
+.search-head .cond.hint { background: #3a3220; color: #f6d48b; }
+.search-note { font-size: 11px; color: var(--muted); }
+.search-hit { display: flex; flex-direction: column; gap: 1px; width: 100%; margin-top: 4px; padding: 6px 8px; text-align: left; color: var(--text); background: #171c27; border: 1px solid #2a3244; }
+.search-hit.weak { opacity: 0.6; }
+.search-hit .hit-line { font-size: 12px; }
+.search-hit .why { font-size: 11px; color: #9fb0cc; }
+.search-hit .kind { display: inline-block; min-width: 38px; padding: 0 4px; font-size: 10px; text-align: center; border-radius: 3px; background: #2a3244; }
+.search-hit .kind.equipment { background: #1d3a5c; }
+.search-hit .kind.sensor { background: #1d4a3c; }
+.search-hit .kind.incident { background: #5c1d1d; }
+.search-hit .kind.aop { background: #4a3a1d; }
+.search-hit .kind.moc { background: #3d1d5c; }

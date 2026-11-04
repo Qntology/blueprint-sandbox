@@ -18,6 +18,8 @@ use crate::audit::{Actor, AuditCategory, AuditEvent};
 use crate::case::{FieldReport, Incident};
 use crate::decision::DecisionModel;
 use crate::drafting::TextWriter;
+use crate::interlock::{self, Evidence, InterlockError};
+use crate::mitigation::{self, Mitigation};
 use crate::lattice::Lattice;
 use crate::policy::{AutomationPolicy, Disposition};
 use crate::privacy::{self, mask_name};
@@ -169,21 +171,22 @@ impl Engine {
 
     fn open(&mut self, incident: Incident, analysis: Analysis, judgement: Option<Judgement>, status: SessionStatus, reason: String, opened_at: DateTime<Utc>) -> Result<()> {
         let notes = analysis.notes.clone();
-        self.store.open(Session { incident, analysis, judgement, status, reason, notes, opened_at, field_request: None })
+        self.store.open(Session { incident, analysis, judgement, status, reason, notes, opened_at, field_request: None, mitigation: None })
     }
 
     /// 진행 중인 사건에 현장 보고를 붙이고 다시 분석합니다. 분석 시각은 보고 시각까지 당깁니다.
     pub fn attach_report(&mut self, db: &Lattice, incident_id: &str, report: FieldReport, now: DateTime<Utc>) -> Result<Outcome> {
         let Some(session) = self.store.take(incident_id) else { bail!("진행 중인 사건이 아닙니다: {incident_id}") };
-        let Session { mut incident, opened_at, .. } = session;
+        let Session { mut incident, opened_at, analysis: before, .. } = session;
         incident.received_at = incident.received_at.max(report.taken_at);
         incident.reports.push(report);
-        let analysis = match analyze(db, &incident, self.brains(), &Self::sds_id(&incident)) {
+        let mut analysis = match analyze(db, &incident, self.brains(), &Self::sds_id(&incident)) {
             Ok(a) => a,
             Err(e) => {
                 // 다시 분석하지 못해도 사건을 잃으면 안 됩니다. 보고를 뺀 채로 되돌립니다.
                 incident.reports.pop();
-                let analysis = analyze(db, &incident, self.brains(), &Self::sds_id(&incident))?;
+                let mut analysis = analyze(db, &incident, self.brains(), &Self::sds_id(&incident))?;
+                carry_interlock(&before, &mut analysis);
                 self.open(incident, analysis, None, SessionStatus::SupervisorReview, format!("현장 보고를 반영하지 못했습니다: {e}"), opened_at)?;
                 return Err(e);
             }
@@ -191,7 +194,8 @@ impl Engine {
         if analysis.next == Next::FieldRetry {
             let reason = analysis.reason.clone();
             incident.reports.pop();
-            let previous = analyze(db, &incident, self.brains(), &Self::sds_id(&incident))?;
+            let mut previous = analyze(db, &incident, self.brains(), &Self::sds_id(&incident))?;
+            carry_interlock(&before, &mut previous);
             let status = if previous.next == Next::AwaitingField { SessionStatus::AwaitingField } else { SessionStatus::SupervisorReview };
             let prev_reason = previous.reason.clone();
             self.open(incident, previous, None, status, prev_reason, opened_at)?;
@@ -200,7 +204,134 @@ impl Engine {
         // 감사 로그에는 사번 대신 솔트 해시를 남깁니다.
         let worker = incident.reports.last().and_then(|r| r.worker_id.as_deref()).map(|w| privacy::salted_hash(&self.salt, w)[..12].to_string()).unwrap_or_else(|| "없음".into());
         record(&mut self.store, now, Actor::FieldTerminal, AuditCategory::DecisionRecorded, incident_id, None, format!("현장 보고 반영 · 재분석 (작업자 {worker})"));
+        carry_interlock(&before, &mut analysis);
         self.settle(incident, analysis, now, opened_at)
+    }
+
+    /// 교대감독이 선행 절차 인터록 단계 하나를 채웁니다 (Part 8-4). 앞 단계를 건너뛰면 막고 감사 로그에 남깁니다.
+    pub fn record_interlock(&mut self, incident_id: &str, step: u32, evidence: Evidence, supervisor: &str, now: DateTime<Utc>) -> Result<Outcome> {
+        let Some(s) = self.store.active_mut(incident_id) else { bail!("진행 중인 사건이 아닙니다: {incident_id}") };
+        let judgement = s.judgement.clone();
+        let Some(state) = s.analysis.interlock.as_mut() else { bail!("이 사건의 절차서에는 선행 절차 인터록이 없습니다") };
+        match interlock::record(state, step, evidence) {
+            Ok(done) => {
+                let text = format!("인터록 Step {} 확인 · {}", done.no, done.evidence.clone().unwrap_or_default());
+                let left = state.missing().iter().map(|m| format!("Step {}", m.no)).collect::<Vec<_>>();
+                record(&mut self.store, now, Actor::SupervisorConsole, AuditCategory::DecisionRecorded, incident_id, Some(supervisor), text);
+                let reason = if left.is_empty() { "선행 절차를 모두 확인했습니다. 확정할 수 있습니다".to_string() } else { format!("남은 선행 절차: {}", left.join(", ")) };
+                Ok(Outcome::SupervisorReview { judgement, reason })
+            }
+            Err(e) => {
+                let category = if matches!(e, InterlockError::OutOfOrder { .. }) { AuditCategory::IllegalActionIntercepted } else { AuditCategory::DecisionRecorded };
+                let actor = if category == AuditCategory::IllegalActionIntercepted { Actor::ZoroGuardrail } else { Actor::SupervisorConsole };
+                record(&mut self.store, now, actor, category, incident_id, Some(supervisor), format!("인터록 확인 거부 · {e}"));
+                Ok(Outcome::Blocked { verdict: Verdict::G3InterceptInterlockOrder, reason: e.to_string() })
+            }
+        }
+    }
+
+    /// 글쓰기 모델 없이 분석합니다 (AOP 초안은 사실 줄 템플릿). 물리엔진 모드에서 완화 조치를 먼저 내려고 씁니다:
+    /// 글쓰기(10 ~ 20초)를 기다리면 공정이 그동안 트립 쪽으로 움직입니다. 모델 초안은 [`Engine::redraft`] 로 뒤에 다시 씁니다.
+    pub fn run_quick(&mut self, db: &Lattice, incident: Incident, now: DateTime<Utc>) -> Result<Outcome> {
+        let writer = self.writer.take();
+        let out = self.run(db, incident, now);
+        self.writer = writer;
+        out
+    }
+
+    /// 진행 중 사건의 AOP 초안을 글쓰기 모델로 다시 씁니다 (인터록 · 완화 조치 기록은 그대로). 글쓰기 모델이 없으면 false.
+    pub fn redraft(&mut self, db: &Lattice, incident_id: &str) -> Result<bool> {
+        if self.writer.is_none() {
+            return Ok(false);
+        }
+        let Some(s) = self.store.active(incident_id) else { bail!("진행 중인 사건이 아닙니다: {incident_id}") };
+        let fresh = analyze(db, &s.incident, self.brains(), &Self::sds_id(&s.incident))?;
+        let Some(s) = self.store.active_mut(incident_id) else { bail!("진행 중인 사건이 아닙니다: {incident_id}") };
+        s.analysis.draft = fresh.draft;
+        if let (Some(old), Some(new)) = (s.analysis.stages.iter_mut().find(|x| x.stage == 5), fresh.stages.into_iter().find(|x| x.stage == 5)) {
+            *old = new;
+        }
+        Ok(true)
+    }
+
+    /// 자율 대응 (Part 8-5): Tier 1 완화 조치(급수 바이패스 개방)를 세우고 네 기준으로 묻고, 정책이 자동 실행인지 정합니다.
+    /// 자동이면 실행 기록까지 남기고 돌려줍니다 (호출한 쪽이 시뮬레이터에 명령을 넣습니다). 사건의 판정 · 결재는 그대로 남습니다.
+    pub fn propose_mitigation(&mut self, db: &Lattice, incident_id: &str, now: DateTime<Utc>) -> Result<Option<Mitigation>> {
+        let Some(s) = self.store.active(incident_id) else { bail!("진행 중인 사건이 아닙니다: {incident_id}") };
+        let Some((action, gates, facts)) = mitigation::plan(db, &s.analysis) else { return Ok(None) };
+        let decided = mitigation::judge(&facts, self.brains().model)?;
+        let gates_clear = gates.iter().all(|g| g.1);
+        let (auto, reason, post_audit) = match self.policy.disposition(&decided.judgement, gates_clear, false, incident_id) {
+            Disposition::AutoFinalize { post_audit } => (true, "자동화 모드 · 규칙 통과 · 네 기준 최솟값이 기준 이상 → Tier 1 자동 실행".to_string(), post_audit),
+            Disposition::PendingSupervisor { reason } => (false, reason, false),
+        };
+        let label = action.label(db);
+        let confidence = decided.judgement.confidence.map(|p| format!("{p:.3}")).unwrap_or_else(|| "없음".into());
+        let mut m = Mitigation {
+            action,
+            label: label.clone(),
+            tier: mitigation::Tier::Tier1,
+            verdict: Verdict::G3EligibleAutoBypassMitigation,
+            gates,
+            facts: facts.into_iter().map(|f| (f.key, f.value)).collect(),
+            decided,
+            auto,
+            reason: reason.clone(),
+            post_audit,
+            executed_at: None,
+            executed_by: None,
+        };
+        record(&mut self.store, now, Actor::System, AuditCategory::DecisionRecorded, incident_id, None, format!("완화 조치 제안 · {label} · 최솟값 {confidence} · {reason}"));
+        if auto {
+            m.executed_at = Some(now);
+            m.executed_by = Some("Zoro-1 자동 (Tier 1)".into());
+            let audit = if post_audit { " · 사후 샘플 감사 대상" } else { "" };
+            record(&mut self.store, now, Actor::ZoroGuardrail, AuditCategory::AutoFinalized, incident_id, None, format!("완화 조치 자동 실행 · {label}{audit}"));
+        }
+        if let Some(s) = self.store.active_mut(incident_id) {
+            s.mitigation = Some(m.clone());
+        }
+        Ok(Some(m))
+    }
+
+    /// 실시간 계측이 바뀌면 남은 인터록 단계를 다시 봅니다 (예: 자동 우회 개방 뒤 Step 2). 새로 채운 단계가 있으면 감사 기록에 남기고 true.
+    pub fn refresh_interlock(&mut self, incident_id: &str, telemetry: &crate::timeseries::Telemetry, now_ms: i64, now: DateTime<Utc>) -> bool {
+        let Some(s) = self.store.active_mut(incident_id) else { return false };
+        let reports = s.incident.reports.clone();
+        let Some(il) = s.analysis.interlock.as_mut() else { return false };
+        let before: Vec<u32> = il.steps.iter().filter(|x| x.passed()).map(|x| x.no).collect();
+        interlock::refresh_all(il, telemetry, now_ms, &reports);
+        let newly: Vec<String> = il.steps.iter().filter(|x| x.passed() && !before.contains(&x.no)).map(|x| format!("Step {} · {}", x.no, x.evidence.clone().unwrap_or_default())).collect();
+        if newly.is_empty() {
+            return false;
+        }
+        record(&mut self.store, now, Actor::System, AuditCategory::DecisionRecorded, incident_id, None, format!("인터록 계측 확인 · {}", newly.join(" / ")));
+        true
+    }
+
+    /// 보조 모드 · 확신도 미달일 때 교대감독이 완화 조치를 실행합니다 (Tier 1 이라 공동 결재는 필요 없음).
+    pub fn execute_mitigation(&mut self, incident_id: &str, supervisor: &str, now: DateTime<Utc>) -> Result<Mitigation> {
+        let Some(s) = self.store.active_mut(incident_id) else { bail!("진행 중인 사건이 아닙니다: {incident_id}") };
+        let Some(m) = s.mitigation.as_mut() else { bail!("제안된 완화 조치가 없습니다") };
+        if m.executed_at.is_some() {
+            bail!("이미 실행한 완화 조치입니다");
+        }
+        m.executed_at = Some(now);
+        m.executed_by = Some(format!("교대감독 {supervisor}"));
+        let done = m.clone();
+        record(&mut self.store, now, Actor::SupervisorConsole, AuditCategory::DecisionRecorded, incident_id, Some(supervisor), format!("완화 조치 실행 · {}", done.label));
+        Ok(done)
+    }
+
+    /// 선행 절차가 남았으면 확정을 막습니다 (Part 8-6 절차 이슈 B-3 · 조치 순서 역순 위반).
+    fn interlock_gate(&mut self, incident_id: &str, supervisor: &str, now: DateTime<Utc>) -> Option<Outcome> {
+        let pending = {
+            let state = self.store.active(incident_id)?.analysis.interlock.as_ref()?;
+            let p = state.next_pending()?;
+            (p.no, p.text.clone())
+        };
+        record(&mut self.store, now, Actor::ZoroGuardrail, AuditCategory::IllegalActionIntercepted, incident_id, Some(supervisor), format!("선행 절차 Step {} 미완료 상태에서 확정 시도 → 차단", pending.0));
+        Some(Outcome::Blocked { verdict: Verdict::G3InterceptInterlockOrder, reason: format!("선행 절차 Step {} ({}) 를 먼저 끝내야 확정할 수 있습니다", pending.0, pending.1) })
     }
 
     /// 교대감독 결정. 확정이면 Gate 5 까지 실행합니다.
@@ -226,12 +357,21 @@ impl Engine {
                         reason: "고위험 조치(감발 · 정지 등)가 든 절차서는 파트장 공동 결재와 근거 절차서 번호가 있어야 확정할 수 있습니다".into(),
                     });
                 }
+                if let Some(blocked) = self.interlock_gate(incident_id, supervisor, now) {
+                    return Ok(blocked);
+                }
                 let apply_moc = j.verdict == Verdict::G2MocVerified;
                 self.finish(incident_id, Closing { final_code: j.verdict.code().to_string(), actor: Actor::SupervisorConsole, supervisor: sup, special_audit_flag: false, post_audit: false, apply_moc }, now)
             }
             SupervisorDecision::ApproveHighRisk(justification) => match approve_high_risk(aop_id.as_deref(), Some(&justification)) {
                 Ok(ApprovalOutcome::Reverted) => Ok(Outcome::SupervisorReview { judgement: Some(j), reason: "승인을 취소했습니다. 결재 전 상태입니다".into() }),
                 Ok(ApprovalOutcome::Approved { special_audit_flag }) => {
+                    // 오경보 처리는 절차를 실행하지 않으므로 인터록을 보지 않습니다. 절차 적용(공동 결재)은 선행 절차가 끝나야 합니다.
+                    if matches!(justification, Justification::ApplyProcedure { .. }) {
+                        if let Some(blocked) = self.interlock_gate(incident_id, supervisor, now) {
+                            return Ok(blocked);
+                        }
+                    }
                     let (code, label) = match &justification {
                         Justification::ProveFalsePositive { .. } => (format!("OVERRIDE_FALSE_POSITIVE:{}", j.verdict.code()), "현장 증빙으로 오경보 처리 (감사실 보고)"),
                         _ => (format!("APPROVED_HIGH_RISK:{}", j.verdict.code()), "고위험 조치 공동 결재"),
@@ -354,4 +494,17 @@ impl Engine {
 
 fn record(store: &mut Store, at: DateTime<Utc>, actor: Actor, category: AuditCategory, id: &str, officer: Option<&str>, detail: impl Into<String>) {
     store.record(AuditEvent::new(at, actor, category, id, officer, detail));
+}
+
+/// 다시 분석해도 교대감독이 이미 확인한 인터록 단계는 그대로 둡니다 (현장 보고가 들어올 때).
+fn carry_interlock(before: &Analysis, after: &mut Analysis) {
+    let (Some(old), Some(new)) = (before.interlock.as_ref(), after.interlock.as_mut()) else { return };
+    if old.aop_id != new.aop_id {
+        return;
+    }
+    for step in new.steps.iter_mut().filter(|s| !s.passed()) {
+        if let Some(prev) = old.steps.iter().find(|p| p.no == step.no && p.passed()) {
+            *step = prev.clone();
+        }
+    }
 }

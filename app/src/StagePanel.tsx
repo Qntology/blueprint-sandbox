@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useMemo, useState } from "react";
 import type { DrawerKey } from "./OfficerView";
 import { clock, fixed, fmt, signedSecs, STAGE_LABEL } from "./plant";
-import type { ArchiveDoc, Asked, Detail, Plant, VerdictInfo } from "./types";
+import type { ArchiveDoc, Asked, Detail, InterlockStep, Plant, VerdictInfo } from "./types";
 import { WaveChart, type Trace } from "./WaveChart";
 
 const STAGE_CLASS: Record<string, string> = { Done: "ok", Skipped: "skip", Corrected: "fix", Alert: "alert", Waiting: "wait", Blocked: "block" };
@@ -324,6 +324,74 @@ function Decision({ detail, catalog }: { detail: Detail; catalog: Record<string,
   );
 }
 
+const DEPTH = (d: number) => (d > 0 ? `+${d}` : `${d}`);
+
+function requirement(s: InterlockStep): string {
+  const unit = s.unit ?? "";
+  if (s.check.kind === "below") return `${fmt(s.check.value)} ${unit} 이하`;
+  if (s.check.kind === "at_least") return `${fmt(s.check.value)} ${unit} 이상`;
+  return "현장 LOTO 서명";
+}
+
+/** 깊이별 선행 절차(Interlock) 체크 (Part 8-4). 순서대로 끝나야 아래 확정이 풀립니다. */
+function InterlockPanel({ detail, supervisor, onChanged }: { detail: Detail; supervisor: string; onChanged: (m: string) => void }) {
+  const il = detail.analysis.interlock;
+  const [values, setValues] = useState<Record<number, string>>({});
+  const [busy, setBusy] = useState(false);
+  if (!il) return null;
+  const next = il.steps.find((s) => s.status !== "passed");
+  const submit = async (step: number, value: number | null, radio: boolean) => {
+    setBusy(true);
+    try {
+      const r = await invoke<{ ok: boolean; message: string }>("record_interlock", { input: { id: detail.id, supervisor_id: supervisor, step, value, radio } });
+      onChanged(r.message);
+    } catch (e) {
+      onChanged(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="interlock">
+      <h4>
+        [{il.aop_id} 깊이별 선행 절차 (Interlock)] <span className="muted">순서대로 끝나야 확정이 풀립니다</span>
+      </h4>
+      {il.steps.map((s) => (
+        <div key={s.no} className={`il-step ${s.status}`}>
+          <div className="il-head">
+            <b>[Step {s.no}]</b> Depth {DEPTH(s.req_depth)} · <span className="mono">{s.kks}</span>
+          </div>
+          <div>
+            {s.status === "passed" ? "☑" : "☐"} {s.text}
+          </div>
+          {s.evidence && <div className="il-evidence">➔ {s.evidence}</div>}
+          {s.status !== "passed" && (
+            <div className="il-evidence warn">
+              {s.observed != null ? `현재 ${fmt(s.observed)} ${s.unit ?? ""} · ` : ""}필요: {requirement(s)}
+              {next?.no !== s.no ? ` · Step ${next?.no} 먼저` : ""}
+            </div>
+          )}
+          {s.status !== "passed" && s.check.kind !== "loto" && (
+            <div className="il-input">
+              <input type="number" placeholder={`현장 값 (${s.unit ?? ""})`} value={values[s.no] ?? ""} onChange={(e) => setValues({ ...values, [s.no]: e.target.value })} />
+              <button className="plain" disabled={busy || next?.no !== s.no || !values[s.no]} onClick={() => submit(s.no, Number(values[s.no]), false)}>
+                현장 값 확인
+              </button>
+            </div>
+          )}
+          {s.status !== "passed" && s.check.kind === "loto" && (
+            <div className="il-input">
+              <button className="plain" disabled={busy || next?.no !== s.no} onClick={() => submit(s.no, null, true)}>
+                교대감독 무전 확인으로 갈음 (사번 날인)
+              </button>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Approval({ detail, supervisor, onDecided }: { detail: Detail; supervisor: string; onDecided: (m: string) => void }) {
   const d = detail.analysis.draft;
   const [ref, setRef] = useState(d?.aop_id ?? "");
@@ -332,6 +400,7 @@ function Approval({ detail, supervisor, onDecided }: { detail: Detail; superviso
   const [note, setNote] = useState("");
   const [reply, setReply] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const pending = detail.analysis.interlock?.steps.find((s) => s.status !== "passed") ?? null;
   const act = async (action: string) => {
     setBusy(true);
     try {
@@ -378,6 +447,14 @@ function Approval({ detail, supervisor, onDecided }: { detail: Detail; superviso
             </ul>
           </>
         )}
+        <InterlockPanel
+          detail={detail}
+          supervisor={supervisor}
+          onChanged={(m) => {
+            setReply(m);
+            onDecided(m);
+          }}
+        />
         <h4>[{d?.high_risk ? "고위험 계통 조작 승인 (policy.rs 안전 가드레일)" : "교대감독 확정"}]</h4>
         {d?.high_risk && (
           <>
@@ -412,13 +489,18 @@ function Approval({ detail, supervisor, onDecided }: { detail: Detail; superviso
           <button className="plain" disabled={busy} onClick={() => act("reject")}>
             반려
           </button>
-          <button className="danger-fill" disabled={busy} onClick={() => act(d?.high_risk ? "approve_procedure" : "confirm")}>
-            🚨 조치확정
+          <button className="danger-fill" disabled={busy || !!pending} onClick={() => act(d?.high_risk ? "approve_procedure" : "confirm")}>
+            {pending ? `🔒 조치확정 (Step ${pending.no} 필요)` : "🚨 조치확정"}
           </button>
         </div>
         {d?.high_risk && (
           <button className="plain small" disabled={busy} onClick={() => act("confirm")}>
             (시험) 공동 결재 없이 확정 시도
+          </button>
+        )}
+        {pending && (
+          <button className="plain small" disabled={busy} onClick={() => act(d?.high_risk ? "approve_procedure" : "confirm")}>
+            (시험) 선행 절차를 건너뛰고 확정 시도
           </button>
         )}
         {reply && <p className="note">{reply}</p>}

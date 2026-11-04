@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useState } from "react";
 import type { Context } from "../PlantTopologyView";
 import { equipmentLevel, fmt, hopDepths, MEDIUM_COLOR, sensorsOf, valueAt } from "../plant";
+import { A0View } from "./A0View";
 
 const images = new Map<string, string>();
 
@@ -19,10 +20,12 @@ export function DrawingView({ ctx }: { ctx: Context }) {
   // 다른 뷰에서 다른 도면의 설비를 고르면 그 도면으로 넘어갑니다.
   useEffect(() => {
     const d = plant.equipment.find((e) => e.kks === selected)?.drawing;
-    if (d && d !== drawing) setDrawing(d);
+    // A0 종합 뷰에서는 설비를 골라도 마스터 도면으로 넘어가지 않습니다.
+    if (d && d !== drawing && !drawing.startsWith("A0:")) setDrawing(d);
   }, [selected, plant]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
+    if (drawing.startsWith("A0:")) return;
     const cached = images.get(drawing);
     if (cached) {
       setSrc(cached);
@@ -56,7 +59,16 @@ export function DrawingView({ ctx }: { ctx: Context }) {
             </button>
           );
         })}
+        {plant.a0.map((a) => (
+          <button key={a.id} className={drawing === `A0:${a.id}` ? "chip active a0-chip" : "chip a0-chip"} onClick={() => setDrawing(`A0:${a.id}`)}>
+            {drawing === `A0:${a.id}` ? "● " : "○ "}A0 종합 · {a.grid.rows}×{a.grid.cols} 타일
+          </button>
+        ))}
       </div>
+      {drawing.startsWith("A0:") && plant.a0.some((a) => `A0:${a.id}` === drawing) ? (
+        <A0View ctx={ctx} a0={plant.a0.find((a) => `A0:${a.id}` === drawing)!} />
+      ) : (
+        <>
       <div className="drawing-title">
         [표제란] 도면번호 <b>{info?.id}</b> ({info?.rev}) · {info?.title} · 발행 {info?.issued}
       </div>
@@ -130,6 +142,8 @@ export function DrawingView({ ctx }: { ctx: Context }) {
           );
         })}
       </div>
+        </>
+      )}
     </div>
   );
 }

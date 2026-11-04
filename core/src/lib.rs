@@ -5,6 +5,7 @@
 //! - `graph` · `causal`: 계통 마인드맵 (홉 뎁스 · 상류 경로) 과 인과 시차(Δt) 근본 원인 역추적
 //! - `timeseries` · `sds`: 60초 링버퍼 · 변곡점 · 기울기 · TTF, SDS 트리거 · 스냅샷 · 블랙박스 봉인
 //! - `extract` · `evidence`: 현장 스캔(계기 점검표 · Red-line) 판독과 원장 4대 상호작용
+//! - `symbols` · `identify`: 글자 없는 설비 심볼(연결 요소 후보 + SigLIP2 그림 사전)과 KKS 없는 설비 판독(이름 · 위치 · 항목 · 좌표 · 심볼)
 //! - `state_machine`: Gate 0 ~ 5 파이프라인 (`Engine`)
 //! - `drafting` · `factcheck`: Zoro-1 이 쓰는 AOP 초안과 숫자 · 코드 1:1 대조
 //! - `policy` · `audit` · `privacy` · `store`: 자동화 정책 · 감사 로그 · 비식별 · 세션과 보관
@@ -20,16 +21,25 @@ pub mod extract;
 pub mod factcheck;
 pub mod field;
 pub mod graph;
+pub mod identify;
+pub mod interlock;
+pub mod issues;
 pub mod lattice;
 pub mod mermaid;
 pub mod mining;
+pub mod mitigation;
+pub mod physics;
 pub mod plant;
 pub mod policy;
 pub mod privacy;
 pub mod scenario;
+pub mod search;
 pub mod sds;
 pub mod stages;
 pub mod state_machine;
 pub mod store;
+pub mod symbols;
+pub mod tiling;
 pub mod timeseries;
+pub mod tsdb;
 pub mod verdict;
