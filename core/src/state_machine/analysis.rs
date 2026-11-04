@@ -24,9 +24,9 @@ use crate::drafting::{draft_aop, AopDraft, TextWriter};
 use crate::interlock::{self, InterlockState};
 use crate::lattice::Lattice;
 use crate::plant::fmt_value;
-use crate::sds::{trigger_at, SdsSnapshot, SdsTrigger, TriggerKind};
+use crate::sds::{SdsSnapshot, SdsTrigger, TriggerKind};
 use crate::stages::{record, StageRecord, StageStatus};
-use crate::timeseries::{metrics, TimeSeriesMetrics, BASELINE_SECS};
+use crate::timeseries::{metrics, ttf_conservative, TimeSeriesMetrics, BASELINE_SECS, SLOPE_SAMPLES};
 use crate::verdict::{OutcomeClass, Verdict};
 
 /// 판단 · 글쓰기 모델 (없으면 규칙과 템플릿만)
@@ -111,9 +111,10 @@ pub fn analyze(db: &Lattice, incident: &Incident, brains: Brains<'_>, sds_id: &s
     let trigger = match &incident.alarm {
         Some(a) => {
             let at = a.at.timestamp_millis();
-            let found = db.sensor(&a.tag).zip(incident.telemetry.get(&a.tag)).and_then(|(s, series)| trigger_at(s, series, at));
+            // 경보 시각의 기울기 · TTF 를 그대로 기록합니다 (사건을 열지 말지의 판단, 예컨대 튐 막기는 실시간 추적기의 몫).
+            let found = db.sensor(&a.tag).zip(incident.telemetry.get(&a.tag)).map(|(s, series)| (series.slope_at(at, SLOPE_SAMPLES), ttf_conservative(s, series, at)));
             let kind = if a.kind == AlarmKind::PreAlarm { TriggerKind::HighSlopePreAlarm } else { TriggerKind::ThresholdBreach };
-            SdsTrigger { kind, tag: Some(a.tag.clone()), at_ms: at, value: Some(a.value), slope: found.as_ref().and_then(|f| f.slope), ttf_secs: found.and_then(|f| f.ttf_secs) }
+            SdsTrigger { kind, tag: Some(a.tag.clone()), at_ms: at, value: Some(a.value), slope: found.and_then(|f| f.0), ttf_secs: found.and_then(|f| f.1) }
         }
         None => SdsTrigger {
             kind: TriggerKind::FieldScanInjected,

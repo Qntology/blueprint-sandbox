@@ -15,6 +15,7 @@ use image::{GrayImage, RgbImage};
 use rayon::prelude::*;
 use serde_json::json;
 
+use crate::symbols::{candidates, crop_square, CandidateParams, Feature, SymbolDict, SymbolHit, DICT_FILE};
 use super::gocr::image::prepare as gocr_prepare;
 use super::gocr::{open as open_gocr, GocrEngine, GocrInput, OcrOutput, Strategy, EARLY_EXIT, TEXT_PROMPT};
 use super::residency::SharedResidency;
@@ -48,6 +49,8 @@ pub struct Timings {
     pub layout_ms: f64,
     pub siglip2_ms: f64,
     pub ocr_ms: f64,
+    /// 심볼 후보 추출 + 그림 사전 대조 (켰을 때만)
+    pub symbol_ms: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +59,8 @@ pub struct PageReading {
     pub skew: f32,
     pub plan: PagePlan,
     pub crops: Vec<CropReading>,
+    /// 심볼 후보와 그림 사전 결과 (`ReadOptions::symbols` 를 켜고 사전이 있을 때). 버린 후보도 들어 있습니다 (`class == None`).
+    pub symbols: Vec<SymbolHit>,
     pub timings: Timings,
 }
 
@@ -65,17 +70,39 @@ pub struct ReadOptions {
     pub plan: PlanParams,
     /// 입력란도 표 프롬프트로 읽습니다. 항목과 값이 칸으로 묶여 나오고, 값을 건너뛰는 일이 줄어듭니다.
     pub forms_as_tables: bool,
+    /// 도면의 설비 심볼을 찾습니다 (곧게 편 페이지의 잉크 후보 → SigLIP2 → 그림 사전). 비전 타워가 올라와 있는 계획 단계 바로 뒤에 돕니다.
+    pub symbols: bool,
 }
 
 impl Default for ReadOptions {
     fn default() -> Self {
-        Self { plan: PlanParams::default(), forms_as_tables: true }
+        Self { plan: PlanParams::default(), forms_as_tables: true, symbols: false }
     }
 }
+
+/// 이미지 한 장의 SigLIP2 벡터 (모두 L2 정규화)
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageVectors {
+    pub pooled: Vec<f32>,
+    pub mean_patch: Vec<f32>,
+}
+
+impl ImageVectors {
+    pub fn get(&self, feature: Feature) -> &[f32] {
+        match feature {
+            Feature::Pooled => &self.pooled,
+            Feature::MeanPatch => &self.mean_patch,
+        }
+    }
+}
+
+/// 심볼 조각을 SigLIP2 에 넣을 때의 패치 상한. 조각은 한 변 90 px 안팎이라 8 × 8 패치(128 px)면 모양이 다 들어갑니다.
+pub const SYMBOL_MAX_PATCHES: usize = 64;
 
 pub struct DocumentReader {
     siglip2: Siglip2,
     probes: Option<ProbeBank>,
+    symbols: Option<SymbolDict>,
     gocr: GocrEngine,
     options: ReadOptions,
 }
@@ -104,13 +131,81 @@ impl DocumentReader {
         let siglip2 = Siglip2::open(&dir, residency.clone())?;
         let probe = dir.join(PROBE_FILE);
         let probes = probe.exists().then(|| ProbeBank::from_file(&probe)).transpose()?;
+        let dict = dir.join(DICT_FILE);
+        let symbols = dict.exists().then(|| SymbolDict::from_file(&dict)).transpose()?;
         let gocr = open_gocr(&models_dir.join("gocr"), residency, MAX_TOKENS, Strategy::Speculative { early_exit: Some(EARLY_EXIT) })?;
-        Ok(Self { siglip2, probes, gocr, options: ReadOptions::default() })
+        Ok(Self { siglip2, probes, symbols, gocr, options: ReadOptions::default() })
     }
 
     pub fn with_options(mut self, options: ReadOptions) -> Self {
         self.options = options;
         self
+    }
+
+    pub fn options(&self) -> ReadOptions {
+        self.options
+    }
+
+    pub fn set_options(&mut self, options: ReadOptions) {
+        self.options = options;
+    }
+
+    /// 그림 사전을 바꿉니다 (사전을 새로 만든 직후 시험할 때)
+    pub fn set_symbol_dict(&mut self, dict: Option<SymbolDict>) {
+        self.symbols = dict;
+    }
+
+    pub fn symbol_dict(&self) -> Option<&SymbolDict> {
+        self.symbols.as_ref()
+    }
+
+    /// 이미지마다 SigLIP2 풀링 벡터와 패치 평균 벡터. 그림 사전을 만들고 대조할 때 씁니다.
+    pub fn embed_images(&self, images: &[RgbImage], max_patches: usize) -> Result<Vec<ImageVectors>> {
+        let patch = self.siglip2.config().patch;
+        let inputs: Vec<PatchInput> = images.par_iter().map(|im| siglip2_prepare(im, patch, max_patches)).collect::<Result<_>>()?;
+        let grids = self.siglip2.encode_images(&inputs)?;
+        Ok(grids
+            .into_iter()
+            .map(|g| {
+                let mut mean = vec![0.0f32; g.dim];
+                for p in g.patches.chunks(g.dim) {
+                    mean.iter_mut().zip(p).for_each(|(a, b)| *a += b);
+                }
+                crate::symbols::normalize(&mut mean);
+                ImageVectors { pooled: g.pooled, mean_patch: mean }
+            })
+            .collect())
+    }
+
+    /// 페이지의 정해진 영역만 다시 읽습니다 (부분 재판독). 도면은 조각 계획이 한 행의 상자들을 가로 띠 하나로 읽어서
+    /// 상자별 글자를 떼어 낼 수 없으므로, KKS 를 못 읽은 상자는 그 상자만 글자 프롬프트로 다시 읽습니다.
+    /// 영역은 테두리 괘선이 글자로 읽히지 않게 안쪽으로 `inset` 화소 줄여 자릅니다.
+    pub fn read_regions(&self, page: &RgbImage, regions: &[Bbox], inset: u32) -> Result<Vec<OcrOutput>> {
+        let inputs: Vec<GocrInput> = regions
+            .par_iter()
+            .map(|&(x0, y0, x1, y1)| {
+                let b = (x0 + inset, y0 + inset, x1.saturating_sub(inset).max(x0 + inset + 1), y1.saturating_sub(inset).max(y0 + inset + 1));
+                Ok(GocrInput { image: gocr_prepare(&cut(page, b, 1.0), GOCR_PATCH, GOCR_MERGE)?, prompt: TEXT_PROMPT.to_string() })
+            })
+            .collect::<Result<_>>()?;
+        self.gocr.recognize(&inputs)
+    }
+
+    /// 페이지마다 심볼 후보를 찾아 그림 사전에 댑니다. 사전이 없으면 빈 결과입니다.
+    pub fn find_symbols(&self, pages: &[&RgbImage]) -> Result<Vec<Vec<SymbolHit>>> {
+        let Some(dict) = &self.symbols else { return Ok(vec![Vec::new(); pages.len()]) };
+        let t = Instant::now();
+        let params = CandidateParams::default();
+        let found: Vec<Vec<_>> = pages.par_iter().map(|p| candidates(p, &params)).collect();
+        let crops: Vec<RgbImage> = found.iter().zip(pages).flat_map(|(cs, p)| cs.iter().map(move |c| crop_square(p, c.bbox))).collect();
+        let vectors = self.embed_images(&crops, SYMBOL_MAX_PATCHES)?;
+        let mut it = vectors.iter();
+        let hits: Vec<Vec<SymbolHit>> = found
+            .iter()
+            .map(|cs| cs.iter().zip(it.by_ref()).map(|(c, v)| SymbolHit { bbox: c.bbox, matched: dict.classify(v.get(dict.feature)) }).collect())
+            .collect();
+        trace::record("siglip2", "심볼 그림 사전", t.elapsed().as_secs_f64() * 1e3, json!({ "pages": pages.len(), "candidates": crops.len(), "accepted": hits.iter().flatten().filter(|h| h.matched.class.is_some()).count() }));
+        Ok(hits)
     }
 
     /// 페이지를 곧게 펴고 읽을 조각을 정합니다. SigLIP2 비전 타워만 씁니다.
@@ -161,7 +256,7 @@ impl DocumentReader {
                 .collect();
             trace::record("규칙", "조각 계획", t.elapsed().as_secs_f64() * 1e3, json!({ "pages": pages }));
         }
-        Ok(planned.into_iter().map(|(image, skew, plan)| (image, skew, plan, Timings { layout_ms, siglip2_ms, ocr_ms: 0.0 })).collect())
+        Ok(planned.into_iter().map(|(image, skew, plan)| (image, skew, plan, Timings { layout_ms, siglip2_ms, ..Timings::default() })).collect())
     }
 
     fn prompt_of(&self, kind: CropKind) -> &'static str {
@@ -181,6 +276,10 @@ impl DocumentReader {
     /// 서명 조각은 글자로 읽지 않고 좌표만 계획에 남깁니다.
     pub fn read_pages(&self, pages: &[RgbImage]) -> Result<Vec<PageReading>> {
         let planned = self.plan_pages(pages)?;
+        // 심볼은 비전 타워가 올라와 있을 때(gocr 로 넘어가기 전) 찾습니다.
+        let t = Instant::now();
+        let mut symbols = if self.options.symbols { self.find_symbols(&planned.iter().map(|p| &p.0).collect::<Vec<_>>())? } else { vec![Vec::new(); planned.len()] }.into_iter();
+        let symbol_ms = t.elapsed().as_secs_f64() * 1e3 / pages.len().max(1) as f64;
         let t = Instant::now();
         let crops: Vec<(&RgbImage, &CropPlan)> = planned.iter().flat_map(|(straight, _, plan, _)| plan.crops.iter().filter(|c| c.kind != CropKind::Sign).map(move |c| (straight, c))).collect();
         let inputs: Vec<GocrInput> = crops
@@ -206,6 +305,7 @@ impl DocumentReader {
             .into_iter()
             .map(|(_, skew, plan, mut timings)| {
                 timings.ocr_ms = ocr_ms;
+                timings.symbol_ms = if self.options.symbols { symbol_ms } else { 0.0 };
                 let crops = plan
                     .crops
                     .iter()
@@ -213,7 +313,7 @@ impl DocumentReader {
                     .zip(outputs.by_ref())
                     .map(|(c, output)| CropReading { kind: c.kind, bbox: c.bbox, output })
                     .collect();
-                PageReading { skew, plan, crops, timings }
+                PageReading { skew, plan, crops, symbols: symbols.next().unwrap_or_default(), timings }
             })
             .collect())
     }

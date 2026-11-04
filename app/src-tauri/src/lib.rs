@@ -876,9 +876,18 @@ fn record_interlock(window: Window, app: AppHandle, desk: State<'_, Desk>, input
 fn search(window: Window, desk: State<'_, Desk>, query: String) -> Result<blueprint_core::search::SearchResult, String> {
     console_only(&window)?;
     let live = physics_mode::live_snapshot(&desk).or_else(|| lock(&desk.live).as_ref().map(|l| (l.telemetry.clone(), l.sim_now().timestamp_millis())));
-    let engine = lock(&desk.engine);
-    let corpus = blueprint_core::search::Corpus::build(&desk.db, live.as_ref().map(|(t, at)| (t, *at)), Some(&engine.store));
-    Ok(blueprint_core::search::search(&desk.db, &corpus, &query))
+    // 엔진이 사건을 모델로 분석하는 동안(엔진 잠금)은 기다리지 않습니다. 그때는 진행 중 사건 · 보관 문서만 빼고 찾습니다.
+    let engine = match desk.engine.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    let corpus = blueprint_core::search::Corpus::build(&desk.db, live.as_ref().map(|(t, at)| (t, *at)), engine.as_ref().map(|e| &e.store));
+    let mut result = blueprint_core::search::search(&desk.db, &corpus, &query);
+    if engine.is_none() {
+        result.notes.push("엔진이 사건을 분석 중이라 이번 검색에는 진행 중 사건 · 보관 문서가 빠졌습니다".into());
+    }
+    Ok(result)
 }
 
 /// 작업자 실명 열람 요청 (콘솔 창 전용). 허용 · 거부 모두 감사 기록에 남습니다.

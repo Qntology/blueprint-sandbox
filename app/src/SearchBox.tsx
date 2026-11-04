@@ -52,7 +52,8 @@ export function SearchBox({ onSelect, onPick }: { onSelect: (kks: string) => voi
         onFocus={() => r && setOpen(true)}
       />
       {error && <span className="bad">{error}</span>}
-      {open && r && (
+      {/* 결과는 지금 입력한 질의의 것일 때만 보입니다 (질의를 고치면 Enter 전까지 옛 결과를 감춤). */}
+      {open && r && r.query === q && (
         <div className="search-results">
           <div className="search-head">
             <span>

@@ -275,6 +275,21 @@ async function a0(c) {
 }
 
 // 자연어 검색 (logis-center 방식)
+/** 질의를 넣고 결과 첫 줄을 돌려줍니다. 결과가 이 질의의 것으로 바뀔 때까지(첫 줄에 기대값이 나오거나 10초) 기다립니다. */
+async function searchTop(c, q, want) {
+  const box = c.locator(".search-input");
+  await box.fill(q);
+  await box.press("Enter");
+  await c.waitForSelector(".search-results", { timeout: 15000 });
+  let first = "";
+  for (let i = 0; i < 20; i++) {
+    first = await c.locator(".search-hit").first().innerText().catch(() => "");
+    if (first.includes(want)) break;
+    await sleep(500);
+  }
+  return first;
+}
+
 async function searchFlow(c) {
   await tidy(c);
   const queries = [
@@ -287,10 +302,7 @@ async function searchFlow(c) {
   for (const [q, want] of queries) {
     k += 1;
     const box = c.locator(".search-input");
-    await box.fill(q);
-    await box.press("Enter");
-    await c.waitForSelector(".search-results", { timeout: 15000 });
-    const first = await c.locator(".search-hit").first().innerText();
+    const first = await searchTop(c, q, want);
     assert(first.includes(want), `검색 '${q}' 첫 결과에 ${want} 가 없습니다: ${first}`);
     await shot(c, `SEARCH-${k}`);
     await box.press("Escape");
@@ -308,6 +320,21 @@ async function phys(c) {
   await c.locator(".drawer button", { hasText: "급수밸브 18% 고착 주입" }).click();
   await waitText(c, "인과 사슬 잠금", 90000);
   await shot(c, "PHYS-1-chain");
+  // SDS 고장 코드는 원장 인터록의 고장 코드와 같은 꼴입니다.
+  await waitText(c, "고장 코드 VALVE_STUCK_LOW", 30000);
+  // 고장 중 질적 상태 검색 (개선안 예시): 물리엔진 링버퍼 값으로 상태 조건이 필터로 걸리고, "왜" 에 지금 값이 나옵니다.
+  const live = [
+    ["고착된 밸브", "10LAB20AA102", "고착"],
+    ["103동 압력 높은 급수펌프", "10LAB10AP001", "압력 높음"],
+  ];
+  let n = 0;
+  for (const [q, want, cond] of live) {
+    n += 1;
+    const first = await searchTop(c, q, want);
+    assert(first.includes(want) && first.includes(cond), `고장 중 검색 '${q}' 첫 결과에 ${want} · ${cond} 가 없습니다: ${first}`);
+    await shot(c, `PHYS-1${"bc"[n - 1]}-search`);
+    await c.locator(".search-input").press("Escape");
+  }
   await waitText(c, "Tier 1 자율 대응", 240000);
   await shot(c, "PHYS-2-mitigation");
   const run = c.locator(".drawer button", { hasText: "완화 조치 실행" });

@@ -291,6 +291,18 @@
       ]
     }
   ],
+  "symbol_legend": [
+    { "class": "pump", "label": "펌프", "shape": "원 + 삼각 받침 + 토출구", "kinds": ["pump"] },
+    { "class": "valve", "label": "밸브", "shape": "나비넥타이 (▷◁)", "kinds": ["valve"] },
+    { "class": "turbine", "label": "터빈", "shape": "사다리꼴 (입구 좁고 출구 넓음)", "kinds": ["turbine"] },
+    { "class": "fan", "label": "팬 · 통풍기", "shape": "원 + 날개", "kinds": ["fan"] },
+    { "class": "exchanger", "label": "열교환기", "shape": "원 + 지그재그 관", "kinds": ["superheater", "reheater", "condenser", "cooler", "heater"] },
+    { "class": "vessel", "label": "용기 · 탑", "shape": "세로 캡슐", "kinds": ["furnace", "deaerator", "scr", "esp", "fgd", "stack"] },
+    { "class": "breaker", "label": "차단기", "shape": "사각 + X", "kinds": ["breaker"] },
+    { "class": "transformer", "label": "변압기", "shape": "겹친 원 두 개", "kinds": ["transformer"] },
+    { "class": "generator", "label": "발전기", "shape": "원 + 사인파", "kinds": ["generator"] },
+    { "class": "panel", "label": "전원 · 제어반", "shape": "사각 + 가로줄", "kinds": ["mcc", "ups", "control"] }
+  ],
   "history": [
     { "date": "2026-03-15", "drawing": "PID-103-LAB", "kind": "revision", "rev": "Rev.3", "note": "계획예방정비 후 정식 도면 개정" },
     { "date": "2026-05-20", "kks": "10LAB10AP001", "kind": "like_for_like", "note": "베어링 동일 사양 교체 (도면 변경 없음)" },

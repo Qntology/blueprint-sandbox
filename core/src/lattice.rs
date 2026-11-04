@@ -253,6 +253,15 @@ pub enum InterlockCheck {
     Loto,
 }
 
+/// 도면 기호 범례 한 줄: 심볼 모양과 그 모양으로 그리는 설비 종류 (`scripts/gen_pid_drawings.py` 와 같은 표)
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct SymbolLegendRow {
+    pub class: String,
+    pub label: String,
+    pub shape: String,
+    pub kinds: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct HistoryRow {
     pub date: NaiveDate,
@@ -287,6 +296,8 @@ struct Seed {
     a0_drawings: Vec<A0Row>,
     #[serde(default)]
     interlocks: Vec<InterlockRow>,
+    #[serde(default)]
+    symbol_legend: Vec<SymbolLegendRow>,
     history: Vec<HistoryRow>,
 }
 
@@ -443,6 +454,18 @@ impl Lattice {
             }
             if a0.grid.rows == 0 || a0.grid.cols == 0 || !(0.0..0.5).contains(&a0.grid.overlap) {
                 bail!("A0 도면 {} 의 타일 격자가 올바르지 않습니다", a0.id);
+            }
+        }
+        let mut kinds_seen: Vec<&str> = Vec::new();
+        for (i, row) in s.symbol_legend.iter().enumerate() {
+            if row.class == "none" || s.symbol_legend[..i].iter().any(|r| r.class == row.class) {
+                bail!("기호 범례 {} 가 겹치거나 예약어입니다", row.class);
+            }
+            for k in &row.kinds {
+                if kinds_seen.contains(&k.as_str()) || !s.equipment.iter().any(|e| &e.kind == k) {
+                    bail!("기호 범례 {} 의 설비 종류 {k} 가 겹치거나 원장에 없습니다", row.class);
+                }
+                kinds_seen.push(k);
             }
         }
         for il in &s.interlocks {
@@ -627,6 +650,21 @@ impl Lattice {
 
     pub fn interlocks(&self) -> &[InterlockRow] {
         &self.seed.interlocks
+    }
+
+    /// 도면 기호 범례
+    pub fn symbol_legend(&self) -> &[SymbolLegendRow] {
+        &self.seed.symbol_legend
+    }
+
+    /// 설비 종류를 그리는 심볼 (범례에 없으면 None: 미분탄기 · 버너 · 베어링)
+    pub fn symbol_for_kind(&self, kind: &str) -> Option<&SymbolLegendRow> {
+        self.seed.symbol_legend.iter().find(|r| r.kinds.iter().any(|k| k == kind))
+    }
+
+    /// 심볼 이름이 가리키는 설비 종류들
+    pub fn kinds_of_symbol(&self, class: &str) -> &[String] {
+        self.seed.symbol_legend.iter().find(|r| r.class == class).map_or(&[], |r| r.kinds.as_slice())
     }
 
     /// 절차서에 딸린 선행 절차 인터록

@@ -1,6 +1,7 @@
 """합성 P&ID 마스터 도면 · Red-line 수기 수정 도면 · 현장 계기 점검표 생성기.
 
     python scripts/gen_pid_drawings.py [마스터 폴더] [현장 스캔 폴더] [시드]
+    python scripts/gen_pid_drawings.py --symbols     심볼 표본(학습 · 시험)과 명판 훼손 도면만 out/symbols 에
 
 기본값은 core/fixtures/drawings (마스터 도면, 저장소에 들어갑니다) 와 out/field (현장 스캔, 저장소 밖) 입니다.
 설비 상자의 위치는 시드 대장(core/fixtures/synthetic_db.json)의 `bbox`(정규화 좌표)를 그대로 씁니다. 그래서 대장이 곧 정답 좌표입니다.
@@ -24,7 +25,7 @@ import random
 import sys
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SEED = os.path.join(ROOT, "core", "fixtures", "synthetic_db.json")
@@ -283,6 +284,92 @@ def fmt(v):
     return f"{v:,.1f}" if abs(v) >= 1000 else f"{v:.1f}" if abs(v) >= 1 or v == 0 else f"{v:.2f}"
 
 
+# 설비 심볼 (원장 `symbol_legend`). 상자 오른쪽 위 빈칸(글자 끝에서 30 px 이상 떨어진 자리)에 한 변 60 px 로 그립니다.
+SYMBOL_SIZE = 60
+SYMBOL_PAD = 12
+WHITE = (255, 255, 255)
+
+
+def draw_symbol(d, cls, cx, cy, s, w=3, fill=INK, variant=0):
+    """(cx, cy) 가운데, 한 변 s 인 심볼. 발전기의 사인파 말고는 획이 모두 이어져 한 덩어리입니다.
+    variant 1 은 같은 종류의 다른 모양 (밸브: 구동기 달린 조절밸브, 펌프: 토출구 왼쪽, 팬: 날개 넷)."""
+
+    def circle(x, y, r, inside=None):
+        d.ellipse((x - r, y - r, x + r, y + r), fill=inside, outline=fill, width=w)
+
+    if cls == "pump":
+        r, y = 0.32 * s, cy - 0.06 * s
+        d.polygon([(cx - 0.38 * s, cy + 0.44 * s), (cx + 0.38 * s, cy + 0.44 * s), (cx, y)], fill=WHITE, outline=fill, width=w)
+        circle(cx, y, r, WHITE)
+        side = -1 if variant == 1 else 1
+        d.line([(cx, y - r + w / 2), (cx + side * (r + 0.14 * s), y - r + w / 2)], fill=fill, width=w)
+        d.line([(cx + side * (r + 0.14 * s), y - r - 0.07 * s), (cx + side * (r + 0.14 * s), y - r + 0.07 * s)], fill=fill, width=w)
+    elif cls == "valve":
+        top = cy + (0.08 * s if variant == 1 else 0)
+        d.polygon([(cx - 0.44 * s, top - 0.26 * s), (cx - 0.44 * s, top + 0.26 * s), (cx, top)], outline=fill, width=w)
+        d.polygon([(cx + 0.44 * s, top - 0.26 * s), (cx + 0.44 * s, top + 0.26 * s), (cx, top)], outline=fill, width=w)
+        if variant == 1:  # 조절밸브: 줄기 + 반원 구동기
+            d.line([(cx, top), (cx, cy - 0.28 * s)], fill=fill, width=w)
+            d.chord((cx - 0.22 * s, cy - 0.5 * s, cx + 0.22 * s, cy - 0.06 * s), 180, 360, outline=fill, width=w)
+    elif cls == "turbine":
+        d.polygon([(cx - 0.4 * s, cy - 0.16 * s), (cx + 0.4 * s, cy - 0.44 * s), (cx + 0.4 * s, cy + 0.44 * s), (cx - 0.4 * s, cy + 0.16 * s)], outline=fill, width=w)
+    elif cls == "fan":
+        r = 0.42 * s
+        circle(cx, cy, r)
+        blades = 4 if variant == 1 else 3
+        for k in range(blades):
+            a = math.radians(90 + k * 360 / blades)
+            tip = (cx + r * math.cos(a), cy - r * math.sin(a))
+            side = (cx + 0.5 * r * math.cos(a + 0.5), cy - 0.5 * r * math.sin(a + 0.5))
+            d.polygon([(cx, cy), side, tip], outline=fill, width=max(2, w - 1))
+    elif cls == "exchanger":
+        r = 0.4 * s
+        circle(cx, cy, r)
+        # 관: 왼쪽 위 밖에서 들어와 원 안을 지그재그로 지나 오른쪽 아래 밖으로
+        pts = [(cx - 0.5 * s, cy - 0.3 * s), (cx - 0.26 * s, cy - 0.3 * s)]
+        for k in range(5):
+            x = cx - 0.26 * s + (k + 1) * 0.104 * s
+            pts.append((x, cy + (0.18 if k % 2 == 0 else -0.18) * s))
+        pts += [(cx + 0.26 * s, cy + 0.3 * s), (cx + 0.5 * s, cy + 0.3 * s)]
+        d.line(pts, fill=fill, width=w, joint="curve")
+    elif cls == "vessel":
+        d.rounded_rectangle((cx - 0.22 * s, cy - 0.46 * s, cx + 0.22 * s, cy + 0.46 * s), radius=0.2 * s, outline=fill, width=w)
+        if variant == 1:  # 노즐
+            d.line([(cx, cy - 0.46 * s), (cx, cy - 0.5 * s)], fill=fill, width=w)
+    elif cls == "breaker":
+        h = 0.32 * s
+        d.rectangle((cx - h, cy - h, cx + h, cy + h), outline=fill, width=w)
+        d.line([(cx - h, cy - h), (cx + h, cy + h)], fill=fill, width=w)
+        d.line([(cx - h, cy + h), (cx + h, cy - h)], fill=fill, width=w)
+    elif cls == "transformer":
+        circle(cx - 0.15 * s, cy, 0.27 * s)
+        circle(cx + 0.15 * s, cy, 0.27 * s)
+    elif cls == "generator":
+        circle(cx, cy, 0.42 * s)
+        pts = [(cx - 0.24 * s + 0.48 * s * t / 24, cy - 0.12 * s * math.sin(2 * math.pi * t / 24)) for t in range(25)]
+        d.line(pts, fill=fill, width=w, joint="curve")
+    elif cls == "panel":
+        d.rectangle((cx - 0.4 * s, cy - 0.3 * s, cx + 0.4 * s, cy + 0.3 * s), outline=fill, width=w)
+        for y in (cy - 0.1 * s, cy + 0.1 * s):
+            d.line([(cx - 0.4 * s, y), (cx + 0.4 * s, y)], fill=fill, width=max(2, w - 1))
+    else:
+        raise ValueError(cls)
+
+
+def symbol_ink_box(cls, cx, cy, s, w, variant):
+    """그린 심볼의 잉크 상자 (정답 좌표). 같은 소수점 위치로 따로 그려 잉크 끝을 잽니다."""
+    ox, oy = int(math.floor(cx - s)), int(math.floor(cy - s))
+    tile = Image.new("RGB", (int(2 * s) + 4, int(2 * s) + 4), WHITE)
+    draw_symbol(ImageDraw.Draw(tile), cls, cx - ox, cy - oy, s, w, INK, variant)
+    l, t, r, b = ImageOps.invert(tile.convert("L")).getbbox()
+    return [ox + l, oy + t, ox + r, oy + b]
+
+
+def symbol_class(db, kind):
+    """설비 종류의 심볼 이름. 범례에 없는 종류(미분탄기 · 버너 · 베어링)는 심볼을 그리지 않습니다."""
+    return next((s["class"] for s in db.get("symbol_legend", []) if kind in s["kinds"]), None)
+
+
 class Plant:
     def __init__(self, db):
         self.db = db
@@ -304,9 +391,21 @@ class Plant:
         return [s for s in self.db["sensors"] if s["kks"] == kks]
 
 
-def draw_master(plant, drawing_id, rng, value_overrides=None):
-    """마스터 도면 한 장. `value_overrides` 는 태그별로 상자에 적을 현재값입니다 (없으면 정상치)."""
+def hatch(c, box):
+    """명판 훼손: 글자 자리를 옅은 빗금으로 덮습니다 (글자는 남지 않음)"""
+    x0, y0, x1, y1 = box
+    c.d.rectangle(box, fill=(232, 232, 236))
+    x = x0 - (y1 - y0)
+    while x < x1:
+        c.d.line([(max(x, x0), y0 + max(0, x0 - x)), (min(x + (y1 - y0), x1), y1 - max(0, x + (y1 - y0) - x1))], fill=(196, 196, 202), width=2)
+        x += 9
+
+
+def draw_master(plant, drawing_id, rng, value_overrides=None, damage=0):
+    """마스터 도면 한 장. `value_overrides` 는 태그별로 상자에 적을 현재값입니다 (없으면 정상치).
+    `damage` 는 KKS 없는 판독 시험용 명판 훼손 정도입니다: 1 KKS 줄, 2 KKS · 이름 줄, 3 상자 글자 전부 (심볼만 남음)."""
     c = Canvas(DW, DH, rng)
+    c.symbols = []
     d = plant.drawings[drawing_id]
     sector = plant.sectors[d["sector"]]
     values = value_overrides or {}
@@ -339,15 +438,27 @@ def draw_master(plant, drawing_id, rng, value_overrides=None):
         for s in plant.sensors_of(e["kks"])[:2]:
             v = values.get(s["tag"], s["normal"])
             lines.append((f"{short_tag(s['tag'])} {s['label']} {fmt(v)} {s['unit']}", 16, GOTHIC))
+        cls = symbol_class(plant.db, e["kind"])
+        sym = (bx1 - SYMBOL_PAD - SYMBOL_SIZE, by0 + SYMBOL_PAD, bx1 - SYMBOL_PAD, by0 + SYMBOL_PAD + SYMBOL_SIZE)
         ty = by0 + 10
         text_parts = []
-        for text, size, path in lines:
-            while c.width(text, size, path) > (bx1 - bx0) - 22 and size > 12:
+        for i, (text, size, path) in enumerate(lines):
+            # 심볼 옆 줄은 심볼 앞 16 px 까지만 씁니다.
+            room = (bx1 - bx0) - 22 - ((SYMBOL_SIZE + SYMBOL_PAD + 16) if cls and ty < sym[3] + 4 else 0)
+            while c.width(text, size, path) > room and size > 12:
                 size -= 1
-            c.text(bx0 + 11, ty, text, size, path)
-            text_parts.append(text)
+            if damage >= 3 or (damage >= 1 and i == 0) or (damage >= 2 and i == 1):
+                hatch(c, (bx0 + 9, ty - 1, bx0 + 13 + c.width(text, size, path), ty + size * 1.3))
+            else:
+                c.text(bx0 + 11, ty, text, size, path)
+                text_parts.append(text)
             ty += size * 1.45
         c.add("value", (bx0, by0, bx1, by1), "\n".join(text_parts))
+        if cls:
+            variant = 1 if (cls == "valve" and "조절" in e["name"]) or (cls == "pump" and e["kks"].endswith("2")) else 0
+            cx, cy = (sym[0] + sym[2]) / 2, (sym[1] + sym[3]) / 2
+            draw_symbol(c.d, cls, cx, cy, SYMBOL_SIZE, 3, INK, variant)
+            c.symbols.append({"kks": e["kks"], "class": cls, "box": symbol_ink_box(cls, cx, cy, SYMBOL_SIZE, 3, variant), "cell": [int(v) for v in sym]})
 
     # 같은 도면 안의 배관 · 전력선. 상자 사이 통로로만 가고, 앱 오버레이가 같은 선을 쓰도록 경로를 JSON 에 남깁니다.
     router = Router()
@@ -669,7 +780,132 @@ def a0_sheet(plant, a0, masters_dir):
     return c, gt
 
 
+NONE_TEXTS = ["주급수 유량", "KKS: 10LAB", "위치: 103동", "토출압력 28.5", "개도 65.0 %", "MPa", "급수동 2F", "AA102", "Rev.3", "도면번호", "연결점", "PID-103", "과열기", "°C", "t/h"]
+
+
+def none_sample(d, rng, side):
+    """심볼이 아닌 조각 (글자 · 배관 · 화살표 · 상자 모서리 · 점선 · 표 칸). 후보 추출이 도면에서 함께 건지는 것들입니다."""
+    kind = rng.choice(["text", "text", "lines", "corner", "dashed", "table", "arrow"])
+    w = rng.choice([1, 2, 3])
+    if kind == "text":
+        size = rng.randint(15, 30)
+        y = rng.uniform(0.15, 0.55) * side
+        for _ in range(rng.choice([1, 1, 2])):
+            s = rng.choice(NONE_TEXTS)
+            d.text((rng.uniform(-0.4, 0.1) * side, y), s, font=font(rng.choice([GOTHIC, BOLD]), size), fill=rng.choice([INK, INK, GRAY]))
+            y += size * 1.45
+    elif kind == "lines":
+        for _ in range(rng.randint(1, 3)):
+            if rng.random() < 0.5:
+                y = rng.uniform(0.1, 0.9) * side
+                d.line([(0, y), (side, y)], fill=INK, width=w + 1)
+            else:
+                x = rng.uniform(0.1, 0.9) * side
+                d.line([(x, 0), (x, side)], fill=INK, width=w + 1)
+    elif kind == "corner":
+        x, y = rng.uniform(0.2, 0.6) * side, rng.uniform(0.2, 0.6) * side
+        d.line([(x, side), (x, y), (side, y)], fill=INK, width=3)
+        if rng.random() < 0.6:
+            d.text((x + 10, y + 8), rng.choice(NONE_TEXTS), font=font(BOLD, 18), fill=INK)
+    elif kind == "dashed":
+        y = rng.uniform(0.3, 0.7) * side
+        x = 0.0
+        while x < side:
+            d.line([(x, y), (x + 18, y)], fill=INK, width=2)
+            x += 28
+        if rng.random() < 0.5:
+            d.line([(side / 2, 0), (side / 2, side)], fill=INK, width=3)
+    elif kind == "table":
+        step = rng.uniform(0.25, 0.45) * side
+        y = rng.uniform(0, step)
+        while y < side:
+            d.line([(0, y), (side, y)], fill=INK, width=1)
+            y += step
+        d.line([(side * 0.45, 0), (side * 0.45, side)], fill=INK, width=1)
+        d.text((4, step * 0.3), rng.choice(NONE_TEXTS), font=font(GOTHIC, 15), fill=INK)
+    else:
+        y = rng.uniform(0.3, 0.7) * side
+        d.line([(0, y), (side * 0.7, y)], fill=INK, width=3)
+        size = 14
+        d.polygon([(side * 0.7 + size, y), (side * 0.7, y - size * 0.6), (side * 0.7, y + size * 0.6)], fill=INK)
+        if rng.random() < 0.5:
+            d.line([(side * 0.7 + size, y), (side * 0.7 + size, side)], fill=INK, width=3)
+
+
+def symbol_samples(db, out_dir, split, seed, per_class, none_count):
+    """SigLIP2 그림 사전용 심볼 표본. 크기 44 ~ 80 px · 획 2 ~ 4 px · 회전(밸브 · 차단기 · 변압기 · 터빈) · 흐림 · 잡음을 섞고,
+    상자 테두리 · 글자 조각 · 배관이 가장자리에 걸린 표본도 둡니다. 학습(train)과 시험(test)은 시드가 다릅니다."""
+    classes = [s["class"] for s in db["symbol_legend"]]
+    rows = []
+    for cls in classes + ["none"]:
+        os.makedirs(os.path.join(out_dir, split, cls), exist_ok=True)
+        for i in range(none_count if cls == "none" else per_class):
+            rng = random.Random(f"{seed}/{split}/{cls}/{i}")
+            s = rng.uniform(44, 80)
+            side = int(s * rng.uniform(1.25, 1.6))
+            big = side * 2
+            tile = Image.new("RGB", (big, big), WHITE)
+            d = ImageDraw.Draw(tile)
+            if cls == "none":
+                none_sample(d, rng, big)
+            else:
+                draw_symbol(d, cls, big / 2, big / 2, s, rng.choice([2, 3, 3, 4]), INK, rng.choice([0, 0, 1]))
+                ctx = rng.random()
+                if ctx < 0.2:  # 상자 테두리가 가장자리에 걸림
+                    m = big / 2 + side / 2 - rng.uniform(2, 8)
+                    d.line([(0, m), (big, m)], fill=INK, width=3) if rng.random() < 0.5 else d.line([(m, 0), (m, big)], fill=INK, width=3)
+                elif ctx < 0.4:  # 왼쪽에 글자 조각
+                    d.text((big / 2 - side / 2 - rng.uniform(30, 60), big / 2 - side * 0.35), rng.choice(NONE_TEXTS), font=font(GOTHIC, rng.randint(15, 21)), fill=INK)
+                elif ctx < 0.5:  # 배관이 심볼에 붙음
+                    d.line([(0, big / 2), (big / 2 - s * 0.4, big / 2)], fill=INK, width=3)
+            angle = 0.0
+            if cls in ("valve", "breaker", "transformer") and rng.random() < 0.3:
+                angle = 90.0
+            elif cls == "turbine" and rng.random() < 0.3:
+                tile = tile.transpose(Image.FLIP_LEFT_RIGHT)
+            angle += rng.uniform(-4, 4)
+            tile = tile.rotate(angle, resample=Image.BICUBIC, fillcolor=WHITE)
+            jx, jy = rng.uniform(-0.06, 0.06) * side, rng.uniform(-0.06, 0.06) * side
+            x0, y0 = int(big / 2 - side / 2 + jx), int(big / 2 - side / 2 + jy)
+            img = tile.crop((x0, y0, x0 + side, y0 + side))
+            img = img.filter(ImageFilter.GaussianBlur(rng.uniform(0.0, 0.7)))
+            a = np.asarray(img).astype(np.float32) + np.random.default_rng(rng.randint(0, 1 << 30)).normal(0, rng.uniform(0, 4), (side, side, 3))
+            img = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
+            rel = f"{split}/{cls}/{i:03d}.png"
+            img.save(os.path.join(out_dir, rel))
+            rows.append({"path": rel, "class": cls, "size": round(s, 1)})
+    with open(os.path.join(out_dir, f"{split}.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"split": split, "seed": seed, "classes": classes + ["none"], "samples": rows}, f, ensure_ascii=False, indent=1)
+        f.write("\n")
+    return len(rows)
+
+
+def damaged_sheets(plant, out_dir, seed):
+    """명판 훼손 도면 (KKS 없는 판독 시험용). 마스터와 같은 배치에 훼손 정도 1 ~ 3 을 모든 상자에 적용하고 스캔 잡음(회전 없음)을 더합니다."""
+    for level in (1, 2, 3):
+        folder = os.path.join(out_dir, "damaged", f"L{level}")
+        os.makedirs(folder, exist_ok=True)
+        for d in plant.db["drawings"]:
+            rng = random.Random(f"{seed}/{d['id']}")
+            c = draw_master(plant, d["id"], rng, damage=level)
+            nrng = random.Random(f"{seed}/{d['id']}/noise/{level}")
+            img = c.img.filter(ImageFilter.GaussianBlur(nrng.uniform(0.2, 0.5)))
+            a = np.asarray(img).astype(np.float32) + np.random.default_rng(nrng.randint(0, 1 << 30)).normal(0, 2.0, (c.h, c.w, 3))
+            img = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
+            eq = [{"kks": e["kks"], "kind": e["kind"], "bbox": e["bbox"]} for e in plant.db["equipment"] if e["drawing"] == d["id"]]
+            save(os.path.join(folder, f"{d['id']}.png"), img, c.gt, {"drawing": d["id"], "level": level, "equipment": eq, "symbols": c.symbols})
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--symbols":
+        # 심볼 표본과 훼손 도면만 (마스터 도면은 그대로)
+        db = json.load(open(SEED, encoding="utf-8"))
+        out = os.path.join(ROOT, "out", "symbols")
+        n_train = symbol_samples(db, out, "train", 20261104, 40, 120)
+        n_test = symbol_samples(db, out, "test", 20261231, 20, 60)
+        damaged_sheets(Plant(db), out, 20261104)
+        print(f"심볼 표본: 학습 {n_train} · 시험 {n_test} · 훼손 도면 3단계 × {len(db['drawings'])}장 → {out}")
+        return
     masters = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "core", "fixtures", "drawings")
     field = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, "out", "field")
     seed = int(sys.argv[3]) if len(sys.argv) > 3 else 20261104
@@ -681,7 +917,7 @@ def main():
         c = draw_master(plant, d["id"], random.Random(f"{seed}/{d['id']}"))
         # 앱에 들어가는 파일이라 팔레트로 줄여 저장합니다.
         img = c.img.convert("P", palette=Image.ADAPTIVE, colors=64)
-        save(os.path.join(masters, f"{d['id']}.png"), img, c.gt, {"drawing": d["id"], "rev": d["rev"], "pipes": c.pipes})
+        save(os.path.join(masters, f"{d['id']}.png"), img, c.gt, {"drawing": d["id"], "rev": d["rev"], "pipes": c.pipes, "symbols": c.symbols})
     # A0 종합 도면은 크고(수 MB) 마스터에서 다시 만들 수 있어 저장소에 넣지 않습니다 (out/a0).
     a0_dir = os.path.join(os.path.dirname(field), "a0")
     os.makedirs(a0_dir, exist_ok=True)

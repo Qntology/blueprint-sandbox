@@ -2,6 +2,7 @@
 //!
 //! - SDS-Trigger: 평시 흔들림(데드밴드 안)은 버리고, 세 조건 중 하나일 때만 사건 세션을 엽니다.
 //!   1) 정적 임계 돌파 (`x ≥ 경보 한계`), 2) 동적 기울기 돌파 (경보 전이지만 트립까지 `TTF ≤ 30초`), 3) 현장 스캔 투입
+//!   한 표본 튐(물리적으로 불가능한 속도로 경보선을 넘은 한 점)은 다음 표본이 확인할 때까지 열지 않고, TTF 는 1 · 2차 중 이른 것입니다.
 //! - SDS-Snapshot: 변곡점 전후 ±30초 시계열을 정수로 동결하고, 게이트별 상태 코드와 축별 확신도를 한 패킷으로 묶습니다.
 //! - 블랙박스 봉인: 확정할 때 동결한 시계열 · 상태 전이 · 판단 기록 · 사람의 반응 시간을 SHA-256 으로 봉인해 감사 로그에 남깁니다.
 //!   같은 입력은 언제나 같은 해시라서 나중에 원본으로 다시 계산해 바뀌지 않았음을 확인할 수 있습니다.
@@ -12,7 +13,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::lattice::SensorRow;
-use crate::timeseries::{ttf, Series, Telemetry, BASELINE_SECS, MILLI, SLOPE_SAMPLES};
+use crate::timeseries::{ttf_conservative, Series, Telemetry, BASELINE_SECS, MILLI, QUAD_SAMPLES, SLOPE_SAMPLES};
 
 /// 동적 기울기 트리거의 기준 (트립 도달 예상 시간, 초)
 pub const PRE_ALARM_TTF_SECS: f64 = 30.0;
@@ -58,13 +59,23 @@ pub struct SdsTrigger {
 }
 
 /// `at_ms` 에서 이 센서가 사건을 열어야 하는가. 데드밴드 안의 흔들림은 열지 않습니다.
+///
+/// - 한 표본 튐 막기: 직전 표본이 경보 밖이었는데 물리적으로 불가능한 속도(`max_slew` 초과)로 경보선을 넘었으면 이 표본으로는 열지 않습니다.
+///   다음 표본도 경보 쪽이면 그때 엽니다 (진짜 계단은 1초 늦게, 전자기 잡음 한 점은 열지 않음).
+/// - 선행 경보의 TTF 는 1차(지금 기울기) · 2차(가속) 중 이른 것입니다 ([`ttf_conservative`]). 기울기 · 곡률을 재는 창(10초)에 튄 표본이 있으면 선행 경보를 내지 않습니다.
 pub fn trigger_at(sensor: &SensorRow, series: &Series, at_ms: i64) -> Option<SdsTrigger> {
     let value = series.value_at(at_ms)?;
     let slope = series.slope_at(at_ms, SLOPE_SAMPLES);
-    let remain = slope.and_then(|s| ttf(sensor, value, s));
+    let remain = ttf_conservative(sensor, series, at_ms);
     let base = |kind| SdsTrigger { kind, tag: Some(sensor.tag.clone()), at_ms, value: Some(value), slope, ttf_secs: remain };
     if sensor.alarm_side(value).is_some() {
-        return Some(base(TriggerKind::ThresholdBreach));
+        let dt = series.period_ms as f64 / 1000.0;
+        let leapt = series.value_at(at_ms - series.period_ms).is_some_and(|p| sensor.alarm_side(p).is_none() && (value - p).abs() / dt > sensor.max_slew);
+        return (!leapt).then(|| base(TriggerKind::ThresholdBreach));
+    }
+    let window = QUAD_SAMPLES as i64 * series.period_ms;
+    if !series.spikes(sensor.max_slew, at_ms - window, at_ms).is_empty() {
+        return None;
     }
     let departed = series.departure(sensor.deadband, series.t0_ms + BASELINE_SECS * 1000, at_ms).is_some();
     (departed && remain.is_some_and(|r| r <= PRE_ALARM_TTF_SECS)).then(|| base(TriggerKind::HighSlopePreAlarm))
@@ -178,6 +189,43 @@ mod tests {
         assert!(found.value.unwrap() < s.alarm_high.unwrap());
         assert!(found.ttf_secs.unwrap() <= PRE_ALARM_TTF_SECS);
         assert_eq!(found.at_ms, 5_000);
+    }
+
+    #[test]
+    fn a_one_sample_spike_over_the_alarm_never_opens_but_a_held_step_opens_a_second_later() {
+        let db = Lattice::embedded().unwrap();
+        let s = db.sensor("10HAH10CT001").unwrap();
+        // 전자기 잡음: t = 10 초 한 표본만 640 °C (초당 30 도 > max_slew 20)
+        let spike = series(|t| 610.0 + (t * 1.3).sin() * 0.3 + if t == 10.0 { 30.0 } else { 0.0 });
+        assert_eq!(first_trigger(s, &spike, -40_000, 90_000), None, "튐 한 점으로는 사건을 열지 않습니다");
+        // 같은 크기의 계단이 머물면 다음 표본에서 엽니다.
+        let step = series(|t| 610.0 + (t * 1.3).sin() * 0.3 + if t >= 10.0 { 30.0 } else { 0.0 });
+        let found = first_trigger(s, &step, -40_000, 90_000).unwrap();
+        assert_eq!((found.kind, found.at_ms), (TriggerKind::ThresholdBreach, 11_000));
+        // 허용 속도 안에서 넘으면 그 표본에서 바로 엽니다.
+        let ramp = series(|t| if t < 0.0 { 610.0 } else { 610.0 + 0.5 * t });
+        assert_eq!(first_trigger(s, &ramp, -40_000, 90_000).unwrap().at_ms, 30_000);
+    }
+
+    #[test]
+    fn an_accelerating_rise_pre_alarms_before_the_linear_ttf_would() {
+        let db = Lattice::embedded().unwrap();
+        let s = db.sensor("10HAH10CT001").unwrap();
+        // 610 + 0.02·t² (t ≥ 0): 경보 625 °C 는 t = 27.4 초, 트립 645 °C 는 t = 41.8 초
+        let accel = series(|t| 610.0 + (t * 1.3).sin() * 0.05 + if t > 0.0 { 0.02 * t * t } else { 0.0 });
+        let found = first_trigger(s, &accel, -40_000, 90_000).unwrap();
+        assert_eq!(found.kind, TriggerKind::HighSlopePreAlarm, "{found:?}");
+        // 1차식만 썼다면 TTF ≤ 30 초가 되는 때는 기울기 · 거리로 계산해 더 늦습니다.
+        let linear_first = (-40..=90)
+            .map(|t| t * 1000)
+            .find(|&t| {
+                let v = accel.value_at(t).unwrap();
+                let slope = accel.slope_at(t, SLOPE_SAMPLES).unwrap_or(0.0);
+                s.alarm_side(v).is_some() || crate::timeseries::ttf(s, v, slope).is_some_and(|r| r <= PRE_ALARM_TTF_SECS)
+            })
+            .unwrap();
+        assert!(found.at_ms < linear_first, "가속을 보면 더 일찍: {} ms vs 1차식 {} ms", found.at_ms, linear_first);
+        assert!(found.value.unwrap() < s.alarm_high.unwrap());
     }
 
     #[test]

@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, VecDeque};
 use serde::Serialize;
 
 use crate::lattice::Lattice;
+use crate::timeseries::{classify_with, fault_code, onset_lag, Baseline, SignalState, BASELINE_SECS};
 use crate::tsdb::LiveRing;
 
 pub const TICK_MS: i64 = 100;
@@ -218,6 +219,16 @@ pub struct TrackEvent {
     pub note: String,
 }
 
+/// 센서 신호 모양이 바뀐 기록 (SDS 상태 코드: `STABLE → SLEW_DROP → STUCK_LOW`)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SignalEvent {
+    pub at_ms: i64,
+    pub tag: String,
+    pub from: SignalState,
+    pub to: SignalState,
+    pub note: String,
+}
+
 /// 센서마다 SDS 상태를 따라가며, 하류 경보가 상류 변곡과 시차로 이어지면 사건을 열 때를 알려 줍니다.
 #[derive(Debug, Clone, Default)]
 pub struct Tracker {
@@ -227,6 +238,15 @@ pub struct Tracker {
     pub opened: Option<String>,
     /// 처음 변곡을 본 뒤 하류 경보를 기다리는 한도 (초). 급수 → 과열기 시차 창(최대 12초)과 선행 경보까지의 시간을 덮습니다.
     pub wait_secs: f64,
+    /// 센서별 기준: 처음 20초 정상 구간에서 붙잡아 둡니다 (링버퍼 창이 미끄러져도 기준은 그대로)
+    baselines: BTreeMap<String, Baseline>,
+    signals: BTreeMap<String, SignalState>,
+    /// 센서 신호 모양의 바뀐 기록
+    pub signal_events: Vec<SignalEvent>,
+    /// 회복 판정 히스테리시스: 정상 범위에 들어온 시각
+    calm_since: BTreeMap<String, i64>,
+    /// 회복 중에서 안정으로 넘기 전에 정상 범위에 머물러야 하는 시간 (초). 경계에서 오락가락하지 않게 합니다.
+    pub calm_secs: i64,
 }
 
 /// 사건을 열 차례
@@ -238,15 +258,47 @@ pub struct OpenCall {
     pub trigger: String,
     pub value: f64,
     pub at_ms: i64,
+    /// 원인 설비 종류 + 원인 센서 신호 모양 (예: `VALVE_STUCK_LOW`, 원장 인터록의 `fault` 와 같은 꼴)
+    pub fault: Option<String>,
+    /// 변화 시작(CUSUM) 시각 차이 (변곡 시차의 확인용, 초)
+    pub onset_lag_secs: Option<f64>,
 }
 
 impl Tracker {
     pub fn new() -> Self {
-        Self { wait_secs: 25.0, ..Self::default() }
+        Self { wait_secs: 25.0, calm_secs: 3, ..Self::default() }
     }
 
     pub fn state(&self, tag: &str) -> TrackState {
         self.states.get(tag).map_or(TrackState::Stable, |s| s.0)
+    }
+
+    /// 센서의 지금 신호 모양 (아직 판정 전이면 안정)
+    pub fn signal(&self, tag: &str) -> SignalState {
+        self.signals.get(tag).copied().unwrap_or(SignalState::Stable)
+    }
+
+    /// 센서마다 신호 모양을 다시 판정하고 바뀐 것을 기록합니다.
+    fn update_signals(&mut self, db: &Lattice, ring: &LiveRing, now: i64) {
+        for s in db.sensors() {
+            let Some(series) = ring.series(&s.tag, 1000) else { continue };
+            if !self.baselines.contains_key(&s.tag) {
+                let end = series.t0_ms + BASELINE_SECS * 1000;
+                if series.end_ms() < end {
+                    continue;
+                }
+                let Some(b) = series.baseline(end, BASELINE_SECS) else { continue };
+                self.baselines.insert(s.tag.clone(), b);
+            }
+            let base = self.baselines[&s.tag];
+            let Some(r) = classify_with(s, &series, now, base, series.t0_ms) else { continue };
+            let from = self.signal(&s.tag);
+            if r.state != from {
+                self.signals.insert(s.tag.clone(), r.state);
+                let note = format!("{} {:.2} {} · 기울기 {:+.2}/s", s.label, r.value, s.unit, r.slope);
+                self.signal_events.push(SignalEvent { at_ms: now, tag: s.tag.clone(), from, to: r.state, note });
+            }
+        }
     }
 
     fn set(&mut self, tag: &str, to: TrackState, at_ms: i64, note: String) {
@@ -271,6 +323,7 @@ impl Tracker {
         let latest = ring.tags().filter_map(|t| ring.latest(t)).map(|x| x.0).max()?;
         // 판정은 1초 간격으로 다시 뽑은 계열로 하고, 그 계열은 정각 초에서 끝납니다. 기준 시각도 정각 초로 내립니다.
         let now = latest - latest.rem_euclid(1000);
+        self.update_signals(db, ring, now);
         // 변곡 포착
         for s in db.sensors() {
             if self.state(&s.tag) == TrackState::Stable {
@@ -289,10 +342,17 @@ impl Tracker {
                     }
                 }
             }
+            // 회복 → 안정: 정상 범위에 calm_secs 동안 머물러야 넘깁니다 (히스테리시스)
             if self.state(&s.tag) == TrackState::Recovering {
                 if let Some((_, v)) = ring.latest(&s.tag) {
                     if (v - s.normal).abs() <= s.deadband * 4.0 {
-                        self.set(&s.tag, TrackState::Stable, now, "정상 범위 회복".into());
+                        let since = *self.calm_since.entry(s.tag.clone()).or_insert(now);
+                        if now - since >= self.calm_secs * 1000 {
+                            self.calm_since.remove(&s.tag);
+                            self.set(&s.tag, TrackState::Stable, now, format!("정상 범위 {}초 유지", self.calm_secs));
+                        }
+                    } else {
+                        self.calm_since.remove(&s.tag);
                     }
                 }
             }
@@ -317,17 +377,27 @@ impl Tracker {
             let report = crate::causal::trace_root_cause(db, &snapshot, tag, now);
             // 원인은 결과보다 먼저 변해야 합니다 (같은 순간이면 같은 고장의 두 얼굴이지 인과가 아닙니다).
             let Some(root) = report.root.filter(|r| r.lag_secs > 0.0) else { continue };
-            self.set(&root.tag, TrackState::CausalChainLocked, now, format!("→ {tag} Δt {:.1}s (허용 {:.1} ~ {:.1}s, {}홉)", root.lag_secs, root.lag_range.0, root.lag_range.1, root.hops));
+            // 고장 코드: 원인 설비 종류 + 원인 센서의 지금 모양. 변화 시작(CUSUM) 시차는 변곡 시차의 확인용입니다.
+            let fault = db.sensor(&root.tag).and_then(|x| db.equipment(&x.kks)).map(|e| fault_code(&e.kind, self.signal(&root.tag)));
+            let part = |t: &str| Some((db.sensor(t)?, snapshot.get(t)?, *self.baselines.get(t)?));
+            let onset = match (part(&root.tag), part(tag)) {
+                (Some(a), Some(b)) => onset_lag(a, b, a.1.t0_ms.max(b.1.t0_ms), now),
+                _ => None,
+            };
+            let check = onset.map(|x| format!(" · 변화 시작 시차 {x:.1}s")).unwrap_or_default();
+            let code = fault.clone().map(|f| format!(" · {f}")).unwrap_or_default();
+            self.set(&root.tag, TrackState::CausalChainLocked, now, format!("→ {tag} Δt {:.1}s (허용 {:.1} ~ {:.1}s, {}홉){check}{code}", root.lag_secs, root.lag_range.0, root.lag_range.1, root.hops));
             self.set(tag, TrackState::CausalChainLocked, now, format!("← {} Δt {:.1}s", root.tag, root.lag_secs));
             self.opened = Some(tag.clone());
-            return Some(OpenCall { alarm_tag: tag.clone(), upstream_tag: Some(root.tag.clone()), lag_secs: Some(root.lag_secs), trigger: trig.kind.code().to_string(), value: trig.value.unwrap_or_default(), at_ms: now });
+            return Some(OpenCall { alarm_tag: tag.clone(), upstream_tag: Some(root.tag.clone()), lag_secs: Some(root.lag_secs), trigger: trig.kind.code().to_string(), value: trig.value.unwrap_or_default(), at_ms: now, fault, onset_lag_secs: onset });
         }
         // 이어지는 하류가 기다려도 없으면 처음 경보 난 센서로 엽니다 (단일 이슈).
         let first = self.states.values().filter_map(|s| s.1).fold(f64::INFINITY, f64::min);
         if first.is_finite() && (now as f64 - first) / 1000.0 >= self.wait_secs {
             let (tag, trig) = &triggered[0];
             self.opened = Some(tag.clone());
-            return Some(OpenCall { alarm_tag: tag.clone(), upstream_tag: None, lag_secs: None, trigger: trig.kind.code().to_string(), value: trig.value.unwrap_or_default(), at_ms: now });
+            let fault = db.sensor(tag).and_then(|x| db.equipment(&x.kks)).map(|e| fault_code(&e.kind, self.signal(tag)));
+            return Some(OpenCall { alarm_tag: tag.clone(), upstream_tag: None, lag_secs: None, trigger: trig.kind.code().to_string(), value: trig.value.unwrap_or_default(), at_ms: now, fault, onset_lag_secs: None });
         }
         None
     }
@@ -445,6 +515,20 @@ mod tests {
         assert!(call.upstream_tag.is_some() && call.lag_secs.is_some_and(|l| l > 2.0), "{call:?}");
         assert!(tr.events.iter().any(|e| e.tag == TAG_VALVE && e.to == TrackState::InflectionDetected));
         assert!(tr.events.iter().any(|e| e.to == TrackState::CausalChainLocked));
+        // SDS 신호 모양: 밸브는 떨어지는 동안 SLEW_DROP, 그 자리에 머물면 STUCK_LOW. 과열기는 SLEW_RISE.
+        let valve: Vec<SignalState> = tr.signal_events.iter().filter(|e| e.tag == TAG_VALVE).map(|e| e.to).collect();
+        assert_eq!(valve.first(), Some(&SignalState::SlewDrop), "{:?}", tr.signal_events);
+        assert_eq!(tr.signal(TAG_VALVE), SignalState::StuckLow, "{:?}", tr.signal_events);
+        assert!(tr.signal_events.iter().any(|e| e.tag == TAG_SH && e.to == SignalState::SlewRise), "{:?}", tr.signal_events);
+        // 고장 코드는 원장 인터록의 고장 코드와 같아 절차가 바로 이어집니다.
+        assert_eq!(call.fault.as_deref(), Some("VALVE_STUCK_LOW"));
+        assert!(db.interlocks().iter().any(|i| Some(i.fault.as_str()) == call.fault.as_deref()));
+        // 변화 시작 시차는 이류 지연(4.2 초) 근처이고, 문턱으로 잰 변곡 시차보다 짧거나 같습니다 (느린 상승은 문턱을 늦게 넘음).
+        let onset = call.onset_lag_secs.expect("변화 시작 시차");
+        let lag = call.lag_secs.unwrap();
+        assert!((3.0..=6.5).contains(&onset) && onset <= lag + 0.5, "변화 시작 {onset:.1}s · 변곡 {lag:.1}s");
+        // 잡음만 있는 센서는 안정에서 움직이지 않습니다.
+        assert!(tr.signal_events.iter().all(|e| [TAG_VALVE, TAG_SH, TAG_FLOW, TAG_PUMP].contains(&e.tag.as_str())), "{:?}", tr.signal_events);
         run(&mut sim, &mut ring, 1.0);
         assert_eq!(tr.observe(&db, &ring), None, "사건은 한 번만 엽니다");
     }

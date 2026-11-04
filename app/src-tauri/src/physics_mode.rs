@@ -30,6 +30,8 @@ pub struct PhysicsState {
     started_ms: i64,
     /// 추적기가 연 사건
     incident: Option<String>,
+    /// 사건을 연 차례 (고장 코드 · 변곡 시차 · 변화 시작 시차)
+    call: Option<OpenCall>,
     /// 엔진이 사건을 분석하는 중
     busy: bool,
     peak_sh: f64,
@@ -127,11 +129,14 @@ fn run_loop(app: AppHandle, generation: u64) {
                 ph.peak_sh = ph.peak_sh.max(sh);
                 k += 1;
                 if k % 10 == 0 {
-                    let PhysicsState { tracker, ring, busy, incident, .. } = &mut *ph;
+                    let PhysicsState { tracker, ring, busy, incident, call: opened, .. } = &mut *ph;
                     if !*busy {
                         call = tracker.observe(&desk.db, ring);
                         if call.is_some() {
                             *busy = true;
+                        }
+                        if let Some(c) = &call {
+                            *opened = Some(c.clone());
                         }
                     } else {
                         tracker.observe(&desk.db, ring);
@@ -257,6 +262,10 @@ pub struct PhysicsDto {
     series: serde_json::Map<String, Value>,
     latest: Vec<(String, f64)>,
     events: Vec<Value>,
+    /// 센서 신호 모양 기록 (SDS 상태 코드)
+    signals: Vec<Value>,
+    /// 사건을 연 차례
+    call: Option<Value>,
     faults: Value,
     commands: Value,
     incident: Option<String>,
@@ -289,6 +298,14 @@ pub fn physics_status(window: Window, desk: State<'_, Desk>) -> Result<PhysicsDt
         .take(30)
         .map(|e| json!({ "t": (e.at_ms - ph.started_ms) as f64 / 1000.0, "tag": e.tag, "from": e.from, "to": e.to, "note": e.note }))
         .collect();
+    let signals = ph
+        .tracker
+        .signal_events
+        .iter()
+        .rev()
+        .take(30)
+        .map(|e| json!({ "t": (e.at_ms - ph.started_ms) as f64 / 1000.0, "tag": e.tag, "from": e.from, "to": e.to, "note": e.note }))
+        .collect();
     Ok(PhysicsDto {
         running: ph.running,
         busy: ph.busy,
@@ -299,6 +316,8 @@ pub fn physics_status(window: Window, desk: State<'_, Desk>) -> Result<PhysicsDt
         series,
         latest,
         events,
+        signals,
+        call: ph.call.as_ref().map(|c| json!({ "t": (c.at_ms - ph.started_ms) as f64 / 1000.0, "alarm_tag": c.alarm_tag, "upstream_tag": c.upstream_tag, "lag_secs": c.lag_secs, "onset_lag_secs": c.onset_lag_secs, "fault": c.fault, "trigger": c.trigger })),
         faults: json!(ph.sim.as_ref().map(|s| s.faults.clone()).unwrap_or_default()),
         commands: json!(ph.sim.as_ref().map(|s| s.commands.iter().map(|(t, c)| json!({ "t": (t - ph.started_ms) as f64 / 1000.0, "command": c })).collect::<Vec<_>>()).unwrap_or_default()),
         incident: ph.incident.clone(),

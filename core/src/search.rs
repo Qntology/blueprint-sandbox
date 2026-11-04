@@ -21,7 +21,7 @@ use serde::Serialize;
 use crate::lattice::{KksMatch, Lattice};
 use crate::plant::fmt_value;
 use crate::store::Store;
-use crate::timeseries::Telemetry;
+use crate::timeseries::{classify_with, Baseline, SignalState, Telemetry};
 
 /// RRF 상수와 경로 가중치 (logis-center `search_fusion.rs` 와 같음)
 pub const FUSION_K: f32 = 20.0;
@@ -100,6 +100,91 @@ const MEASURE_WORDS: [(&str, &[&str]); 9] = [
     ("농도", &["ppm"]),
 ];
 
+/// 질적 상태 조건 ("압력 높은", "고착", "비정상"). 지금 계측(물리엔진 · 시나리오 재생)이 있을 때만 판정하고, 없으면 힌트로 내립니다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Quality {
+    High,
+    Low,
+    Rising,
+    Falling,
+    Stuck,
+    Frozen,
+    Abnormal,
+}
+
+impl Quality {
+    fn label(self) -> &'static str {
+        match self {
+            Quality::High => "높음",
+            Quality::Low => "낮음",
+            Quality::Rising => "상승 중",
+            Quality::Falling => "하강 중",
+            Quality::Stuck => "고착",
+            Quality::Frozen => "동결",
+            Quality::Abnormal => "비정상",
+        }
+    }
+
+    /// 높음 · 낮음은 경보 쪽이거나 정상치에서 여유(데드밴드 ×2 와 정상치 2 % 중 큰 값)보다 벗어났을 때,
+    /// 상승 · 하강 · 고착 · 동결은 신호 모양(`timeseries::classify`)으로, 비정상은 그중 하나라도일 때입니다.
+    fn holds(self, t: &SignalTag) -> bool {
+        let dev = t.value - t.normal;
+        match self {
+            Quality::High => t.side == Some(true) || dev > t.margin,
+            Quality::Low => t.side == Some(false) || -dev > t.margin,
+            Quality::Rising => t.state == Some(SignalState::SlewRise),
+            Quality::Falling => t.state == Some(SignalState::SlewDrop),
+            Quality::Stuck => matches!(t.state, Some(SignalState::StuckLow | SignalState::StuckHigh)),
+            Quality::Frozen => t.state == Some(SignalState::Flatline),
+            Quality::Abnormal => t.side.is_some() || dev.abs() > t.margin || t.state.is_some_and(|s| s != SignalState::Stable),
+        }
+    }
+}
+
+/// 질적 상태 낱말. 한 글자 낱말(높 · 낮)은 앞머리 일치, 나머지는 낱말 안 어디든 ("온도상승", "고착된").
+/// "이상" 은 비교어("600도 이상")라서 "이상한" · "이상징후" 만 비정상입니다.
+const QUALITY_WORDS: [(&str, Quality); 21] = [
+    ("높", Quality::High),
+    ("과다", Quality::High),
+    ("낮", Quality::Low),
+    ("저하", Quality::Low),
+    ("부족", Quality::Low),
+    ("상승", Quality::Rising),
+    ("오르", Quality::Rising),
+    ("올라", Quality::Rising),
+    ("증가", Quality::Rising),
+    ("하강", Quality::Falling),
+    ("하락", Quality::Falling),
+    ("떨어", Quality::Falling),
+    ("감소", Quality::Falling),
+    ("내려", Quality::Falling),
+    ("고착", Quality::Stuck),
+    ("멈춘", Quality::Stuck),
+    ("동결", Quality::Frozen),
+    ("비정상", Quality::Abnormal),
+    ("이상한", Quality::Abnormal),
+    ("이상징후", Quality::Abnormal),
+    ("문제", Quality::Abnormal),
+];
+
+fn quality_of(w: &str) -> Option<Quality> {
+    QUALITY_WORDS.iter().find(|(k, _)| if k.chars().count() == 1 { w.starts_with(k) } else { w.contains(k) }).map(|x| x.1)
+}
+
+/// 지금 계측 한 점 (설비 · 센서 문서에 붙음)
+#[derive(Debug, Clone, PartialEq)]
+struct SignalTag {
+    label: String,
+    unit: String,
+    value: f64,
+    normal: f64,
+    margin: f64,
+    /// 경보 쪽 (`Some(true)` 상한 · `Some(false)` 하한)
+    side: Option<bool>,
+    state: Option<SignalState>,
+}
+
 const NEGATIONS: [&str; 7] = ["아닌", "제외", "빼고", "없는", "말고", "않은", "아니"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -159,6 +244,9 @@ pub struct Doc {
     level: Option<&'static str>,
     #[serde(skip)]
     status: Option<String>,
+    /// 지금 계측의 값 · 모양 (질적 상태 조건용)
+    #[serde(skip)]
+    signals: Vec<SignalTag>,
 }
 
 /// 검색 표 (원장 + 진행 중 사건 · 보관 · 지금 계측)
@@ -166,6 +254,8 @@ pub struct Doc {
 pub struct Corpus {
     pub docs: Vec<Doc>,
     df: HashMap<String, usize>,
+    /// 지금 계측이 있는가 (없으면 질적 상태 조건은 힌트로만)
+    pub live: bool,
 }
 
 fn level_of(s: &crate::lattice::SensorRow, v: f64) -> &'static str {
@@ -194,6 +284,21 @@ impl Corpus {
     /// `live` 가 있으면 계측 조건 · 상태를 그 시각 값으로, 없으면 정상치로 봅니다.
     pub fn build(db: &Lattice, live: Option<(&Telemetry, i64)>, store: Option<&Store>) -> Self {
         let value = |tag: &str, normal: f64| live.and_then(|(t, at)| t.value_at(tag, at)).or(if live.is_none() { Some(normal) } else { None });
+        let signal_of = |s: &crate::lattice::SensorRow| -> Option<SignalTag> {
+            let (t, at) = live?;
+            let series = t.get(&s.tag)?;
+            let value = series.value_at(at)?;
+            Some(SignalTag {
+                label: s.label.clone(),
+                unit: s.unit.clone(),
+                value,
+                normal: s.normal,
+                margin: (2.0 * s.deadband).max(0.02 * s.normal.abs()),
+                side: s.alarm_side(value),
+                // 기준은 원장 정상치입니다. 물리엔진 링버퍼는 60초 창이 미끄러져서 "처음 20초" 가 고장 뒤 값이 될 수 있습니다.
+                state: classify_with(s, series, at, Baseline { mean: s.normal, std: 0.0 }, series.t0_ms).map(|r| r.state),
+            })
+        };
         let mut docs = Vec::new();
         for e in db.equipment_all() {
             let a = db.address(&e.kks);
@@ -223,6 +328,7 @@ impl Corpus {
                 measures,
                 level,
                 status: None,
+                signals: db.sensors_of(&e.kks).into_iter().filter_map(signal_of).collect(),
             });
         }
         for s in db.sensors() {
@@ -242,6 +348,7 @@ impl Corpus {
                 measures: vec![(s.label.clone(), s.unit.clone(), v)],
                 level: v.filter(|_| live.is_some()).map(|v| level_of(s, v)),
                 status: None,
+                signals: signal_of(s).into_iter().collect(),
             });
         }
         for a in db.aops() {
@@ -258,6 +365,7 @@ impl Corpus {
                 measures: Vec::new(),
                 level: None,
                 status: Some(if a.high_risk { "고위험".into() } else { "일반".into() }),
+                signals: Vec::new(),
             });
         }
         for m in db.mocs() {
@@ -280,6 +388,7 @@ impl Corpus {
                 measures: vec![(m.param.clone(), m.unit.clone(), Some(m.new))],
                 level: None,
                 status: Some(status.to_string()),
+                signals: Vec::new(),
             });
         }
         for d in db.drawings() {
@@ -297,6 +406,7 @@ impl Corpus {
                 measures: Vec::new(),
                 level: None,
                 status: None,
+                signals: Vec::new(),
             });
         }
         if let Some(store) = store {
@@ -316,6 +426,7 @@ impl Corpus {
                     measures: Vec::new(),
                     level: None,
                     status: Some("진행 중".into()),
+                    signals: Vec::new(),
                 });
             }
             for r in store.archive() {
@@ -332,6 +443,7 @@ impl Corpus {
                     measures: Vec::new(),
                     level: None,
                     status: Some("확정".into()),
+                    signals: Vec::new(),
                 });
             }
         }
@@ -343,7 +455,7 @@ impl Corpus {
                 *df.entry(t).or_insert(0) += 1;
             }
         }
-        Self { docs, df }
+        Self { docs, df, live: live.is_some() }
     }
 }
 
@@ -388,6 +500,8 @@ enum Cond {
     Number { measure: Option<String>, op: Op, value: f64 },
     Level(&'static str),
     Status(String),
+    /// 질적 상태 (계측 종류가 있으면 그 계측만)
+    Signal { measure: Option<String>, want: Quality },
     Near { anchor: String, upstream: Option<bool>, hops: usize },
 }
 
@@ -401,6 +515,7 @@ impl Cond {
             Cond::Number { measure, op, value } => d.measures.iter().any(|x| measure.as_deref().is_none_or(|m| measure_fits(m, &x.0, &x.1)) && x.2.is_some_and(|v| op.holds(v, *value))),
             Cond::Level(l) => d.level == Some(*l) || (*l == "alarm" && d.level == Some("trip")),
             Cond::Status(s) => d.status.as_deref().is_some_and(|x| x.contains(s.as_str())),
+            Cond::Signal { measure, want } => d.signals.iter().any(|t| measure.as_deref().is_none_or(|m| measure_fits(m, &t.label, &t.unit)) && want.holds(t)),
             Cond::Near { anchor, .. } => d.kks.as_deref().is_some_and(|k| k != anchor && near.contains_key(k)) && db.equipment(d.kks.as_deref().unwrap_or("")).is_some(),
         }
     }
@@ -414,8 +529,19 @@ impl Cond {
             Cond::Number { measure, op, value } => ("수치", format!("{} {} {}", measure.as_deref().unwrap_or("값"), op.text(), fmt_value(*value))),
             Cond::Level(l) => ("상태", (*l).to_string()),
             Cond::Status(s) => ("상태", s.clone()),
+            Cond::Signal { measure, want } => ("상태", format!("{}{}", measure.as_deref().map(|m| format!("{m} ")).unwrap_or_default(), want.label())),
             Cond::Near { anchor, upstream, hops } => ("연결", format!("{anchor} {} {hops}홉", match upstream { Some(true) => "상류", Some(false) => "하류", None => "주변" })),
         }
+    }
+}
+
+impl Cond {
+    /// 질적 상태 조건이 맞은 계측 (화면의 "왜")
+    fn evidence(&self, d: &Doc) -> Option<String> {
+        let Cond::Signal { measure, want } = self else { return None };
+        let t = d.signals.iter().find(|t| measure.as_deref().is_none_or(|m| measure_fits(m, &t.label, &t.unit)) && want.holds(t))?;
+        let shape = t.state.map(|s| format!(", {}", s.label())).unwrap_or_default();
+        Some(format!("{} {} {} (정상 {}{shape})", t.label, fmt_value(t.value), t.unit, fmt_value(t.normal)))
     }
 }
 
@@ -516,8 +642,16 @@ pub fn search(db: &Lattice, corpus: &Corpus, query: &str) -> SearchResult {
     // 1) 유형 먼저
     let mut types: Vec<DocKind> = TYPE_WORDS.iter().filter(|(_, ws)| ws.iter().any(|w| q.contains(w))).map(|(k, _)| *k).collect();
     if types.is_empty() {
-        types = vec![DocKind::Equipment, DocKind::Sensor];
-        notes.push("유형 지시어 없음 → 설비(기본) · 계측".into());
+        // 한국어 명사구는 끝 낱말이 머리입니다 ("출구온도 비정상 과열기" 는 과열기를 묻습니다). 머리가 설비 종류 낱말이면 설비만 찾습니다.
+        let head = words.last().map(|w| w.trim_end_matches(['을', '를', '이', '가', '은', '는'])).unwrap_or_default();
+        let kind_head = KIND_WORDS.iter().any(|(k, _)| head.ends_with(k)) || ["설비", "장비", "기기"].contains(&head);
+        if kind_head {
+            types = vec![DocKind::Equipment];
+            notes.push(format!("유형 지시어 없음 · 머리 낱말 '{head}' → 설비"));
+        } else {
+            types = vec![DocKind::Equipment, DocKind::Sensor];
+            notes.push("유형 지시어 없음 → 설비(기본) · 계측".into());
+        }
     }
 
     // 2) 식별자: KKS · 태그는 원장으로 교정
@@ -604,6 +738,12 @@ pub fn search(db: &Lattice, corpus: &Corpus, query: &str) -> SearchResult {
         } else if w.starts_with("정상") {
             conds.push(Cond::Level("normal"));
         }
+        // 질적 상태: 계측 낱말은 같은 낱말 안 → 앞 두 낱말 → 바로 다음 낱말 차례로 찾습니다 ("압력 높은", "출구온도 비정상", "높은 압력")
+        if let Some(want) = quality_of(w) {
+            let measure_in = |x: &String| MEASURE_WORDS.iter().find(|(m, _)| x.contains(m)).map(|(m, _)| m.to_string());
+            let measure = measure_in(w).or_else(|| words[..i].iter().rev().take(2).find_map(measure_in)).or_else(|| words.get(i + 1).and_then(measure_in));
+            conds.push(Cond::Signal { measure, want });
+        }
         if w.contains("대기") && types.contains(&DocKind::Moc) {
             conds.push(Cond::Status("승인 대기".into()));
         } else if w.starts_with("승인") && types.contains(&DocKind::Moc) && !q.contains("대기") {
@@ -658,7 +798,13 @@ pub fn search(db: &Lattice, corpus: &Corpus, query: &str) -> SearchResult {
         trial.push(c.clone());
         let satisfiable = in_scope.iter().any(|i| passes_all(&trial, &corpus.docs[*i], db, &near));
         let (kind, text) = c.describe(db);
-        let note = if satisfiable { "필터".to_string() } else { "앞 조건과 함께 맞는 항목이 없어 힌트로 내림 (정답을 지우지 않게)".to_string() };
+        let note = if satisfiable {
+            "필터".to_string()
+        } else if matches!(c, Cond::Signal { .. }) && !corpus.live {
+            "지금 계측이 없어 힌트로 내림 (물리엔진 · 시나리오 재생 중에만 판정)".to_string()
+        } else {
+            "앞 조건과 함께 맞는 항목이 없어 힌트로 내림 (정답을 지우지 않게)".to_string()
+        };
         conditions.push(Condition { kind, text, applied: satisfiable, note });
         if satisfiable {
             hard.push(c);
@@ -716,7 +862,15 @@ pub fn search(db: &Lattice, corpus: &Corpus, query: &str) -> SearchResult {
     let mut hits = Vec::new();
     let mut seen = BTreeSet::new();
     let why = |d: &Doc| -> Vec<String> {
-        let mut w: Vec<String> = hard.iter().chain(hints.iter()).filter(|c| c.matches(d, db, &near)).map(|c| { let (k, t) = c.describe(db); format!("{k} {t}") }).collect();
+        let mut w: Vec<String> = hard
+            .iter()
+            .chain(hints.iter())
+            .filter(|c| c.matches(d, db, &near))
+            .map(|c| {
+                let (k, t) = c.describe(db);
+                c.evidence(d).map_or_else(|| format!("{k} {t}"), |e| format!("{k} {t}: {e}"))
+            })
+            .collect();
         w.extend(qterms.iter().filter(|t| d.text.contains(t.as_str())).map(|t| format!("'{t}'")));
         if let (Some(k), true) = (d.kks.as_ref(), !near.is_empty()) {
             if let Some(depth) = near.get(k) {
@@ -752,7 +906,7 @@ pub fn search(db: &Lattice, corpus: &Corpus, query: &str) -> SearchResult {
 }
 
 /// 화면 순위로 채점하는 평가 질의 (logis-center 방식: 필터를 거친 화면 순서로 잼). (질의, 정답 id, 허용 순위)
-pub const EVAL_QUERIES: [(&str, &str, usize); 14] = [
+pub const EVAL_QUERIES: [(&str, &str, usize); 17] = [
     ("103동 2층 밸브", "10LAB20AA102", 2),
     ("103동 2층 밸브", "10LAB20AA103", 2),
     ("급수 바이패스", "10LAB20AA103", 1),
@@ -767,7 +921,32 @@ pub const EVAL_QUERIES: [(&str, &str, usize); 14] = [
     ("105동 도면", "PID-105-HLB", 1),
     ("유인통풍기", "10HLB10AN001", 1),
     ("주증기 압력", "10MAA10CP001", 2),
+    // 개선안 예시 (지금 계측 없음: 질적 상태는 힌트로)
+    ("103동 압력 높은 급수펌프", "10LAB10AP001", 1),
+    ("보일러동 지하 출구온도 비정상 과열기", "10HAH10BB001", 1),
+    ("10LABI0AA102 고착", "10LAB20AA102", 1),
 ];
+
+/// 지금 계측이 있을 때의 평가 (시나리오 P2 재생 끝 시각: 밸브 18 % 고착 · 펌프 토출 29.4 MPa · 과열기 638 °C)
+pub const EVAL_LIVE_SCENARIO: &str = "P2";
+pub const EVAL_LIVE_QUERIES: [(&str, &str, usize); 7] = [
+    ("103동 압력 높은 급수펌프", "10LAB10AP001", 1),
+    ("보일러동 지하 출구온도 비정상 과열기", "10HAH10BB001", 1),
+    ("10LABI0AA102 고착", "10LAB20AA102", 1),
+    ("고착된 밸브", "10LAB20AA102", 1),
+    ("유량 낮은 급수", "10LAB20AA102", 1),
+    ("온도 높은 센서", "10HAH10CT001", 1),
+    ("103동 비정상 설비", "10LAB20AA102", 2),
+];
+
+/// 시나리오를 끝 시각까지 재생한 지금 계측으로 검색 표를 만듭니다 (평가 · 시험용).
+pub fn live_corpus(db: &Lattice, scenario: &str) -> Option<Corpus> {
+    let set = crate::scenario::ScenarioSet::embedded().ok()?;
+    let sc = set.get(scenario)?;
+    let telemetry = sc.telemetry(&set);
+    let at = sc.time(sc.now_s).timestamp_millis();
+    Some(Corpus::build(db, Some((&telemetry, at)), None))
+}
 
 #[cfg(test)]
 mod tests {
@@ -782,6 +961,43 @@ mod tests {
     }
 
     use super::EVAL_QUERIES as QUERIES;
+
+    #[test]
+    fn qualitative_conditions_wait_for_live_values_and_then_filter() {
+        let db = Lattice::embedded().unwrap();
+        // 지금 계측이 없으면 질적 상태는 힌트로 내리고 이유를 남깁니다 (정답은 공간 · 종류 · 계측으로 1위).
+        let still = Corpus::build(&db, None, None);
+        let r = search(&db, &still, "103동 압력 높은 급수펌프");
+        let c = r.conditions.iter().find(|c| c.text.contains("높음")).unwrap();
+        assert!(!c.applied && c.note.contains("지금 계측이 없어"), "{c:?}");
+        assert_eq!(rank(&r, "10LAB10AP001"), Some(1), "{:?}", top(&r, 5));
+        // P2 재생 끝: 펌프 토출 29.4 MPa (정상 28.5) → 필터로 걸리고 "왜" 에 값이 나옵니다.
+        let live = live_corpus(&db, EVAL_LIVE_SCENARIO).unwrap();
+        let r = search(&db, &live, "103동 압력 높은 급수펌프");
+        let c = r.conditions.iter().find(|c| c.text.contains("높음")).unwrap();
+        assert!(c.applied, "{c:?}");
+        assert_eq!(r.hits[0].doc.id, "10LAB10AP001");
+        assert!(r.hits[0].why.iter().any(|w| w.contains("29.4") && w.contains("28.5")), "{:?}", r.hits[0].why);
+        // 고착된 밸브: 103동 2층 밸브 둘 중 고착된 주 조절밸브만 조건을 통과합니다 (바이패스는 0 % 근처에서 흔들림 = 안정).
+        let r = search(&db, &live, "고착된 밸브");
+        assert_eq!(r.hits[0].doc.id, "10LAB20AA102", "{:?}", top(&r, 5));
+        let passed: Vec<&Hit> = r.hits.iter().filter(|h| h.passed && !h.rescued).collect();
+        assert!(passed.iter().all(|h| h.doc.kks.as_deref() == Some("10LAB20AA102")), "{:?}", passed.iter().map(|h| &h.doc.id).collect::<Vec<_>>());
+        // 부정어가 붙으면 조건이 아닙니다.
+        let r = search(&db, &live, "고착 아닌 밸브");
+        assert!(!r.conditions.iter().any(|c| c.text.contains("고착")), "{:?}", r.conditions);
+    }
+
+    #[test]
+    fn live_queries_put_the_answer_on_top() {
+        let db = Lattice::embedded().unwrap();
+        let live = live_corpus(&db, EVAL_LIVE_SCENARIO).unwrap();
+        for (q, want, within) in EVAL_LIVE_QUERIES {
+            let r = search(&db, &live, q);
+            let k = rank(&r, want);
+            assert!(k.is_some_and(|k| k <= within), "'{q}' → {want} 순위 {k:?} (위: {:?}) 조건 {:?}", top(&r, 5), r.conditions);
+        }
+    }
 
 
     #[test]

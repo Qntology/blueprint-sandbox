@@ -28,6 +28,10 @@ interface PhysicsStatus {
   series: Record<string, number[]>;
   latest: [string, number][];
   events: { t: number; tag: string; from: string; to: string; note: string }[];
+  /** 센서 신호 모양 기록 (SDS 상태 코드: STABLE → SLEW_DROP → STUCK_LOW …) */
+  signals: { t: number; tag: string; from: string; to: string; note: string }[];
+  /** 추적기가 사건을 연 차례 (고장 코드는 원장 인터록의 fault 와 같은 꼴) */
+  call: { t: number; alarm_tag: string; upstream_tag: string | null; lag_secs: number | null; onset_lag_secs: number | null; fault: string | null; trigger: string } | null;
   faults: { kind: string; open_pct?: number; tag?: string; bias?: number }[];
   commands: { t: number; command: { kind: string; open_pct: number } }[];
   incident: string | null;
@@ -134,6 +138,21 @@ export function PhysicsPanel({ plant, supervisor, automation, onOpenIncident }: 
             {st?.commands.map((c, i) => (
               <li key={`c${i}`} className="good">
                 ⚡ t = {c.t.toFixed(1)}s · 시뮬레이터 명령: 바이패스 {fmt(c.command.open_pct)}% 개방
+              </li>
+            ))}
+          </ul>
+          {st?.call && (
+            <p className="callout">
+              🔒 t = {st.call.t.toFixed(1)}s 사건 열림 · {st.call.trigger} · 고장 코드 <b className="mono">{st.call.fault ?? "-"}</b>
+              {st.call.lag_secs != null && <> · 변곡 시차 {st.call.lag_secs.toFixed(1)}s</>}
+              {st.call.onset_lag_secs != null && <> · 변화 시작(CUSUM) 시차 {st.call.onset_lag_secs.toFixed(1)}s</>}
+            </p>
+          )}
+          <h4>[센서 신호 모양 (SDS 상태 코드)]</h4>
+          <ul className="facts physics-log physics-signals">
+            {st?.signals.map((e, i) => (
+              <li key={`s${i}`}>
+                📈 t = {e.t.toFixed(1)}s · <span className="mono">{e.tag}</span> {e.from} → <b>{e.to}</b> · {e.note}
               </li>
             ))}
           </ul>

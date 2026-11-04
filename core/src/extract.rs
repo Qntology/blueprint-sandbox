@@ -55,7 +55,7 @@ impl PageText {
 }
 
 /// 표 태그(`<td>` 등)를 빼고 칸 사이를 띄웁니다.
-fn strip_tags(text: &str) -> String {
+pub fn strip_tags(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {

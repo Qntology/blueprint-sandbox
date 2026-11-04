@@ -329,6 +329,7 @@ button.big { padding: 20px 40px; font-size: 21px; border-radius: 8px; }
 .physics-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 6px; }
 .physics-latest { display: flex; flex-wrap: wrap; gap: 12px; font-size: 11px; color: #9fb0cc; margin-top: 6px; }
 .physics-log { max-height: 260px; overflow-y: auto; font-size: 11px; }
+.physics-signals { max-height: 150px; }
 .mitigation { margin-top: 8px; padding: 8px; background: #13202a; border: 1px solid #2c5b4a; border-radius: 6px; }
 .mitigation.done { border-color: var(--green); }
 .bar-line { display: grid; grid-template-columns: 1fr 120px 44px; gap: 6px; align-items: center; font-size: 11px; }
