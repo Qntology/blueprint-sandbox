@@ -12,6 +12,10 @@
 //! [`Residency::enter`] 가 거기에 없는 묶음은 내리고 없는 묶음만 올립니다. 모델이 바뀌면 이전 모델을 통째로 내립니다.
 //!
 //! 쓰는 쪽이 핸들(`Arc<Loaded>`)을 쥔 채로는 묶음을 내릴 수 없습니다. 내렸다고 기록했는데 메모리가 남는 일을 막기 위해서입니다.
+//!
+//! 예외 하나 (켤 때만, [`Coexist`]): 작은 묶음(SigLIP2 비전 타워, 약 0.8 GB)은 모델이 바뀌어도 장치에 남겨 둘 수 있습니다.
+//! 다음 단계를 올리고도 여유분 + 공존 여유가 남을 때만 남기고, 모자라면 다음 단계를 올리기 **전에** 먼저 내립니다.
+//! 기본은 꺼짐입니다 (한 번에 한 모델). 실측 이득이 스캔 한 번에 0.3 초 남짓이라서입니다 (`docs/verification.md`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -41,6 +45,11 @@ const DEFAULT_HEADROOM_MB: u64 = 640;
 pub const TEXT_TOKEN_TABLE: &str = "text_model.embeddings.token_embedding.weight";
 /// 호스트에 남은 가중치가 있어도 계속 진행하도록 허용하는 환경 변수 (`1`). 수치가 실행마다 달라질 수 있어 진단용으로만 씁니다.
 pub const ALLOW_HOST_ENV: &str = "BLUEPRINT_ALLOW_HOST_WEIGHTS";
+/// 모델이 바뀌어도 남겨 둘 묶음 (`siglip2` = SigLIP2 비전 타워). 없거나 `off` 면 한 번에 한 모델입니다.
+pub const COEXIST_ENV: &str = "BLUEPRINT_COEXIST";
+/// 남겨 둔 묶음과 다음 단계를 함께 올린 뒤에도 여유분 위로 더 남아 있어야 하는 장치 메모리 (MB)
+pub const COEXIST_MARGIN_ENV: &str = "BLUEPRINT_COEXIST_MARGIN_MB";
+const DEFAULT_COEXIST_MARGIN_MB: u64 = 512;
 
 fn env_mb(key: &str) -> Option<u64> {
     std::env::var(key).ok().and_then(|v| v.trim().parse::<u64>().ok())
@@ -430,11 +439,55 @@ struct Current {
     groups: BTreeMap<Group, Arc<Loaded>>,
 }
 
+/// 모델이 바뀌어도 장치에 남겨 둘 수 있는 묶음 목록. 기본은 비어 있습니다 (한 번에 한 모델).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Coexist {
+    pins: Vec<(ModelId, Group)>,
+    margin: u64,
+}
+
+impl Coexist {
+    pub fn off() -> Self {
+        Self::default()
+    }
+
+    /// `model` 의 `group` 을 남겨 둡니다. 여유는 `BLUEPRINT_COEXIST_MARGIN_MB` (기본 512 MB).
+    pub fn pin(model: ModelId, group: Group) -> Self {
+        Self { pins: vec![(model, group)], margin: env_mb(COEXIST_MARGIN_ENV).unwrap_or(DEFAULT_COEXIST_MARGIN_MB) << 20 }
+    }
+
+    /// `BLUEPRINT_COEXIST=siglip2` 이면 SigLIP2 비전 타워를 남깁니다. 그 밖의 값은 꺼짐입니다.
+    pub fn from_env() -> Self {
+        match std::env::var(COEXIST_ENV).map(|v| v.trim().to_lowercase()) {
+            Ok(v) if v == "siglip2" || v == "siglip2:vision" => Self::pin(ModelId::Siglip2, Group::Vision),
+            _ => Self::off(),
+        }
+    }
+
+    pub fn is_off(&self) -> bool {
+        self.pins.is_empty()
+    }
+
+    fn allows(&self, model: ModelId, group: Group) -> bool {
+        self.pins.contains(&(model, group))
+    }
+}
+
+/// 모델이 바뀐 뒤에도 남겨 둔 묶음
+struct Pinned {
+    file: Arc<WeightFile>,
+    loaded: Arc<Loaded>,
+}
+
 /// 모델 하나, 단계 하나의 가중치만 장치에 두는 관리자
 pub struct Residency {
     device: Device,
     budget: Budget,
     current: Option<Current>,
+    coexist: Coexist,
+    pinned: BTreeMap<(ModelId, Group), Pinned>,
+    /// 남겨 둔 묶음을 다시 올리지 않고 그대로 쓴 횟수
+    coexist_hits: u64,
     history: Vec<Transition>,
 }
 
@@ -443,11 +496,33 @@ pub type SharedResidency = Arc<Mutex<Residency>>;
 
 impl Residency {
     pub fn new(device: Device, budget: Budget) -> Self {
-        Self { device, budget, current: None, history: Vec::new() }
+        Self { device, budget, current: None, coexist: Coexist::off(), pinned: BTreeMap::new(), coexist_hits: 0, history: Vec::new() }
+    }
+
+    pub fn with_coexist(mut self, coexist: Coexist) -> Self {
+        self.coexist = coexist;
+        self
     }
 
     pub fn shared(device: Device, budget: Budget) -> SharedResidency {
         Arc::new(Mutex::new(Self::new(device, budget)))
+    }
+
+    pub fn shared_with(device: Device, budget: Budget, coexist: Coexist) -> SharedResidency {
+        Arc::new(Mutex::new(Self::new(device, budget).with_coexist(coexist)))
+    }
+
+    /// 남겨 둔 묶음 (모델, 묶음)
+    pub fn pinned_groups(&self) -> Vec<(ModelId, Group)> {
+        self.pinned.keys().copied().collect()
+    }
+
+    pub fn pinned_bytes(&self) -> u64 {
+        self.pinned.values().map(|p| p.loaded.device_bytes).sum()
+    }
+
+    pub fn coexist_hits(&self) -> u64 {
+        self.coexist_hits
     }
 
     pub fn device(&self) -> &Device {
@@ -508,12 +583,19 @@ impl Residency {
 
     /// 이 단계가 쓰는 묶음만 올라온 상태로 만들고, 그 핸들을 `phase.groups` 순서대로 돌려줍니다.
     ///
-    /// 1. 다른 모델이 올라와 있으면 통째로 내립니다 (동시 상주 금지).
+    /// 1. 다른 모델이 올라와 있으면 통째로 내립니다 (동시 상주 금지). [`Coexist`] 를 켰으면 그 묶음만 자리가 될 때 남깁니다.
     /// 2. 이 단계에 없는 묶음을 내립니다.
     /// 3. 아직 없는 묶음을 올립니다. 상한을 넘으면 [`OverBudget`] 오류입니다.
+    ///
+    /// 남겨 둔 묶음만으로 되는 단계(예: 다른 모델이 올라와 있을 때의 SigLIP2 비전)는 지금 모델을 건드리지 않고 그 핸들을 돌려줍니다.
     pub fn enter(&mut self, spec: &ModelSpec, phase: &Phase) -> Result<Vec<Arc<Loaded>>> {
         phase.validate()?;
-        self.switch_model(spec)?;
+        if let Some(handles) = self.pinned_handles(spec, phase) {
+            self.coexist_hits += 1;
+            trace::record(spec.id.name(), "공존 상주", 0.0, json!({ "groups": phase.groups.iter().map(|g| g.to_string()).collect::<Vec<_>>(), "bytes": handles.iter().map(|h| h.device_bytes).sum::<u64>() }));
+            return Ok(handles);
+        }
+        self.switch_model(spec, phase)?;
         let stale: Vec<Group> = self
             .resident_groups()
             .into_iter()
@@ -537,8 +619,14 @@ impl Residency {
         self.release_groups(&[group])
     }
 
-    /// 올라온 것을 모두 내리고 장치 메모리를 돌려받습니다.
+    /// 올라온 것을 모두 내리고 장치 메모리를 돌려받습니다 (남겨 둔 묶음 포함).
     pub fn release_all(&mut self) -> Result<()> {
+        self.release_current()?;
+        self.release_pinned()
+    }
+
+    /// 지금 모델의 묶음을 모두 내립니다 (남겨 둔 묶음은 그대로).
+    fn release_current(&mut self) -> Result<()> {
         let groups = self.resident_groups();
         if groups.is_empty() {
             // 내릴 것이 없어도 정리합니다. 다른 관리자가 남긴 풀과 버퍼 캐시가 여유 메모리 검사를 흐리지 않게 하기 위해서입니다.
@@ -553,20 +641,112 @@ impl Residency {
         self.current.as_ref().is_some_and(|c| c.groups.contains_key(&group))
     }
 
-    fn switch_model(&mut self, spec: &ModelSpec) -> Result<()> {
+    /// 이 단계의 묶음이 모두 남겨 둔 묶음(같은 모델 · 같은 파일)이면 그 핸들
+    fn pinned_handles(&self, spec: &ModelSpec, phase: &Phase) -> Option<Vec<Arc<Loaded>>> {
+        if self.pinned.is_empty() {
+            return None;
+        }
+        phase
+            .groups
+            .iter()
+            .map(|g| self.pinned.get(&(spec.id, *g)).filter(|p| p.file.path() == spec.file.path()).map(|p| Arc::clone(&p.loaded)))
+            .collect()
+    }
+
+    fn switch_model(&mut self, spec: &ModelSpec, phase: &Phase) -> Result<()> {
         // 같은 모델의 같은 파일이면 이미 올라온 가중치를 그대로 씁니다 (파일을 다시 열어 만든 `WeightFile` 도 같은 파일로 봅니다).
         let same = matches!(&self.current, Some(c) if c.id == spec.id && c.file.path() == spec.file.path());
-        if !same {
-            // 새 모델의 첫 바이트를 읽기 전에 이전 모델을 모두 내립니다.
-            self.release_all()?;
-            self.current = Some(Current { id: spec.id, file: Arc::clone(&spec.file), groups: BTreeMap::new() });
+        if same {
+            return Ok(());
+        }
+        // 새 모델의 첫 바이트를 읽기 전에 이전 모델을 모두 내립니다. 공존을 켰으면 그 묶음만 따로 둡니다.
+        self.pin_outgoing();
+        self.release_current()?;
+        // 이 모델의 남겨 둔 묶음은 다시 이 모델의 묶음이 됩니다 (다시 올리지 않음). 파일이 다르면 내립니다.
+        let mine: Vec<(ModelId, Group)> = self.pinned.keys().filter(|(m, _)| *m == spec.id).copied().collect();
+        let mut groups = BTreeMap::new();
+        let mut other_file = false;
+        for key in mine {
+            if self.pinned[&key].file.path() == spec.file.path() {
+                if let Some(p) = self.pinned.remove(&key) {
+                    groups.insert(key.1, p.loaded);
+                }
+            } else {
+                other_file = true;
+            }
+        }
+        if other_file {
+            self.release_pinned()?;
+        }
+        self.current = Some(Current { id: spec.id, file: Arc::clone(&spec.file), groups });
+        self.make_room(spec, phase)
+    }
+
+    /// 지금 모델에서 공존을 허락한 묶음을 내리지 않고 따로 둡니다.
+    fn pin_outgoing(&mut self) {
+        if self.coexist.is_off() {
+            return;
+        }
+        let Some(cur) = self.current.as_mut() else { return };
+        let keep: Vec<Group> = cur.groups.keys().copied().filter(|g| self.coexist.allows(cur.id, *g)).collect();
+        for g in keep {
+            if let Some(loaded) = cur.groups.remove(&g) {
+                trace::record(cur.id.name(), "공존 남김", 0.0, json!({ "group": g.to_string(), "bytes": loaded.device_bytes }));
+                self.pinned.insert((cur.id, g), Pinned { file: Arc::clone(&cur.file), loaded });
+            }
+        }
+    }
+
+    /// 남겨 둔 묶음과 함께 이 단계를 올릴 자리(예산 · 장치 여유분 + 공존 여유)가 없으면 남겨 둔 묶음을 먼저 내립니다.
+    fn make_room(&mut self, spec: &ModelSpec, phase: &Phase) -> Result<()> {
+        if self.pinned.is_empty() {
+            return Ok(());
+        }
+        let (mut need, mut on_device) = (0u64, 0u64);
+        for g in phase.groups.iter().filter(|g| !self.is_resident(**g)) {
+            let file = spec.file_of(*g);
+            need += estimate_group_bytes(file, *g, &self.device)?;
+            on_device += estimate_device_heap_bytes(file, *g, &self.device)?;
+        }
+        let fits_budget = self.budget.allows(self.resident_bytes() + self.pinned_bytes(), need);
+        let fits_device = self.free_bytes().is_none_or(|free| free >= on_device + headroom_bytes() + self.coexist.margin);
+        if fits_budget && fits_device {
+            Ok(())
+        } else {
+            self.release_pinned()
+        }
+    }
+
+    /// 남겨 둔 묶음을 모두 내립니다. 쓰는 곳이 남은 묶음이 하나라도 있으면 아무것도 내리지 않습니다.
+    fn release_pinned(&mut self) -> Result<()> {
+        if self.pinned.is_empty() {
+            return Ok(());
+        }
+        for ((model, group), p) in &self.pinned {
+            let holders = Arc::strong_count(&p.loaded) - 1;
+            if holders > 0 {
+                bail!("{model} {group} 묶음을 아직 쓰는 곳이 있어 내릴 수 없습니다 (핸들 {holders}개). 핸들을 놓은 뒤에 내리세요");
+            }
+        }
+        let (free_before, buffers_before) = (self.free_bytes(), self.tensor_buffer_bytes());
+        let t0 = Instant::now();
+        let released: Vec<((ModelId, Group), u64)> = std::mem::take(&mut self.pinned).into_iter().map(|(k, p)| (k, p.loaded.device_bytes)).collect();
+        self.settle();
+        let (free_after, buffers_after) = (self.free_bytes(), self.tensor_buffer_bytes());
+        let millis = t0.elapsed().as_millis() as u64 / released.len().max(1) as u64;
+        for ((model, group), bytes) in released {
+            self.record(Transition { action: Action::Release, model, group, bytes, free_before, free_after, buffers_before, buffers_after, millis });
         }
         Ok(())
     }
 
     fn load_one(&mut self, spec: &ModelSpec, group: Group) -> Result<()> {
         let need = estimate_group_bytes(spec.file_of(group), group, &self.device)?;
-        let resident = self.resident_bytes();
+        if !self.pinned.is_empty() && !self.budget.allows(self.resident_bytes() + self.pinned_bytes(), need) {
+            // 남겨 둔 묶음 때문에 예산을 넘으면 그것부터 내립니다.
+            self.release_pinned()?;
+        }
+        let resident = self.resident_bytes() + self.pinned_bytes();
         if !self.budget.allows(resident, need) {
             return Err(OverBudget { group, need, resident, max: self.budget.max_bytes().unwrap_or(u64::MAX) }.into());
         }
@@ -576,7 +756,12 @@ impl Residency {
         if self.device.is_metal() {
             let _ = self.device.synchronize_all();
         }
-        let (free_before, buffers_before) = (self.free_bytes(), self.tensor_buffer_bytes());
+        let (mut free_before, mut buffers_before) = (self.free_bytes(), self.tensor_buffer_bytes());
+        // 남겨 둔 묶음이 있으면 공존 여유까지 남아야 올립니다. 모자라면 남겨 둔 묶음을 먼저 내립니다 (저사양 GPU 는 예전과 같아짐).
+        if !self.pinned.is_empty() && check_headroom(group, on_device, free_before, headroom_bytes() + self.coexist.margin).is_err() {
+            self.release_pinned()?;
+            (free_before, buffers_before) = (self.free_bytes(), self.tensor_buffer_bytes());
+        }
         if !allow_host_weights() {
             check_headroom(group, on_device, free_before, headroom_bytes())?;
         }
@@ -1152,5 +1337,118 @@ mod tests {
         assert_eq!(res.resident_bytes(), 0);
         assert!(res.resident_groups().is_empty());
         Ok(())
+    }
+
+    /// 작은 siglip2 모양 파일: 비전 타워 2 개, 텍스트 타워 1 개
+    fn siglip_like(dir: &TempDir) -> Arc<WeightFile> {
+        let t: Vec<(String, Tensor, GgmlDType)> = vec![
+            ("vision_model.encoder.layers.0.mlp.fc1.weight".into(), rand(&[96, 32], 51), GgmlDType::BF16),
+            ("vision_model.post_layernorm.weight".into(), rand(&[32], 52), GgmlDType::F32),
+            ("text_model.encoder.layers.0.mlp.fc1.weight".into(), rand(&[64, 32], 53), GgmlDType::BF16),
+        ];
+        let path = dir.0.join("siglip2.gguf");
+        write_gguf(&path, &[("general.architecture", Value::String("siglip2".into()))], &t).unwrap();
+        Arc::new(WeightFile::open(&path).unwrap())
+    }
+
+    fn loads_of(res: &Residency, model: ModelId, group: Group) -> usize {
+        res.history().iter().filter(|t| t.action == Action::Load && t.model == model && t.group == group).count()
+    }
+
+    /// 문서 스캔을 여러 번: siglip2 비전 → gocr 비전 → gocr 언어 → zoro 판단
+    fn scan_cycles(res: &mut Residency, siglip: &ModelSpec, gocr: &ModelSpec, zoro: &ModelSpec, cycles: usize) -> Result<()> {
+        for _ in 0..cycles {
+            drop(res.enter(siglip, &phase("siglip2:비전", &[Group::Vision]))?);
+            drop(res.enter(gocr, &phase("gocr:비전", &[Group::Vision]))?);
+            drop(res.enter(gocr, &phase("gocr:언어", &[Group::Embedding, Group::blocks(0..2), Group::Output]))?);
+            drop(res.enter(zoro, &phase("zoro:판단", &[Group::blocks(0..4), Group::Output]))?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn with_coexist_off_every_scan_reloads_the_vision_tower() -> Result<()> {
+        let dir = TempDir::new("res-co-off");
+        let (siglip, gocr, zoro) = (ModelSpec::new(ModelId::Siglip2, siglip_like(&dir)), ModelSpec::new(ModelId::Gocr, gocr_like(&dir)), ModelSpec::new(ModelId::Zoro, zoro_like(&dir)));
+        let mut res = Residency::new(Device::Cpu, Budget::unlimited());
+        scan_cycles(&mut res, &siglip, &gocr, &zoro, 3)?;
+        assert_eq!(loads_of(&res, ModelId::Siglip2, Group::Vision), 3);
+        assert_eq!(res.coexist_hits(), 0);
+        assert!(res.pinned_groups().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_pinned_vision_tower_stays_across_other_models_when_there_is_room() -> Result<()> {
+        let dir = TempDir::new("res-co-on");
+        let (siglip, gocr, zoro) = (ModelSpec::new(ModelId::Siglip2, siglip_like(&dir)), ModelSpec::new(ModelId::Gocr, gocr_like(&dir)), ModelSpec::new(ModelId::Zoro, zoro_like(&dir)));
+        let mut res = Residency::new(Device::Cpu, Budget::unlimited()).with_coexist(Coexist::pin(ModelId::Siglip2, Group::Vision));
+        scan_cycles(&mut res, &siglip, &gocr, &zoro, 3)?;
+        assert_eq!(loads_of(&res, ModelId::Siglip2, Group::Vision), 1, "한 번만 올립니다");
+        assert_eq!(res.coexist_hits(), 2, "두 번째 스캔부터는 남겨 둔 타워를 그대로 씁니다");
+        assert_eq!(res.pinned_groups(), vec![(ModelId::Siglip2, Group::Vision)]);
+        assert_eq!(res.resident_model(), Some(ModelId::Zoro));
+        // 남기는 것은 siglip2 비전뿐입니다. gocr 와 zoro 는 여전히 함께 올라오지 않습니다.
+        let mut resident: HashMap<ModelId, u64> = HashMap::new();
+        for t in res.history() {
+            let e = resident.entry(t.model).or_default();
+            match t.action {
+                Action::Load => *e += t.bytes,
+                Action::Release => *e -= t.bytes,
+            }
+            assert!(!(resident.get(&ModelId::Gocr).is_some_and(|b| *b > 0) && resident.get(&ModelId::Zoro).is_some_and(|b| *b > 0)), "gocr · zoro 동시 상주: {:?}", res.history());
+        }
+        res.release_all()?;
+        assert!(res.pinned_groups().is_empty() && res.resident_model().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_pinned_tower_is_released_first_when_the_next_model_would_not_fit() -> Result<()> {
+        let dir = TempDir::new("res-co-tight");
+        let (siglip, gocr, zoro) = (ModelSpec::new(ModelId::Siglip2, siglip_like(&dir)), ModelSpec::new(ModelId::Gocr, gocr_like(&dir)), ModelSpec::new(ModelId::Zoro, zoro_like(&dir)));
+        let vision = estimate_group_bytes(&siglip.file, Group::Vision, &Device::Cpu)?;
+        let zoro_text = estimate_group_bytes(&zoro.file, Group::blocks(0..4), &Device::Cpu)? + estimate_group_bytes(&zoro.file, Group::Output, &Device::Cpu)?;
+        let gocr_lang: u64 = [Group::Embedding, Group::blocks(0..2), Group::Output].iter().map(|g| estimate_group_bytes(&gocr.file, *g, &Device::Cpu).unwrap()).sum();
+        assert!(zoro_text > gocr_lang);
+        // 예산: siglip2 비전 + gocr 언어는 들어가고, siglip2 비전 + zoro 는 안 들어감 (저사양 GPU 흉내)
+        let budget = Budget::bytes(vision + zoro_text - 1);
+        assert!(budget.allows(vision, gocr_lang));
+        let mut res = Residency::new(Device::Cpu, budget).with_coexist(Coexist::pin(ModelId::Siglip2, Group::Vision));
+        drop(res.enter(&siglip, &phase("siglip2:비전", &[Group::Vision]))?);
+        drop(res.enter(&gocr, &phase("gocr:언어", &[Group::Embedding, Group::blocks(0..2), Group::Output]))?);
+        assert_eq!(res.pinned_groups().len(), 1, "gocr 와는 함께 들어갑니다");
+        drop(res.enter(&zoro, &phase("zoro:판단", &[Group::blocks(0..4), Group::Output]))?);
+        assert!(res.pinned_groups().is_empty(), "zoro 를 올리기 전에 내렸습니다");
+        let log: Vec<(Action, ModelId, Group)> = res.history().iter().map(|t| (t.action, t.model, t.group)).collect();
+        let released = log.iter().position(|e| *e == (Action::Release, ModelId::Siglip2, Group::Vision)).unwrap();
+        let zoro_loaded = log.iter().position(|e| e.0 == Action::Load && e.1 == ModelId::Zoro).unwrap();
+        assert!(released < zoro_loaded, "{log:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_pinned_tower_that_is_still_borrowed_is_not_dropped_silently() -> Result<()> {
+        let dir = TempDir::new("res-co-held");
+        let (siglip, zoro) = (ModelSpec::new(ModelId::Siglip2, siglip_like(&dir)), ModelSpec::new(ModelId::Zoro, zoro_like(&dir)));
+        let vision = estimate_group_bytes(&siglip.file, Group::Vision, &Device::Cpu)?;
+        let zoro_text = estimate_group_bytes(&zoro.file, Group::blocks(0..4), &Device::Cpu)?;
+        let mut res = Residency::new(Device::Cpu, Budget::bytes(vision + zoro_text - 1)).with_coexist(Coexist::pin(ModelId::Siglip2, Group::Vision));
+        let held = res.enter(&siglip, &phase("siglip2:비전", &[Group::Vision]))?;
+        let err = res.enter(&zoro, &phase("zoro:판단", &[Group::blocks(0..4)])).err().expect("쥔 핸들은 내릴 수 없습니다");
+        assert!(err.to_string().contains("아직 쓰는 곳"), "{err}");
+        drop(held);
+        drop(res.enter(&zoro, &phase("zoro:판단", &[Group::blocks(0..4)]))?);
+        assert!(res.pinned_groups().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn the_coexist_setting_reads_only_the_named_tower() {
+        assert!(Coexist::off().is_off());
+        let pin = Coexist::pin(ModelId::Siglip2, Group::Vision);
+        assert!(pin.allows(ModelId::Siglip2, Group::Vision));
+        assert!(!pin.allows(ModelId::Gocr, Group::Vision), "gocr 비전은 남기지 않습니다");
+        assert!(!pin.allows(ModelId::Siglip2, Group::Text));
     }
 }

@@ -17,7 +17,7 @@
 | 시계열 AOP 초안 · 시간 숫자 팩트체크 | `drafting::draft_aop` + `factcheck::check` (사실 줄의 시차 · TTF 숫자까지 대조) | 구현 |
 | SDS 블랙박스 봉인 (`tb_audit_log`) | `sds::{freeze, seal}` (±30초 시계열 · 상태 코드 · 축 확신도 · 결정 · 반응 시간), `AuditCategory::SdsSealed` | 구현 |
 | 도면 리비전 타임라인 · 구버전 도면 경고 | `Lattice::latest_rev`, `MocCheck::stale_drawing` | 구현 |
-| SDS 델타 패치 디핑 (바뀐 패치만 gocr) | — | 미구현 |
+| SDS 델타 패치 디핑 (바뀐 패치만 gocr) | `core/src/ai/siglip2/delta.rs` · `DocumentReader::read_pages_delta`. 마스터 특징 격자(int8)로 **어느 마스터인지** 고르고, **바뀐 곳은 잉크**(마스터 잉크를 3 px 넓힌 밖의 새 획 · 지운 획)로 찾습니다. 패치 코사인으로 바뀐 곳을 고르는 기획 방식은 스캔 잡음만으로 같은 도면의 코사인 평균이 0.69 라 쓰지 않았습니다 ([powerplant-bottleneck-plan.md](powerplant-bottleneck-plan.md)) | 구현 (방식을 바꿈) |
 | `GdnState` 프리픽스 상태 캐시 | — | 미구현 (zoro 에 접두 상태 저장 · 복원이 없음) |
 | P14 타임머신과 60초 윈도 연동 | `app/src/TimeScrubber.tsx` (슬라이더 시각의 값으로 세 뷰를 다시 칠함), SDS 분석기 파형 | 구현 |
 

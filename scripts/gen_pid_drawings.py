@@ -3,6 +3,7 @@
     python scripts/gen_pid_drawings.py [마스터 폴더] [현장 스캔 폴더] [시드]
     python scripts/gen_pid_drawings.py --symbols     심볼 표본(학습 · 시험)과 명판 훼손 도면만 out/symbols 에
     python scripts/gen_pid_drawings.py --a0-dpi 300  같은 A0 종합도를 2 배 해상도로 다시 그려 out/a0/PID-100-ALL-A0@300dpi.png 에
+    python scripts/gen_pid_drawings.py --a0-delta    A0 델타 실측용: 다시 스캔한 A0(바뀐 곳 없음)와 PID-103-LAB 칸에 Red-line 을 그린 A0 (out/a0)
 
 기본값은 core/fixtures/drawings (마스터 도면, 저장소에 들어갑니다) 와 out/field (현장 스캔, 저장소 밖) 입니다.
 설비 상자의 위치는 시드 대장(core/fixtures/synthetic_db.json)의 `bbox`(정규화 좌표)를 그대로 씁니다. 그래서 대장이 곧 정답 좌표입니다.
@@ -11,6 +12,7 @@
   <마스터>/PID-10x-XXX.png · .json   마스터 도면과 정답 영역 (스캔 잡음 없음, 앱의 도면 뷰가 씁니다)
   <현장>/P3_redline.png · .json        Red-line: PID-103-LAB 에 붉은 펜으로 MOC 번호 · 새 경보 한계 · 서명
   <현장>/P3F_redline.png · .json       같은 Red-line 의 위조 수치 (35.0 MPa)
+  <현장>/P3_redline_clean.png 등        스캔 잡음 · 기울기 없는 Red-line (델타 판독 실측의 정답: 마스터와의 차이가 곧 바뀐 곳)
   <현장>/P1_gauge.png · .json          현장 계기 점검표 (102동 주증기 압력 26.0 MPa, 손글씨)
 
 정답 영역의 kind 는 zoro-gravity 의 합성 서식과 같은 이름을 씁니다.
@@ -819,6 +821,34 @@ def save(path, img, gt, extra):
         f.write("\n")
 
 
+def scan_effects(img, rng):
+    """기울기 없이 스캐너 흐림 · 색조 · 잡음만 (A0 를 다시 스캔한 그림)"""
+    out = img.filter(ImageFilter.GaussianBlur(rng.uniform(0.2, 0.4)))
+    a = np.asarray(out).astype(np.float32)
+    tint = np.array([rng.uniform(246, 255), rng.uniform(245, 254), rng.uniform(240, 252)], dtype=np.float32) / 255.0
+    noise = np.random.default_rng(rng.randint(0, 1 << 30)).normal(0, 2.0, a.shape)
+    return Image.fromarray(np.clip(a * tint + noise, 0, 255).astype(np.uint8))
+
+
+def a0_delta(plant, db, masters, field_seed=20261104):
+    """A0 델타 실측용 그림 두 장 (out/a0): 바뀐 곳 없이 다시 스캔한 A0, PID-103-LAB 칸에 P3 Red-line 을 그려 다시 스캔한 A0.
+    Red-line 은 현장 스캔(P3)과 같은 시드로 다시 그린 것이고, 바탕 A0 는 저장된 마스터 A0 그림입니다."""
+    a0_dir = os.path.join(ROOT, "out", "a0")
+    os.makedirs(a0_dir, exist_ok=True)
+    for a0 in db.get("a0_drawings", []):
+        base = Image.open(os.path.join(a0_dir, f"{a0['id']}.png")).convert("RGB")
+        rescan = scan_effects(base, random.Random(f"{a0['id']}/rescan"))
+        rescan.save(os.path.join(a0_dir, f"{a0['id']}-rescan.jpg"), quality=92)
+        marked = base.copy()
+        scan = next(x for s in json.load(open(os.path.join(ROOT, "core", "fixtures", "plant_scenarios.json"), encoding="utf-8"))["scenarios"] if s["id"] == "P3" for x in s["scans"])
+        c, _ = redline(plant, random.Random(f"{field_seed}/P3/redline"), scan["new"])
+        sheet = next(sh for sh in a0["sheets"] if sh["drawing"] == "PID-103-LAB")
+        marked.paste(c.img, (sheet["x"], sheet["y"]))
+        marked = scan_effects(marked, random.Random(f"{a0['id']}/redline"))
+        marked.save(os.path.join(a0_dir, f"{a0['id']}-redline.jpg"), quality=92)
+        print(f"A0 델타: {a0_dir}/{a0['id']}-rescan.jpg · -redline.jpg ({base.width} × {base.height} px)")
+
+
 def a0_sheet(plant, a0, masters_dir, scale=1, seed=20261104):
     """A0 종합 도면 (Part 8-4). 마스터 도면들을 원장 배치(`a0_drawings`)대로 한 장에 앉힙니다.
     글자 크기는 마스터 그대로라 A0 전체 높이의 0.4 % 쯤입니다 (실제 A0 도면의 KKS 글씨 2.5 ~ 3.5 mm 와 같은 비율).
@@ -989,6 +1019,10 @@ def main():
             save(path, img, c.gt, {"drawing": a0["id"], "rev": a0["rev"], "dpi": dpi, "scale": scale, "equipment": gt, "grid": a0["grid"]})
             print(f"A0 {dpi} DPI: {path} ({img.width} × {img.height} px)")
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "--a0-delta":
+        db = json.load(open(SEED, encoding="utf-8"))
+        a0_delta(Plant(db), db, os.path.join(ROOT, "core", "fixtures", "drawings"))
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "--symbols":
         # 심볼 표본과 훼손 도면만 (마스터 도면은 그대로)
         db = json.load(open(SEED, encoding="utf-8"))
@@ -1023,6 +1057,8 @@ def main():
             rng = random.Random(f"{seed}/{s['id']}/{scan['kind']}")
             if scan["kind"] == "redline":
                 c, truth = redline(plant, rng, scan["new"])
+                # 스캔 잡음 · 기울기 없는 원본 (델타 판독의 정답). 난수를 쓰지 않아 스캔 그림은 그대로입니다.
+                c.img.save(os.path.join(field, os.path.splitext(scan["image"])[0] + "_clean.png"))
             else:
                 c = gauge_card(plant, rng, scan)
                 truth = {k: scan[k] for k in ("kks", "tag", "value", "unit", "worker", "sector")}

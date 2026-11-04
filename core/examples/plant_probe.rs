@@ -37,7 +37,7 @@ fn read(rt: &runtime::Runtime, db: &Lattice, path: &PathBuf) -> Result<(Extracte
     let pages = rt.reader.read_pages(std::slice::from_ref(&img))?;
     let ms = t.elapsed().as_secs_f64() * 1e3;
     let p = &pages[0];
-    let timings = ReadTimings { layout_ms: p.timings.layout_ms, siglip2_ms: p.timings.siglip2_ms, ocr_ms: p.timings.ocr_ms, crops: p.crops.len(), dropped: p.plan.dropped.len() };
+    let timings = ReadTimings { layout_ms: p.timings.layout_ms, siglip2_ms: p.timings.siglip2_ms, ocr_ms: p.timings.ocr_ms, crops: p.crops.len(), dropped: p.plan.dropped.len(), blank: p.plan.blank.len(), skipped: 0 };
     Ok((extract(&PageText::from_reading("probe", img.dimensions(), p), db), timings, ms))
 }
 
@@ -84,7 +84,7 @@ fn main() -> Result<()> {
             timings.crops,
             timings.dropped
         );
-        drawings.push(json!({ "id": d.id, "read_id": x.drawing, "rev": x.drawing_rev, "expected": expected.len(), "found": hit, "extra": x.kks_hits.len() - hit, "mean_iou": mean_iou, "corrected": x.kks_hits.iter().filter(|h| h.corrected).count(), "ms": ms, "crops": timings.crops, "dropped": timings.dropped }));
+        drawings.push(json!({ "id": d.id, "read_id": x.drawing, "rev": x.drawing_rev, "expected": expected.len(), "found": hit, "extra": x.kks_hits.len() - hit, "mean_iou": mean_iou, "corrected": x.kks_hits.iter().filter(|h| h.corrected).count(), "ms": ms, "crops": timings.crops, "dropped": timings.dropped, "blank": timings.blank }));
     }
 
     // 2. 현장 스캔
@@ -132,8 +132,8 @@ fn main() -> Result<()> {
 
     // 3. 시나리오
     let mut engine = Engine::new(b"probe", AutomationPolicy::default(), None);
-    engine.model = Some(Box::new(rt.model));
-    engine.writer = Some(Box::new(rt.writer));
+    engine.model = Some(std::sync::Arc::new(rt.model));
+    engine.writer = Some(std::sync::Arc::new(rt.writer));
     let mut results = Vec::new();
     for s in &set.scenarios {
         let id = format!("INC-{}", s.id);

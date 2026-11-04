@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use blueprint_core::ai::accel;
-use blueprint_core::ai::document::DocumentReader;
+use blueprint_core::ai::document::{Baseline, DocumentReader, PageReading};
+use blueprint_core::ai::siglip2::delta::{DeltaParams, MasterSet};
 use blueprint_core::case::{DeviationExcuse, FieldKind, ReadTimings, Signature};
 use blueprint_core::extract::{extract, DocKind, Extracted, PageText};
 use blueprint_core::interlock::Evidence;
@@ -35,7 +36,8 @@ use blueprint_core::policy::{AutomationPolicy, OperatingMode};
 use blueprint_core::privacy::{mask_id, mask_name, salted_hash};
 use blueprint_core::scenario::ScenarioSet;
 use blueprint_core::state_machine::gate3_substantive::Justification;
-use blueprint_core::state_machine::{Engine, Outcome, SupervisorDecision};
+use blueprint_core::state_machine::staged;
+use blueprint_core::state_machine::{Engine, EngineAccess, Outcome, SupervisorDecision};
 use blueprint_core::store::SessionStatus;
 use blueprint_core::timeseries::Telemetry;
 use blueprint_models::{app_dir, delete_model as remove_model, download, entry, import_from, import_source, models_dir, status, CATALOG};
@@ -125,6 +127,8 @@ struct Desk {
     /// GPU 를 쓰는 일은 한 번에 하나입니다.
     gpu: Mutex<()>,
     reader: Mutex<Option<Arc<DocumentReader>>>,
+    /// 마스터 도면 5장의 특징 격자 · 잉크 (SDS 델타 패치: Red-line 은 바뀐 조각만 읽습니다)
+    masters: Mutex<Option<Arc<MasterSet>>>,
     status: Mutex<String>,
     loaded: Mutex<bool>,
     device: Mutex<Option<candle_core::Device>>,
@@ -140,6 +144,19 @@ struct Desk {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// 엔진 잠금은 준비 · 반영 때만 짧게 쥐고, 모델(판단 · 글쓰기)은 GPU 잠금만 쥔 채 돌립니다.
+/// 모델이 생각하는 동안에도 사건 목록 · 상태 줄 · 교대감독의 조회와 결정이 멈추지 않습니다.
+impl EngineAccess for Desk {
+    fn engine<R>(&self, f: impl FnOnce(&mut Engine) -> R) -> R {
+        f(&mut lock(&self.engine))
+    }
+
+    fn infer<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _gpu = lock(&self.gpu);
+        f()
+    }
 }
 
 fn console_only(window: &Window) -> Result<(), String> {
@@ -500,13 +517,7 @@ fn inject_scenario(window: Window, app: AppHandle, desk: State<'_, Desk>, id: St
         notify_console(&app);
         return Ok(None);
     }
-    let result = {
-        let _gpu = lock(&desk.gpu);
-        let mut engine = lock(&desk.engine);
-        let incident_id = engine.next_id("INC", Utc::now());
-        let incident = s.incident(&desk.scenarios, &incident_id);
-        engine.run(&desk.db, incident, Utc::now()).map(|_| incident_id)
-    };
+    let result = staged::open(&*desk, &desk.db, "INC", Utc::now(), false, |id| s.incident(&desk.scenarios, id)).map(|(id, _)| id);
     notify_console(&app);
     result.map(Some).map_err(|e| format!("{e:#}"))
 }
@@ -1024,13 +1035,10 @@ fn scan_field_documents(window: Window, desk: State<'_, Desk>) -> Result<ScanRep
         hashes.push(salted_hash(b"scan", &String::from_utf8_lossy(&bytes)));
         images.push(image::load_from_memory(&bytes).map_err(|e| format!("이미지를 읽을 수 없습니다: {e}"))?.to_rgb8());
     }
-    let pages = {
-        let _gpu = lock(&desk.gpu);
-        reader.read_pages(&images).map_err(|e| {
-            eprintln!("[스캔] 읽기 실패: {e:#}");
-            "문서를 읽지 못했습니다. 주제어실에 알려 주세요.".to_string()
-        })?
-    };
+    let pages = read_scans(&desk, &reader, &images).map_err(|e| {
+        eprintln!("[스캔] 읽기 실패: {e:#}");
+        "문서를 읽지 못했습니다. 주제어실에 알려 주세요.".to_string()
+    })?;
     let mut timings = ReadTimings::default();
     let found: Vec<Extracted> = pages
         .iter()
@@ -1042,6 +1050,8 @@ fn scan_field_documents(window: Window, desk: State<'_, Desk>) -> Result<ScanRep
             timings.ocr_ms += p.timings.ocr_ms;
             timings.crops += p.crops.len();
             timings.dropped += p.plan.dropped.len();
+            timings.blank += p.plan.blank.len();
+            timings.skipped += p.delta.as_ref().map_or(0, |d| d.skipped.len());
             extract(&PageText::from_reading(h, img.dimensions(), p), &desk.db)
         })
         .collect();
@@ -1076,6 +1086,7 @@ fn scan_field_documents(window: Window, desk: State<'_, Desk>) -> Result<ScanRep
             corrected.push(match c.field.as_str() {
                 "설비 KKS" => "kks",
                 "센서 태그" => "tag",
+                "서명자 이름" => "worker_name",
                 _ => "moc_no",
             });
         }
@@ -1179,18 +1190,17 @@ fn submit_field_report(window: Window, app: AppHandle, desk: State<'_, Desk>, in
         content_hash: None,
         edited: input.edited.clone(),
     };
-    let result = {
-        let _gpu = lock(&desk.gpu);
-        let mut engine = lock(&desk.engine);
-        // 자유 서술 소명은 Zoro-1 이 표준 소명으로 바꿉니다. 바꾸지 못하면 그대로 교대감독에게 갑니다.
-        let mut form = form;
-        if let (Some(DeviationExcuse::FreeText(text)), Some(writer)) = (form.excuse.clone(), engine.writer.as_deref()) {
-            if let Ok(Some(std)) = blueprint_core::drafting::normalize_excuse(writer, &text) {
+    // 자유 서술 소명은 Zoro-1 이 표준 소명으로 바꿉니다. 바꾸지 못하면 그대로 교대감독에게 갑니다.
+    let mut form = form;
+    if let Some(DeviationExcuse::FreeText(text)) = form.excuse.clone() {
+        let minds = desk.engine(|e| e.minds());
+        if let Some(writer) = minds.writer.as_deref() {
+            if let Ok(Some(std)) = desk.infer(|| blueprint_core::drafting::normalize_excuse(writer, &text)) {
                 form.excuse = Some(std);
             }
         }
-        field::submit(&mut engine, &desk.db, &form, live.as_ref().map(|l| &l.0), sim_now)
-    };
+    }
+    let result = field::submit_staged(&*desk, &desk.db, &form, live.as_ref().map(|l| &l.0), sim_now);
     notify_console(&app);
     let reply = match result {
         Ok(receipt) => {
@@ -1240,6 +1250,30 @@ fn notify_field_case(app: &AppHandle, desk: &Desk, id: &str) {
 
 // ───────────────────────── 시작 ─────────────────────────
 
+/// 마스터 도면(앱에 든 5장)의 SigLIP2 특징 격자와 잉크를 만듭니다.
+fn index_masters(desk: &Desk, reader: &DocumentReader) -> anyhow::Result<MasterSet> {
+    let pages: Vec<(String, image::RgbImage)> = DRAWINGS.iter().map(|(id, bytes)| Ok((id.to_string(), image::load_from_memory(bytes)?.to_rgb8()))).collect::<anyhow::Result<_>>()?;
+    let _gpu = lock(&desk.gpu);
+    reader.index_masters(&pages, &DeltaParams::default())
+}
+
+/// 스캔을 읽습니다. 마스터 색인이 있으면 바뀐 조각만 읽고(SDS 델타 패치), 읽은 도면번호가 고른 마스터와 다르면 그 장을 전부 다시 읽습니다.
+fn read_scans(desk: &Desk, reader: &DocumentReader, images: &[image::RgbImage]) -> anyhow::Result<Vec<PageReading>> {
+    let masters = lock(&desk.masters).clone();
+    let _gpu = lock(&desk.gpu);
+    let Some(masters) = masters else { return reader.read_pages(images) };
+    let mut pages = reader.read_pages_delta(images, &Baseline::Best(&masters), &DeltaParams::default())?;
+    for (i, page) in pages.iter_mut().enumerate() {
+        let Some(master) = page.delta.as_ref().filter(|d| d.fallback.is_none() && !d.skipped.is_empty()).and_then(|d| d.master.clone()) else { continue };
+        let read = extract(&PageText::from_reading("", images[i].dimensions(), page), &desk.db);
+        if read.drawing.as_deref().is_some_and(|d| d != master) {
+            eprintln!("[델타] 도면번호 {:?} 가 고른 마스터 {master} 와 달라 전부 다시 읽습니다", read.drawing);
+            *page = reader.read_pages(std::slice::from_ref(&images[i]))?.remove(0);
+        }
+    }
+    Ok(pages)
+}
+
 /// 모델을 뒤에서 엽니다. 가중치가 준비될 때까지 기다리고, 열리면 엔진에 꽂습니다.
 fn load_models(app: AppHandle) {
     let desk = app.state::<Desk>();
@@ -1257,12 +1291,17 @@ fn load_models(app: AppHandle) {
         Ok(rt) => {
             {
                 let mut engine = lock(&desk.engine);
-                engine.model = Some(Box::new(rt.model));
-                engine.writer = Some(Box::new(rt.writer));
+                engine.model = Some(Arc::new(rt.model));
+                engine.writer = Some(Arc::new(rt.writer));
             }
-            *lock(&desk.reader) = Some(rt.reader);
+            *lock(&desk.reader) = Some(rt.reader.clone());
             *lock(&desk.status) = format!("Zoro-1 · {} (SharedResidency)", rt.backend);
             *lock(&desk.device) = Some(rt.device);
+            // 마스터 도면 색인 (SigLIP2 비전 1 회, 1 ~ 2 초). 실패하면 Red-line 을 전부 읽습니다.
+            match index_masters(&desk, &rt.reader) {
+                Ok(set) => *lock(&desk.masters) = Some(Arc::new(set)),
+                Err(e) => eprintln!("[델타] 마스터 도면을 색인하지 못했습니다 (Red-line 은 전부 읽음): {e:#}"),
+            }
         }
         Err(e) => {
             eprintln!("[엔진] 모델을 열지 못했습니다: {e:#}");
@@ -1282,6 +1321,7 @@ pub fn run() {
         scenarios: ScenarioSet::embedded().expect("합성 시나리오를 읽을 수 없습니다"),
         gpu: Mutex::new(()),
         reader: Mutex::new(None),
+        masters: Mutex::new(None),
         status: Mutex::new("모델 여는 중".to_string()),
         loaded: Mutex::new(false),
         device: Mutex::new(None),

@@ -7,6 +7,8 @@
 //! - 현장 실측치가 중앙 계측값(알람이 난 채널 값)과 크게 다르고 소명이 없으면 소명을 먼저 받습니다 (내부 수치는 보이지 않음).
 //! - Red-line: 새 사건으로 열어 MOC 원장과 대조합니다. 위조 · 모순이면 잠기고, 현장에는 "확인 필요" 만 갑니다.
 
+use std::cell::RefCell;
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use thiserror::Error;
@@ -16,6 +18,7 @@ use crate::lattice::Lattice;
 use crate::plant::Sector;
 use crate::state_machine::gate2_consistency::field_tolerance;
 use crate::state_machine::gate4_5_finalize::check_field_text;
+use crate::state_machine::staged::{self, EngineAccess};
 use crate::state_machine::{Engine, Outcome};
 use crate::store::SessionStatus;
 use crate::timeseries::Telemetry;
@@ -137,45 +140,49 @@ fn waiting_incident(engine: &Engine, tag: Option<&str>, kks: Option<&str>) -> Op
 
 /// 현장 보고를 접수합니다. `live` 는 새 현장 사건에 붙일 지금 계측입니다 (시뮬레이터 값, 없으면 빈 계측).
 pub fn submit(engine: &mut Engine, db: &Lattice, form: &FieldForm, live: Option<&Telemetry>, now: DateTime<Utc>) -> Result<FieldReceipt, FieldError> {
+    submit_staged(&RefCell::new(engine), db, form, live, now)
+}
+
+/// [`submit`] 과 같습니다. 엔진 잠금은 준비 · 반영 때만 쥐고, 판단 · 글쓰기 모델이 도는 동안은 풉니다 ([`staged`]).
+pub fn submit_staged(access: &impl EngineAccess, db: &Lattice, form: &FieldForm, live: Option<&Telemetry>, now: DateTime<Utc>) -> Result<FieldReceipt, FieldError> {
     let kind = form.kind.unwrap_or(FieldKind::GaugeCard);
     let report = report_of(db, form, kind, now)?;
-    let outcome = if kind == FieldKind::Redline {
-        let id = engine.next_id("FLD", now);
-        let incident = Incident { id: id.clone(), source: IncidentSource::Field, alarm: None, telemetry: live.cloned().unwrap_or_default(), reports: vec![report], received_at: now, scenario: None };
-        (id, engine.run(db, incident, now)?)
+    let fresh = |id: &str, report: FieldReport| Incident { id: id.to_string(), source: IncidentSource::Field, alarm: None, telemetry: live.cloned().unwrap_or_default(), reports: vec![report], received_at: now, scenario: None };
+    let (receipt_no, outcome) = if kind == FieldKind::Redline {
+        staged::open(access, db, "FLD", now, false, |id| fresh(id, report))?
     } else {
-        match waiting_incident(engine, report.tag.as_deref(), report.kks.as_deref()) {
-            Some(id) => {
-                if report.excuse.is_none() {
-                    let session = engine.store.active(&id).expect("세션");
-                    // 알람을 낸 채널의 값(운전원이 본 중앙 표시값)과 비교합니다. 내부 값은 안내에 넣지 않습니다.
-                    let at = report.taken_at.timestamp_millis();
-                    let reference = session.incident.alarm.as_ref().filter(|a| Some(a.tag.as_str()) == report.tag.as_deref()).map(|a| {
-                        a.channel.as_ref().and_then(|c| session.incident.telemetry.channels.get(&a.tag)?.get(c)?.value_at(at)).unwrap_or(a.value)
-                    });
-                    let tolerance = report.tag.as_deref().map(|t| field_tolerance(db, t)).unwrap_or(0.0);
-                    if let (Some(v), Some(r)) = (report.reading, reference) {
-                        if (v - r).abs() > tolerance {
-                            return Err(FieldError::NeedExcuse { message: EXCUSE_MESSAGE.to_string() });
-                        }
+        let waiting = access.engine(|engine| -> Result<Option<String>, FieldError> {
+            let Some(id) = waiting_incident(engine, report.tag.as_deref(), report.kks.as_deref()) else { return Ok(None) };
+            if report.excuse.is_none() {
+                let session = engine.store.active(&id).expect("세션");
+                // 알람을 낸 채널의 값(운전원이 본 중앙 표시값)과 비교합니다. 내부 값은 안내에 넣지 않습니다.
+                let at = report.taken_at.timestamp_millis();
+                let reference = session.incident.alarm.as_ref().filter(|a| Some(a.tag.as_str()) == report.tag.as_deref()).map(|a| {
+                    a.channel.as_ref().and_then(|c| session.incident.telemetry.channels.get(&a.tag)?.get(c)?.value_at(at)).unwrap_or(a.value)
+                });
+                let tolerance = report.tag.as_deref().map(|t| field_tolerance(db, t)).unwrap_or(0.0);
+                if let (Some(v), Some(r)) = (report.reading, reference) {
+                    if (v - r).abs() > tolerance {
+                        return Err(FieldError::NeedExcuse { message: EXCUSE_MESSAGE.to_string() });
                     }
                 }
+            }
+            Ok(Some(id))
+        })?;
+        match waiting {
+            Some(id) => {
                 let at = report.taken_at;
-                (id.clone(), engine.attach_report(db, &id, report, at.max(now))?)
+                let out = staged::attach_report(access, db, &id, report, at.max(now))?;
+                (id, out)
             }
-            None => {
-                let id = engine.next_id("FLD", now);
-                let incident = Incident { id: id.clone(), source: IncidentSource::Field, alarm: None, telemetry: live.cloned().unwrap_or_default(), reports: vec![report], received_at: now, scenario: None };
-                (id, engine.run(db, incident, now)?)
-            }
+            None => staged::open(access, db, "FLD", now, false, |id| fresh(id, report))?,
         }
     };
-    let (receipt_no, outcome) = outcome;
     let state = match outcome {
         Outcome::FieldRetry { reason, .. } => return Err(FieldError::Retry(reason)),
         Outcome::Blocked { verdict: Verdict::G2RejectContradictionLock, .. } => FieldState::Hold { notice: "제출한 변경 내용을 승인 기록에서 확인하지 못했습니다. 기술책임자에게 변경 승인 여부를 확인해 주세요.".to_string() },
         Outcome::AutoFinalized { .. } | Outcome::Finalized { .. } => {
-            let notice = engine.store.archive().iter().find(|a| a.incident_id == receipt_no).map(|a| a.field_notice.clone()).unwrap_or_default();
+            let notice = access.engine(|e| e.store.archive().iter().find(|a| a.incident_id == receipt_no).map(|a| a.field_notice.clone()).unwrap_or_default());
             FieldState::Finished { notice }
         }
         _ => FieldState::Sent,

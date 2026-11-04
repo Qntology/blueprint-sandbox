@@ -26,7 +26,7 @@ use crate::lattice::Lattice;
 use crate::plant::fmt_value;
 use crate::sds::{SdsSnapshot, SdsTrigger, TriggerKind};
 use crate::stages::{record, StageRecord, StageStatus};
-use crate::timeseries::{metrics, ttf_conservative, TimeSeriesMetrics, BASELINE_SECS, SLOPE_SAMPLES};
+use crate::timeseries::{metrics, ttf_conservative, Telemetry, TimeSeriesMetrics, BASELINE_SECS, SLOPE_SAMPLES};
 use crate::verdict::{OutcomeClass, Verdict};
 
 /// 판단 · 글쓰기 모델 (없으면 규칙과 템플릿만)
@@ -136,7 +136,16 @@ pub fn analyze(db: &Lattice, incident: &Incident, brains: Brains<'_>, sds_id: &s
     } else {
         let crops: usize = read.iter().map(|t| t.crops).sum();
         let dropped: usize = read.iter().map(|t| t.dropped).sum();
-        stages.push(record(1, read.iter().map(|t| t.layout_ms + t.siglip2_ms).sum(), StageStatus::Done, format!("조각 {crops}개 판독 · 안내문 {dropped}개 버림")));
+        let blank: usize = read.iter().map(|t| t.blank).sum();
+        let skipped: usize = read.iter().map(|t| t.skipped).sum();
+        let mut summary = format!("조각 {crops}개 판독 · 안내문 {dropped}개 버림");
+        if blank > 0 {
+            summary.push_str(&format!(" · 빈 조각 {blank}개"));
+        }
+        if skipped > 0 {
+            summary.push_str(&format!(" · 마스터와 같은 조각 {skipped}개 건너뜀"));
+        }
+        stages.push(record(1, read.iter().map(|t| t.layout_ms + t.siglip2_ms).sum(), StageStatus::Done, summary));
         let summary = if corrections > 0 { format!("대장 대조로 오독 {corrections}건 교정") } else { "판독 완료 · 교정 없음".to_string() };
         stages.push(record(2, read.iter().map(|t| t.ocr_ms).sum(), if corrections > 0 { StageStatus::Corrected } else { StageStatus::Done }, summary));
     }
@@ -156,17 +165,11 @@ pub fn analyze(db: &Lattice, incident: &Incident, brains: Brains<'_>, sds_id: &s
             }
         }
     }
-    let mut telemetry = incident.telemetry.clone();
-    let signal = route.tag.as_deref().filter(|t| telemetry.get(t).is_some()).map(|t| gate1_formal::signal_health(db, &telemetry, t, now));
+    let signal = route.tag.as_deref().filter(|t| incident.telemetry.get(t).is_some()).map(|t| gate1_formal::signal_health(db, &incident.telemetry, t, now));
     if let Some(s) = &signal {
         codes.push(s.state.verdict().code().to_string());
-        if let SignalState::SpikeFiltered { spikes } = &s.state {
-            if let Some(series) = telemetry.get(&s.tag) {
-                let clean = series.despiked(spikes);
-                telemetry = telemetry.with_series(&s.tag, clean);
-            }
-        }
     }
+    let telemetry = cleaned(incident, signal.as_ref());
     let flatline = signal.as_ref().is_some_and(|s| matches!(s.state, SignalState::Flatline { .. }));
 
     // Gate 2: 보팅 · 현장 실측 · MOC
@@ -235,26 +238,8 @@ pub fn analyze(db: &Lattice, incident: &Incident, brains: Brains<'_>, sds_id: &s
 
     // Gate 4: 조치 절차서 초안
     let causal = substantive.causal.as_ref();
-    let draft = select_aop(db, candidate, route.tag.as_deref(), causal).map(|aop| {
-        let now_value = route.tag.as_deref().and_then(|t| telemetry.value_at(t, now));
-        let root_value = causal.and_then(|c| c.root.as_ref()).and_then(|r| telemetry.value_at(&r.tag, now));
-        let template = template_summary(db, candidate, route.tag.as_deref(), causal, now_value, root_value);
-        let facts: Vec<String> = substantive.facts.iter().filter(|(k, _)| k != "적용 규칙").map(|(k, v)| format!("{k}: {v}")).collect();
-        let source: Vec<String> = facts.iter().cloned().chain(std::iter::once(template.clone())).collect();
-        draft_aop(brains.writer, aop, &source, &template)
-    });
-    match &draft {
-        Some(d) => {
-            let status = if next == Next::AwaitingField { StageStatus::Waiting } else if d.high_risk { StageStatus::Waiting } else { StageStatus::Done };
-            let summary = match (d.by_model, d.problems.is_empty()) {
-                (true, _) => format!("{} 초안 · 숫자 대조 통과{}", d.aop_id, if d.high_risk { " · 공동결재 대기" } else { "" }),
-                (false, true) => format!("{} 템플릿 (글쓰기 모델 없음)", d.aop_id),
-                (false, false) => format!("{} 모델 초안 수치 불일치 {}건 → 템플릿", d.aop_id, d.problems.len()),
-            };
-            stages.push(record(5, d.ms, status, summary));
-        }
-        None => stages.push(record(5, 0.0, if next == Next::Locked { StageStatus::Blocked } else { StageStatus::Skipped }, if moc.is_some() { "절차서 없음 (변경 반영 심사)" } else { "절차서 없음" })),
-    }
+    let draft = draft_for(db, candidate, route.tag.as_deref(), &substantive, &telemetry, now, brains.writer);
+    stages.push(draft_stage(draft.as_ref(), &next, moc.is_some()));
 
     // 시계열 요약 · 전파 체인
     let mut focus: Vec<String> = route.tag.iter().cloned().collect();
@@ -298,6 +283,55 @@ pub fn analyze(db: &Lattice, incident: &Incident, brains: Brains<'_>, sds_id: &s
         reason,
         notes,
     })
+}
+
+/// Gate 1 이 걸러 낸 순간 잡음을 뺀 계측 (판단 · 초안이 보는 값)
+fn cleaned(incident: &Incident, signal: Option<&SignalReport>) -> Telemetry {
+    let telemetry = &incident.telemetry;
+    if let Some(SignalReport { tag, state: SignalState::SpikeFiltered { spikes }, .. }) = signal {
+        if let Some(series) = telemetry.get(tag) {
+            return telemetry.with_series(tag, series.despiked(spikes));
+        }
+    }
+    telemetry.clone()
+}
+
+/// Gate 4: 판정 후보 · 근본 원인 · 판단에 쓴 사실 · 지금 계측으로 조치 절차서 초안을 씁니다 (글쓰기 모델이 없으면 템플릿).
+fn draft_for(db: &Lattice, candidate: Verdict, tag: Option<&str>, substantive: &Substantive, telemetry: &Telemetry, now: i64, writer: Option<&dyn TextWriter>) -> Option<AopDraft> {
+    let causal = substantive.causal.as_ref();
+    let aop = select_aop(db, candidate, tag, causal)?;
+    let now_value = tag.and_then(|t| telemetry.value_at(t, now));
+    let root_value = causal.and_then(|c| c.root.as_ref()).and_then(|r| telemetry.value_at(&r.tag, now));
+    let template = template_summary(db, candidate, tag, causal, now_value, root_value);
+    let facts: Vec<String> = substantive.facts.iter().filter(|(k, _)| k != "적용 규칙").map(|(k, v)| format!("{k}: {v}")).collect();
+    let source: Vec<String> = facts.iter().cloned().chain(std::iter::once(template.clone())).collect();
+    Some(draft_aop(writer, aop, &source, &template))
+}
+
+/// Stage 5 기록
+fn draft_stage(draft: Option<&AopDraft>, next: &Next, has_moc: bool) -> StageRecord {
+    match draft {
+        Some(d) => {
+            let status = if *next == Next::AwaitingField || d.high_risk { StageStatus::Waiting } else { StageStatus::Done };
+            let summary = match (d.by_model, d.problems.is_empty()) {
+                (true, _) => format!("{} 초안 · 숫자 대조 통과{}", d.aop_id, if d.high_risk { " · 공동결재 대기" } else { "" }),
+                (false, true) => format!("{} 템플릿 (글쓰기 모델 없음)", d.aop_id),
+                (false, false) => format!("{} 모델 초안 수치 불일치 {}건 → 템플릿", d.aop_id, d.problems.len()),
+            };
+            record(5, d.ms, status, summary)
+        }
+        None => record(5, 0.0, if *next == Next::Locked { StageStatus::Blocked } else { StageStatus::Skipped }, if has_moc { "절차서 없음 (변경 반영 심사)" } else { "절차서 없음" }),
+    }
+}
+
+/// 진행 중 사건의 AOP 초안만 글쓰기 모델로 다시 씁니다. 판정 · 인터록은 저장된 분석 그대로이고 모델에 다시 묻지 않습니다.
+/// 판단 결과가 없거나(서명 재요청 등) 절차서가 없으면 None.
+pub fn redraft(db: &Lattice, incident: &Incident, analysis: &Analysis, writer: &dyn TextWriter) -> Option<(AopDraft, StageRecord)> {
+    let substantive = analysis.substantive.as_ref()?;
+    let telemetry = cleaned(incident, analysis.signal.as_ref());
+    let draft = draft_for(db, analysis.candidate, analysis.route.tag.as_deref(), substantive, &telemetry, incident.now_ms(), Some(writer))?;
+    let stage = draft_stage(Some(&draft), &analysis.next, analysis.moc.is_some());
+    Some((draft, stage))
 }
 
 /// Gate 3 에 넘기는 것

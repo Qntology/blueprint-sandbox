@@ -7,11 +7,13 @@
 //! - `ink` · `layout`: 픽셀 분석과 조각 나누기
 //! - `arena`: 칸마다 종류끼리 겨루는 패치 경쟁 (NMS)
 //! - `plan`: 조각마다 읽을지 정하기
+//! - `delta`: 마스터 도면과 패치끼리 견주어 바뀐 조각만 읽기 (SDS 델타 패치)
 //!
 //! 단계마다 쓰는 타워만 올립니다. 페이지를 읽을 때는 비전 타워만, 앵커 문구를 새로 인코딩할 때는 텍스트 타워만 올라옵니다.
 
 pub mod arena;
 pub mod config;
+pub mod delta;
 pub mod image;
 pub mod ink;
 pub mod layout;

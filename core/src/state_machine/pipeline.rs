@@ -6,20 +6,29 @@
 //!
 //! 현장 서명 재요청은 판정이 아닙니다. 현장 게이지를 기다리는 사건은 세션으로 남고, 보고가 오면 다시 분석합니다.
 //! 이 시스템은 설비를 제어하지 않습니다. 확정은 진단과 조치 지시서를 기록하는 일입니다.
+//!
+//! 모델(판단 · 글쓰기)을 부르는 일은 준비 → 모델 → 반영 세 걸음입니다 ([`super::staged`]). 앱은 엔진 잠금을 준비와 반영에만 쥐고,
+//! 모델이 도는 동안에는 풉니다. 여기의 `run` · `attach_report` 같은 메서드는 같은 세 걸음을 엔진 하나에서 잇달아 부릅니다.
+
+use std::cell::RefCell;
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use super::analysis::{analyze, Analysis, Brains, Next};
+use super::analysis::{Analysis, Brains, Next};
 use super::gate3_substantive::{approve_high_risk, ApprovalOutcome, Justification};
 use super::gate4_5_finalize::{check_field_text, field_notice, retention_until, ArchiveRow};
+use super::staged::{self, Commit};
 use crate::audit::{Actor, AuditCategory, AuditEvent};
 use crate::case::{FieldReport, Incident};
-use crate::decision::DecisionModel;
-use crate::drafting::TextWriter;
+use crate::decision::{DecisionModel, Fact};
+use crate::drafting::{AopDraft, TextWriter};
 use crate::interlock::{self, Evidence, InterlockError};
-use crate::mitigation::{self, Mitigation};
+use crate::mitigation::{self, Action, Mitigation};
+use crate::stages::StageRecord;
+use crate::verdict::Decided;
 use crate::lattice::Lattice;
 use crate::policy::{AutomationPolicy, Disposition};
 use crate::privacy::{self, mask_name};
@@ -63,12 +72,57 @@ struct Closing {
     apply_moc: bool,
 }
 
+/// 판단 · 글쓰기 모델의 손잡이 (`Arc`). 엔진을 잠근 동안 복제해 두고, 잠금을 푼 뒤 모델을 돌릴 때 씁니다.
+#[derive(Clone, Default)]
+pub struct Minds {
+    pub model: Option<Arc<dyn DecisionModel>>,
+    pub writer: Option<Arc<dyn TextWriter>>,
+}
+
+impl Minds {
+    pub fn brains(&self) -> Brains<'_> {
+        Brains { model: self.model.as_deref(), writer: self.writer.as_deref() }
+    }
+
+    /// 글쓰기 없이 (AOP 초안은 사실 줄 템플릿)
+    pub fn without_writer(&self) -> Self {
+        Self { model: self.model.clone(), writer: None }
+    }
+}
+
+/// 현장 보고를 붙여 다시 분석할 입력 (엔진 잠금 안에서 만든 사본)
+pub struct AttachJob {
+    pub id: String,
+    /// 보고를 붙인 사건 사본 (분석 시각을 보고 시각까지 당김)
+    pub incident: Incident,
+    rev: u64,
+}
+
+/// 진행 중 사건의 AOP 초안을 글쓰기 모델로 다시 쓸 입력
+pub struct RedraftJob {
+    pub id: String,
+    pub incident: Incident,
+    pub analysis: Analysis,
+    pub writer: Arc<dyn TextWriter>,
+    rev: u64,
+}
+
+/// Tier 1 완화 조치의 계획 (모델에 물을 사실까지)
+pub struct MitigationJob {
+    pub id: String,
+    pub facts: Vec<Fact>,
+    pub model: Option<Arc<dyn DecisionModel>>,
+    action: Action,
+    gates: Vec<(String, bool)>,
+    rev: u64,
+}
+
 pub struct Engine {
     pub policy: AutomationPolicy,
     /// Zoro-1 판단 (백본 + jev_head). 없으면 규칙만으로 동작하고 자동 확정은 불가능합니다.
-    pub model: Option<Box<dyn DecisionModel>>,
+    pub model: Option<Arc<dyn DecisionModel>>,
     /// Zoro-1 글쓰기 (같은 백본 + 임베딩 표). 없으면 템플릿만 씁니다.
-    pub writer: Option<Box<dyn TextWriter>>,
+    pub writer: Option<Arc<dyn TextWriter>>,
     pub store: Store,
     salt: Vec<u8>,
     seq: u32,
@@ -76,12 +130,17 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(salt: &[u8], policy: AutomationPolicy, model: Option<Box<dyn DecisionModel>>) -> Self {
-        Self { policy, model, writer: None, store: Store::default(), salt: salt.to_vec(), seq: 0 }
+        Self { policy, model: model.map(Arc::from), writer: None, store: Store::default(), salt: salt.to_vec(), seq: 0 }
     }
 
     pub fn with_writer(mut self, writer: Box<dyn TextWriter>) -> Self {
-        self.writer = Some(writer);
+        self.writer = Some(Arc::from(writer));
         self
+    }
+
+    /// 모델 손잡이 사본 (엔진 잠금 밖에서 모델을 돌릴 때)
+    pub fn minds(&self) -> Minds {
+        Minds { model: self.model.clone(), writer: self.writer.clone() }
     }
 
     /// 사건 번호 (`INC-20261104-0001`, 현장 보고는 `FLD-…`)
@@ -106,17 +165,18 @@ impl Engine {
         self.store.record(event);
     }
 
-    fn brains(&self) -> Brains<'_> {
-        Brains { model: self.model.as_deref(), writer: self.writer.as_deref() }
-    }
-
-    fn sds_id(incident: &Incident) -> String {
+    /// SDS 스냅샷 번호 (사건 번호의 머리를 `SDS` 로 바꿈)
+    pub fn sds_id(incident: &Incident) -> String {
         format!("SDS-{}", incident.id.split_once('-').map(|(_, rest)| rest).unwrap_or(&incident.id))
     }
 
     /// 사건 하나를 Gate 0 부터 돌립니다.
     pub fn run(&mut self, db: &Lattice, incident: Incident, now: DateTime<Utc>) -> Result<Outcome> {
-        let analysis = analyze(db, &incident, self.brains(), &Self::sds_id(&incident))?;
+        staged::run(&RefCell::new(self), db, incident, now, false)
+    }
+
+    /// 분석 결과로 사건을 엽니다 (반영 걸음). 서명 재요청이면 사건을 열지 않습니다.
+    pub fn commit_run(&mut self, incident: Incident, analysis: Analysis, now: DateTime<Utc>) -> Result<Outcome> {
         if analysis.next == Next::FieldRetry {
             record(&mut self.store, now, Actor::FieldTerminal, AuditCategory::DecisionRecorded, &incident.id, None, analysis.reason.clone());
             return Ok(Outcome::FieldRetry { verdict: analysis.candidate, reason: analysis.reason });
@@ -171,41 +231,48 @@ impl Engine {
 
     fn open(&mut self, incident: Incident, analysis: Analysis, judgement: Option<Judgement>, status: SessionStatus, reason: String, opened_at: DateTime<Utc>) -> Result<()> {
         let notes = analysis.notes.clone();
-        self.store.open(Session { incident, analysis, judgement, status, reason, notes, opened_at, field_request: None, mitigation: None })
+        self.store.open(Session { incident, analysis, judgement, status, reason, notes, opened_at, field_request: None, mitigation: None, rev: 0 })
     }
 
     /// 진행 중인 사건에 현장 보고를 붙이고 다시 분석합니다. 분석 시각은 보고 시각까지 당깁니다.
     pub fn attach_report(&mut self, db: &Lattice, incident_id: &str, report: FieldReport, now: DateTime<Utc>) -> Result<Outcome> {
-        let Some(session) = self.store.take(incident_id) else { bail!("진행 중인 사건이 아닙니다: {incident_id}") };
-        let Session { mut incident, opened_at, analysis: before, .. } = session;
+        staged::attach_report(&RefCell::new(self), db, incident_id, report, now)
+    }
+
+    /// 현장 보고를 붙인 사건 사본을 만듭니다 (준비 걸음). 세션은 그대로 둡니다.
+    pub fn attach_job(&self, incident_id: &str, report: &FieldReport) -> Result<AttachJob> {
+        let Some(s) = self.store.active(incident_id) else { bail!("진행 중인 사건이 아닙니다: {incident_id}") };
+        let mut incident = s.incident.snapshot();
         incident.received_at = incident.received_at.max(report.taken_at);
-        incident.reports.push(report);
-        let mut analysis = match analyze(db, &incident, self.brains(), &Self::sds_id(&incident)) {
+        incident.reports.push(report.clone());
+        Ok(AttachJob { id: incident_id.to_string(), incident, rev: s.rev })
+    }
+
+    /// 다시 분석한 결과를 세션에 반영합니다 (반영 걸음). 그사이 세션이 바뀌었으면 `Stale` 입니다.
+    /// 분석이 실패하거나 서명을 다시 받아야 하면 세션(판정 · 인터록 확인 기록)을 그대로 둡니다.
+    pub fn commit_attach(&mut self, job: AttachJob, analysis: Result<Analysis>, now: DateTime<Utc>) -> Result<Commit<Outcome>> {
+        let AttachJob { id, incident, rev } = job;
+        let Some(s) = self.store.active_mut(&id) else { bail!("진행 중인 사건이 아닙니다: {id}") };
+        if s.rev != rev {
+            return Ok(Commit::Stale);
+        }
+        let mut analysis = match analysis {
             Ok(a) => a,
             Err(e) => {
-                // 다시 분석하지 못해도 사건을 잃으면 안 됩니다. 보고를 뺀 채로 되돌립니다.
-                incident.reports.pop();
-                let mut analysis = analyze(db, &incident, self.brains(), &Self::sds_id(&incident))?;
-                carry_interlock(&before, &mut analysis);
-                self.open(incident, analysis, None, SessionStatus::SupervisorReview, format!("현장 보고를 반영하지 못했습니다: {e}"), opened_at)?;
+                // 다시 분석하지 못해도 사건을 잃으면 안 됩니다. 보고를 붙이지 않은 세션을 그대로 두고 사유만 남깁니다.
+                s.reason = format!("현장 보고를 반영하지 못했습니다: {e}");
                 return Err(e);
             }
         };
         if analysis.next == Next::FieldRetry {
-            let reason = analysis.reason.clone();
-            incident.reports.pop();
-            let mut previous = analyze(db, &incident, self.brains(), &Self::sds_id(&incident))?;
-            carry_interlock(&before, &mut previous);
-            let status = if previous.next == Next::AwaitingField { SessionStatus::AwaitingField } else { SessionStatus::SupervisorReview };
-            let prev_reason = previous.reason.clone();
-            self.open(incident, previous, None, status, prev_reason, opened_at)?;
-            return Ok(Outcome::FieldRetry { verdict: Verdict::G1SignInvalidRetry, reason });
+            return Ok(Commit::Done(Outcome::FieldRetry { verdict: Verdict::G1SignInvalidRetry, reason: analysis.reason }));
         }
+        let Some(Session { opened_at, analysis: before, .. }) = self.store.take(&id) else { bail!("진행 중인 사건이 아닙니다: {id}") };
         // 감사 로그에는 사번 대신 솔트 해시를 남깁니다.
         let worker = incident.reports.last().and_then(|r| r.worker_id.as_deref()).map(|w| privacy::salted_hash(&self.salt, w)[..12].to_string()).unwrap_or_else(|| "없음".into());
-        record(&mut self.store, now, Actor::FieldTerminal, AuditCategory::DecisionRecorded, incident_id, None, format!("현장 보고 반영 · 재분석 (작업자 {worker})"));
+        record(&mut self.store, now, Actor::FieldTerminal, AuditCategory::DecisionRecorded, &id, None, format!("현장 보고 반영 · 재분석 (작업자 {worker})"));
         carry_interlock(&before, &mut analysis);
-        self.settle(incident, analysis, now, opened_at)
+        self.settle(incident, analysis, now, opened_at).map(Commit::Done)
     }
 
     /// 교대감독이 선행 절차 인터록 단계 하나를 채웁니다 (Part 8-4). 앞 단계를 건너뛰면 막고 감사 로그에 남깁니다.
@@ -233,33 +300,56 @@ impl Engine {
     /// 글쓰기 모델 없이 분석합니다 (AOP 초안은 사실 줄 템플릿). 물리엔진 모드에서 완화 조치를 먼저 내려고 씁니다:
     /// 글쓰기(10 ~ 20초)를 기다리면 공정이 그동안 트립 쪽으로 움직입니다. 모델 초안은 [`Engine::redraft`] 로 뒤에 다시 씁니다.
     pub fn run_quick(&mut self, db: &Lattice, incident: Incident, now: DateTime<Utc>) -> Result<Outcome> {
-        let writer = self.writer.take();
-        let out = self.run(db, incident, now);
-        self.writer = writer;
-        out
+        staged::run(&RefCell::new(self), db, incident, now, true)
     }
 
-    /// 진행 중 사건의 AOP 초안을 글쓰기 모델로 다시 씁니다 (인터록 · 완화 조치 기록은 그대로). 글쓰기 모델이 없으면 false.
+    /// 진행 중 사건의 AOP 초안을 글쓰기 모델로 다시 씁니다 (판정 · 인터록 · 완화 조치 기록은 그대로). 글쓰기 모델이 없으면 false.
     pub fn redraft(&mut self, db: &Lattice, incident_id: &str) -> Result<bool> {
-        if self.writer.is_none() {
-            return Ok(false);
-        }
+        staged::redraft(&RefCell::new(self), db, incident_id)
+    }
+
+    /// 초안을 다시 쓸 입력 (준비 걸음). 글쓰기 모델이 없으면 None.
+    pub fn redraft_job(&self, incident_id: &str) -> Result<Option<RedraftJob>> {
+        let Some(writer) = self.writer.clone() else { return Ok(None) };
         let Some(s) = self.store.active(incident_id) else { bail!("진행 중인 사건이 아닙니다: {incident_id}") };
-        let fresh = analyze(db, &s.incident, self.brains(), &Self::sds_id(&s.incident))?;
-        let Some(s) = self.store.active_mut(incident_id) else { bail!("진행 중인 사건이 아닙니다: {incident_id}") };
-        s.analysis.draft = fresh.draft;
-        if let (Some(old), Some(new)) = (s.analysis.stages.iter_mut().find(|x| x.stage == 5), fresh.stages.into_iter().find(|x| x.stage == 5)) {
-            *old = new;
+        Ok(Some(RedraftJob { id: incident_id.to_string(), incident: s.incident.snapshot(), analysis: s.analysis.clone(), writer, rev: s.rev }))
+    }
+
+    /// 다시 쓴 초안을 넣습니다 (반영 걸음). 그사이 세션이 바뀌었거나 닫혔으면 넣지 않고 false.
+    pub fn commit_redraft(&mut self, job: RedraftJob, drafted: Option<(AopDraft, StageRecord)>) -> bool {
+        let Some(s) = self.store.active_mut(&job.id) else { return false };
+        if s.rev != job.rev {
+            return false;
         }
-        Ok(true)
+        let Some((draft, stage)) = drafted else { return false };
+        s.analysis.draft = Some(draft);
+        if let Some(old) = s.analysis.stages.iter_mut().find(|x| x.stage == 5) {
+            *old = stage;
+        }
+        true
     }
 
     /// 자율 대응 (Part 8-5): Tier 1 완화 조치(급수 바이패스 개방)를 세우고 네 기준으로 묻고, 정책이 자동 실행인지 정합니다.
     /// 자동이면 실행 기록까지 남기고 돌려줍니다 (호출한 쪽이 시뮬레이터에 명령을 넣습니다). 사건의 판정 · 결재는 그대로 남습니다.
     pub fn propose_mitigation(&mut self, db: &Lattice, incident_id: &str, now: DateTime<Utc>) -> Result<Option<Mitigation>> {
+        staged::propose_mitigation(&RefCell::new(self), db, incident_id, now)
+    }
+
+    /// 완화 조치 계획 (준비 걸음). 세울 조치가 없으면 None.
+    pub fn mitigation_job(&self, db: &Lattice, incident_id: &str) -> Result<Option<MitigationJob>> {
         let Some(s) = self.store.active(incident_id) else { bail!("진행 중인 사건이 아닙니다: {incident_id}") };
         let Some((action, gates, facts)) = mitigation::plan(db, &s.analysis) else { return Ok(None) };
-        let decided = mitigation::judge(&facts, self.brains().model)?;
+        Ok(Some(MitigationJob { id: incident_id.to_string(), facts, model: self.model.clone(), action, gates, rev: s.rev }))
+    }
+
+    /// 네 기준 판단을 받아 정책을 적용하고 기록합니다 (반영 걸음). 그사이 세션이 바뀌었으면 `Stale` 입니다.
+    pub fn commit_mitigation(&mut self, db: &Lattice, job: MitigationJob, decided: Decided, now: DateTime<Utc>) -> Result<Commit<Mitigation>> {
+        let MitigationJob { id, facts, action, gates, rev, .. } = job;
+        let incident_id = id.as_str();
+        let Some(s) = self.store.active(incident_id) else { bail!("진행 중인 사건이 아닙니다: {incident_id}") };
+        if s.rev != rev {
+            return Ok(Commit::Stale);
+        }
         let gates_clear = gates.iter().all(|g| g.1);
         let (auto, reason, post_audit) = match self.policy.disposition(&decided.judgement, gates_clear, false, incident_id) {
             Disposition::AutoFinalize { post_audit } => (true, "자동화 모드 · 규칙 통과 · 네 기준 최솟값이 기준 이상 → Tier 1 자동 실행".to_string(), post_audit),
@@ -291,7 +381,7 @@ impl Engine {
         if let Some(s) = self.store.active_mut(incident_id) {
             s.mitigation = Some(m.clone());
         }
-        Ok(Some(m))
+        Ok(Commit::Done(m))
     }
 
     /// 실시간 계측이 바뀌면 남은 인터록 단계를 다시 봅니다 (예: 자동 우회 개방 뒤 Step 2). 새로 채운 단계가 있으면 감사 기록에 남기고 true.

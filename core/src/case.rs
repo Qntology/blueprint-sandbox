@@ -125,6 +125,10 @@ pub struct ReadTimings {
     /// 읽은 조각 수와 버린 안내문 조각 수
     pub crops: usize,
     pub dropped: usize,
+    /// 글자가 없어 읽지 않은 조각 (상자 테두리 · 배관뿐인 띠)
+    pub blank: usize,
+    /// 마스터 도면과 같아 읽지 않은 조각 (SDS 델타 패치)
+    pub skipped: usize,
 }
 
 /// 현장 단말이 보낸 점검 · 변경 보고 하나
@@ -238,6 +242,19 @@ impl Incident {
     /// 분석 시각 (epoch ms)
     pub fn now_ms(&self) -> i64 {
         self.received_at.timestamp_millis()
+    }
+
+    /// 엔진 잠금 밖에서 분석하려고 만드는 사본. 사본도 버릴 때 근무자 이름 · 자유 서술 소명을 지웁니다 (`Drop`).
+    pub fn snapshot(&self) -> Incident {
+        Incident {
+            id: self.id.clone(),
+            source: self.source,
+            alarm: self.alarm.clone(),
+            telemetry: self.telemetry.clone(),
+            reports: self.reports.clone(),
+            received_at: self.received_at,
+            scenario: self.scenario.clone(),
+        }
     }
 
     /// 알람 태그. 알람이 없으면 현장 보고의 태그입니다.

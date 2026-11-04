@@ -627,6 +627,20 @@ impl Lattice {
         hits.next().is_none().then_some(first)
     }
 
+    /// 한 글자만 다르게 읽힌 이름(같은 길이, 세 글자 이상)의 근무자. 그런 사람이 정확히 한 명일 때만 고릅니다 (손글씨 오독 교정).
+    pub fn person_one_off(&self, name: &str) -> Option<&PersonRow> {
+        let want: Vec<char> = name.trim().chars().collect();
+        if want.len() < 3 {
+            return None;
+        }
+        let mut hits = self.seed.personnel.iter().filter(|p| {
+            let have: Vec<char> = p.name.chars().collect();
+            have.len() == want.len() && have.iter().zip(&want).filter(|(a, b)| a != b).count() == 1
+        });
+        let first = hits.next()?;
+        hits.next().is_none().then_some(first)
+    }
+
     /// 근무자가 이 섹터를 관할하는가
     pub fn authorized(&self, person: &str, sector: &str) -> bool {
         self.person(person).is_some_and(|p| p.authorized_sectors.iter().any(|s| s == "*" || s == sector))
