@@ -2,6 +2,7 @@
 
     python scripts/gen_pid_drawings.py [마스터 폴더] [현장 스캔 폴더] [시드]
     python scripts/gen_pid_drawings.py --symbols     심볼 표본(학습 · 시험)과 명판 훼손 도면만 out/symbols 에
+    python scripts/gen_pid_drawings.py --a0-dpi 300  같은 A0 종합도를 2 배 해상도로 다시 그려 out/a0/PID-100-ALL-A0@300dpi.png 에
 
 기본값은 core/fixtures/drawings (마스터 도면, 저장소에 들어갑니다) 와 out/field (현장 스캔, 저장소 밖) 입니다.
 설비 상자의 위치는 시드 대장(core/fixtures/synthetic_db.json)의 `bbox`(정규화 좌표)를 그대로 씁니다. 그래서 대장이 곧 정답 좌표입니다.
@@ -82,12 +83,71 @@ def font(path, size, index=0):
     return ImageFont.truetype(path, size, index=index)
 
 
+class ScaledDraw:
+    """`s` 배 그림에 그리되 좌표 · 굵기 · 글꼴 크기는 1 배 값으로 받습니다 (300 DPI 합성). 배치는 1 배 그대로이고,
+    글자 폭 · 상자 같은 측정은 1 배 값을 돌려줘서 1 배 도면과 같은 자리에 같은 모양이 2 배 해상도로 그려집니다."""
+
+    def __init__(self, img, s):
+        self.s = s
+        self.d = ImageDraw.Draw(img)
+        self.m = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+        self.fonts = {}
+
+    def _xy(self, xy):
+        if xy and isinstance(xy[0], (list, tuple)):
+            return [(x * self.s, y * self.s) for x, y in xy]
+        return [v * self.s for v in xy]
+
+    def _kw(self, kw):
+        kw = dict(kw)
+        if "width" in kw:
+            kw["width"] = max(1, int(round(kw["width"] * self.s)))
+        if "radius" in kw:
+            kw["radius"] = kw["radius"] * self.s
+        if "font" in kw:
+            f = kw["font"]
+            key = (f.path, f.size, f.index)
+            if key not in self.fonts:
+                self.fonts[key] = ImageFont.truetype(f.path, int(round(f.size * self.s)), index=f.index)
+            kw["font"] = self.fonts[key]
+        return kw
+
+    def line(self, xy, **kw):
+        self.d.line(self._xy(xy), **self._kw(kw))
+
+    def rectangle(self, xy, **kw):
+        self.d.rectangle(self._xy(xy), **self._kw(kw))
+
+    def rounded_rectangle(self, xy, **kw):
+        self.d.rounded_rectangle(self._xy(xy), **self._kw(kw))
+
+    def polygon(self, xy, **kw):
+        self.d.polygon(self._xy(xy), **self._kw(kw))
+
+    def ellipse(self, xy, **kw):
+        self.d.ellipse(self._xy(xy), **self._kw(kw))
+
+    def chord(self, xy, start, end, **kw):
+        self.d.chord(self._xy(xy), start, end, **self._kw(kw))
+
+    def text(self, xy, text, **kw):
+        self.d.text(self._xy(xy), text, **self._kw(kw))
+
+    def textbbox(self, xy, text, **kw):
+        return self.m.textbbox(xy, text, **kw)
+
+    def textlength(self, text, **kw):
+        return self.m.textlength(text, **kw)
+
+
 class Canvas:
-    def __init__(self, w, h, rng):
+    def __init__(self, w, h, rng, scale=1):
+        """`w × h` 는 1 배 배치 크기입니다. `scale` 이 1 이 아니면 그림만 그 배율로 그립니다 (ScaledDraw)."""
         self.w, self.h = w, h
         self.rng = rng
-        self.img = Image.new("RGB", (w, h), (255, 255, 255))
-        self.d = ImageDraw.Draw(self.img)
+        self.scale = scale
+        self.img = Image.new("RGB", (w * scale, h * scale), (255, 255, 255))
+        self.d = ImageDraw.Draw(self.img) if scale == 1 else ScaledDraw(self.img, scale)
         self.gt = []
 
     def px(self, box):
@@ -209,7 +269,17 @@ class Canvas:
         ImageDraw.Draw(tile).text((2 - l, 2 - t), s, font=f, fill=fill + (255,))
         tile = tile.rotate(90, expand=True)
         x, y = int(cx - tile.width / 2), int(cy - tile.height / 2)
-        self.img.paste(tile, (x, y), tile)
+        if self.scale == 1:
+            self.img.paste(tile, (x, y), tile)
+        else:
+            # 배율 그림: 같은 글을 배율 글꼴로 다시 써서 같은 가운데에 붙입니다.
+            k = self.scale
+            fk = font(path, int(round(size * k)))
+            l2, t2, r2, b2 = ImageDraw.Draw(Image.new("RGB", (8, 8))).textbbox((0, 0), s, font=fk)
+            big = Image.new("RGBA", (r2 - l2 + 4 * k, b2 - t2 + 4 * k), (255, 255, 255, 255))
+            ImageDraw.Draw(big).text((2 * k - l2, 2 * k - t2), s, font=fk, fill=fill + (255,))
+            big = big.rotate(90, expand=True)
+            self.img.paste(big, (int(cx * k - big.width / 2), int(cy * k - big.height / 2)), big)
         if kind:
             self.add(kind, (x, y, x + tile.width, y + tile.height), s)
 
@@ -401,10 +471,11 @@ def hatch(c, box):
         x += 9
 
 
-def draw_master(plant, drawing_id, rng, value_overrides=None, damage=0):
+def draw_master(plant, drawing_id, rng, value_overrides=None, damage=0, scale=1):
     """마스터 도면 한 장. `value_overrides` 는 태그별로 상자에 적을 현재값입니다 (없으면 정상치).
-    `damage` 는 KKS 없는 판독 시험용 명판 훼손 정도입니다: 1 KKS 줄, 2 KKS · 이름 줄, 3 상자 글자 전부 (심볼만 남음)."""
-    c = Canvas(DW, DH, rng)
+    `damage` 는 KKS 없는 판독 시험용 명판 훼손 정도입니다: 1 KKS 줄, 2 KKS · 이름 줄, 3 상자 글자 전부 (심볼만 남음).
+    `scale` 은 그림 배율입니다 (2 = 300 DPI, 배치 · 정답 좌표는 1 배 그대로)."""
+    c = Canvas(DW, DH, rng, scale)
     c.symbols = []
     d = plant.drawings[drawing_id]
     sector = plant.sectors[d["sector"]]
@@ -748,20 +819,25 @@ def save(path, img, gt, extra):
         f.write("\n")
 
 
-def a0_sheet(plant, a0, masters_dir):
+def a0_sheet(plant, a0, masters_dir, scale=1, seed=20261104):
     """A0 종합 도면 (Part 8-4). 마스터 도면들을 원장 배치(`a0_drawings`)대로 한 장에 앉힙니다.
-    글자 크기는 마스터 그대로라 A0 전체 높이의 0.4 % 쯤입니다 (실제 A0 도면의 KKS 글씨 2.5 ~ 3.5 mm 와 같은 비율)."""
+    글자 크기는 마스터 그대로라 A0 전체 높이의 0.4 % 쯤입니다 (실제 A0 도면의 KKS 글씨 2.5 ~ 3.5 mm 와 같은 비율).
+    `scale` 이 2 면 마스터를 같은 시드로 2 배 해상도로 다시 그려 앉힙니다 (300 DPI, 150 DPI 그림을 키우지 않음)."""
     W, H = a0["pixel_size"]
-    c = Canvas(W, H, random.Random(a0["id"]))
+    c = Canvas(W, H, random.Random(a0["id"]), scale)
     c.d.rectangle((20, 20, W - 20, H - 20), outline=INK, width=6)
     c.d.rectangle((40, 40, W - 40, H - 40), outline=INK, width=2)
     c.text(160, 260, f"{a0['title']}  ·  A0 {a0['size_mm'][0]} × {a0['size_mm'][1]} mm  ·  {a0['dpi']} DPI", 64, BOLD, kind="label")
     c.text(160, 380, "마스터 계통도 5장을 한 장에 모은 종합도입니다. 각 칸의 표제란은 원 도면의 것입니다.", 40, GOTHIC, fill=GRAY, kind="label")
     gt = []
     for sh in a0["sheets"]:
-        img = Image.open(os.path.join(masters_dir, f"{sh['drawing']}.png")).convert("RGB")
-        c.img.paste(img, (sh["x"], sh["y"]))
-        c.d.rectangle((sh["x"] - 4, sh["y"] - 4, sh["x"] + img.width + 4, sh["y"] + img.height + 4), outline=INK, width=3)
+        if scale == 1:
+            img = Image.open(os.path.join(masters_dir, f"{sh['drawing']}.png")).convert("RGB")
+        else:
+            img = draw_master(plant, sh["drawing"], random.Random(f"{seed}/{sh['drawing']}"), scale=scale).img
+        c.img.paste(img, (sh["x"] * scale, sh["y"] * scale))
+        sw, shh = img.width // scale, img.height // scale
+        c.d.rectangle((sh["x"] - 4, sh["y"] - 4, sh["x"] + sw + 4, sh["y"] + shh + 4), outline=INK, width=3)
     for e in plant.db["equipment"]:
         sh = next((s for s in a0["sheets"] if s["drawing"] == e["drawing"]), None)
         if sh is None:
@@ -897,6 +973,22 @@ def damaged_sheets(plant, out_dir, seed):
 
 
 def main():
+    if len(sys.argv) > 2 and sys.argv[1] == "--a0-dpi":
+        # A0 종합도만 배율을 바꿔 다시 그립니다 (마스터 · 현장 스캔은 그대로)
+        dpi = int(sys.argv[2])
+        db = json.load(open(SEED, encoding="utf-8"))
+        plant = Plant(db)
+        a0_dir = os.path.join(ROOT, "out", "a0")
+        os.makedirs(a0_dir, exist_ok=True)
+        for a0 in db.get("a0_drawings", []):
+            scale = dpi // a0["dpi"]
+            assert scale * a0["dpi"] == dpi and scale >= 1, "A0 원장 DPI 의 정수배만 됩니다"
+            c, gt = a0_sheet(plant, a0, os.path.join(ROOT, "core", "fixtures", "drawings"), scale)
+            img = c.img.convert("P", palette=Image.ADAPTIVE, colors=64)
+            path = os.path.join(a0_dir, f"{a0['id']}@{dpi}dpi.png")
+            save(path, img, c.gt, {"drawing": a0["id"], "rev": a0["rev"], "dpi": dpi, "scale": scale, "equipment": gt, "grid": a0["grid"]})
+            print(f"A0 {dpi} DPI: {path} ({img.width} × {img.height} px)")
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "--symbols":
         # 심볼 표본과 훼손 도면만 (마스터 도면은 그대로)
         db = json.load(open(SEED, encoding="utf-8"))

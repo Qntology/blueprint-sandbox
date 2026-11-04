@@ -299,7 +299,7 @@ fn main() -> Result<()> {
                 let mut regions = vec![px(TITLE_BOX)];
                 regions.extend(equipment.iter().map(|(_, b)| px(*b)));
                 let tuples: Vec<(u32, u32, u32, u32)> = regions.iter().map(|r| (r[0], r[1], r[2], r[3])).collect();
-                let texts = reader.read_regions(&img, &tuples, 5)?;
+                let texts = reader.read_regions(&img, &tuples, 5, 1.0)?;
                 ms += t.elapsed().as_secs_f64() * 1e3;
                 // 표제란의 도면 번호 (원장 번호와 편집 거리 2 이내면 고칩니다)
                 let title = strip_tags(&texts[0].text);
