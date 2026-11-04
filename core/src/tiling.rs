@@ -5,10 +5,15 @@
 //! 엔진 상수는 그대로 두고, 읽기 전에 A0 를 `rows × cols` 격자 타일(이웃과 `overlap` 만큼 겹침)로 잘라 `read_pages` 에 묶어 넘깁니다.
 //! 타일 하나가 A3 ~ A4 비율이 되어 글자 크기 가정이 맞고, 타일에서 찾은 상자는 타일 오프셋을 더해 A0 전체 좌표로 되돌립니다.
 //! 겹친 띠에서 두 번 찾은 같은 KKS 는 상자 겹침(IoU ≥ 0.5)이나 포함으로 하나로 합칩니다(NMS).
+//!
+//! 배치를 원장이 아는 A0(정기 확인 · 알람 자리 재확인)는 타일 전체를 읽지 않아도 됩니다. [`ledger_boxes`] 로 원장 설비 상자만
+//! 잘라 다시 읽고 [`check_box`] 로 원장 KKS 와 대조합니다 (빠른 확인 경로). 못 읽은 상자만 그 상자를 덮는 타일로 다시 읽습니다.
+//! 타일 판독의 조각 대부분(배관 · 심볼 · 표제란 · 범례)은 KKS 색인에 쓸모가 없어서, 상자만 읽으면 시간이 크게 줍니다.
 
 use serde::Serialize;
 
-use crate::lattice::{A0Row, Lattice};
+use crate::extract::strip_tags;
+use crate::lattice::{A0Row, KksMatch, Lattice};
 
 /// 타일 하나 (A0 픽셀 좌표). `id` 는 행 글자 + 열 번호입니다 (`B3` = 2행 3열).
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -112,6 +117,63 @@ pub fn covering<'a>(tiles: &'a [Tile], global: [f32; 4], page: (u32, u32)) -> Ve
         return vec![t];
     }
     tiles.iter().filter(|t| t.touches(global, page)).collect()
+}
+
+/// 원장 설비 상자 하나의 A0 자리 (빠른 확인 경로)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LedgerBox {
+    pub kks: String,
+    /// A0 전체 정규화 좌표 (원장)
+    pub bbox: [f32; 4],
+    /// 그림 화소 좌표 `[x0, y0, x1, y1)` (그림 크기 기준이라 150 · 300 DPI 어느 쪽이든 맞음)
+    pub px: [u32; 4],
+    pub tile: Option<String>,
+}
+
+/// 원장 설비 상자의 A0 화소 영역. `page` 는 실제 그림 크기, `only` 가 있으면 그 설비들만 (알람 · Red-line 자리 재확인).
+pub fn ledger_boxes(db: &Lattice, a0: &A0Row, page: (u32, u32), only: Option<&[&str]>) -> Vec<LedgerBox> {
+    let grid = tiles(page, a0.grid.rows, a0.grid.cols, a0.grid.overlap);
+    let (w, h) = (page.0 as f32, page.1 as f32);
+    db.equipment_all()
+        .iter()
+        .filter(|e| only.is_none_or(|o| o.contains(&e.kks.as_str())))
+        .filter_map(|e| {
+            let g = a0_bbox(db, a0, &e.kks)?;
+            let px = [(g[0] * w).floor() as u32, (g[1] * h).floor() as u32, ((g[2] * w).ceil() as u32).min(page.0), ((g[3] * h).ceil() as u32).min(page.1)];
+            Some(LedgerBox { kks: e.kks.clone(), bbox: g, px, tile: tile_of(&grid, g, page).map(|t| t.id.clone()) })
+        })
+        .collect()
+}
+
+/// 원장 상자를 다시 읽은 글자와 원장 KKS 의 대조
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BoxCheck {
+    pub kks: String,
+    /// 글자에서 찾은 KKS (원장으로 오독 교정). 원장과 같은 코드가 있으면 그것, 없으면 처음 찾은 다른 코드
+    pub read: Option<String>,
+    pub corrected: bool,
+    /// 원장 KKS 를 읽었는가
+    pub ok: bool,
+}
+
+/// 글자의 낱말마다 KKS 꼴을 원장으로 교정해, 그 상자의 원장 KKS 가 있는지 봅니다.
+/// 다른 설비 코드만 읽혔으면 `ok = false` 이고 `read` 에 그 코드가 남습니다 (도면 개정 · 상자 이동 의심).
+pub fn check_box(db: &Lattice, kks: &str, text: &str) -> BoxCheck {
+    let found: Vec<KksMatch> = strip_tags(text)
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+        .filter(|w| w.len() >= 10)
+        .map(|w| db.match_kks(w))
+        .filter(|m| m.code().is_some())
+        .collect();
+    let mine = found.iter().find(|m| m.code() == Some(kks));
+    let pick = mine.or(found.first());
+    BoxCheck {
+        kks: kks.to_string(),
+        read: pick.and_then(|m| m.code()).map(str::to_string),
+        corrected: pick.is_some_and(|m| matches!(m, KksMatch::Corrected { .. })),
+        ok: mine.is_some(),
+    }
 }
 
 /// 타일에서 찾은 코드 하나 (A0 전체 좌표)
@@ -226,5 +288,36 @@ mod tests {
         // 103동 급수조절밸브는 타일 하나(또는 경계에 걸리면 둘)만 다시 읽으면 됩니다.
         let valve = a0_bbox(&db, a0, "10LAB20AA102").unwrap();
         assert!(covering(&ts, valve, page).len() <= 2);
+    }
+
+    #[test]
+    fn ledger_boxes_follow_the_picture_size_and_can_be_narrowed() {
+        let db = Lattice::embedded().unwrap();
+        let a0 = db.a0("PID-100-ALL-A0").unwrap();
+        let page = (a0.pixel_size[0], a0.pixel_size[1]);
+        let all = ledger_boxes(&db, a0, page, None);
+        assert_eq!(all.len(), db.equipment_all().len());
+        let valve = all.iter().find(|b| b.kks == "10LAB20AA102").unwrap();
+        assert!(valve.px[2] > valve.px[0] && valve.px[3] > valve.px[1] && valve.px[2] <= page.0 && valve.px[3] <= page.1);
+        assert_eq!(valve.tile, tile_of(&a0_tiles(a0), valve.bbox, page).map(|t| t.id.clone()));
+        // 300 DPI 그림(2 배)이면 화소 상자도 2 배, 정규화 좌표 · 타일 이름은 그대로
+        let double = ledger_boxes(&db, a0, (page.0 * 2, page.1 * 2), Some(&["10LAB20AA102"]));
+        assert_eq!(double.len(), 1);
+        assert_eq!(double[0].bbox, valve.bbox);
+        assert_eq!(double[0].tile, valve.tile);
+        assert!(double[0].px.iter().zip(valve.px).all(|(a, b)| a.abs_diff(b * 2) <= 2), "{:?} vs {:?}", double[0].px, valve.px);
+    }
+
+    #[test]
+    fn a_reread_box_is_checked_against_the_ledger_code() {
+        let db = Lattice::embedded().unwrap();
+        let ok = check_box(&db, "10LAB20AA102", "KKS: 10LAB20AA102\n주급수 유량조절밸브\nCG102 밸브 개도 78.0 %");
+        assert!(ok.ok && !ok.corrected && ok.read.as_deref() == Some("10LAB20AA102"), "{ok:?}");
+        let misread = check_box(&db, "10LAB20AA102", "<table><tr><td>KKS: 1OLAB20AA1O2</td></tr></table>");
+        assert!(misread.ok && misread.corrected, "O 를 0 으로 고쳐 맞춥니다: {misread:?}");
+        let other = check_box(&db, "10LAB20AA102", "KKS: 10LAB20AA103 급수 바이패스 밸브");
+        assert!(!other.ok && other.read.as_deref() == Some("10LAB20AA103"), "다른 설비 코드는 불일치로 남깁니다: {other:?}");
+        let none = check_box(&db, "10LAB20AA102", "위치: 103동 2F · CG102 18.0 %");
+        assert!(!none.ok && none.read.is_none(), "{none:?}");
     }
 }

@@ -180,12 +180,20 @@ impl DocumentReader {
     /// 페이지의 정해진 영역만 다시 읽습니다 (부분 재판독). 도면은 조각 계획이 한 행의 상자들을 가로 띠 하나로 읽어서
     /// 상자별 글자를 떼어 낼 수 없으므로, KKS 를 못 읽은 상자는 그 상자만 글자 프롬프트로 다시 읽습니다.
     /// 영역은 테두리 괘선이 글자로 읽히지 않게 안쪽으로 `inset` 화소 줄여 자릅니다.
-    pub fn read_regions(&self, page: &RgbImage, regions: &[Bbox], inset: u32) -> Result<Vec<OcrOutput>> {
+    /// `scale` 이 1 보다 작으면 자른 영역을 그만큼 줄여 읽습니다 (300 DPI 도면의 글자를 150 DPI 크기로: gocr 이미지 토큰이 넓이에 비례).
+    pub fn read_regions(&self, page: &RgbImage, regions: &[Bbox], inset: u32, scale: f32) -> Result<Vec<OcrOutput>> {
         let inputs: Vec<GocrInput> = regions
             .par_iter()
             .map(|&(x0, y0, x1, y1)| {
                 let b = (x0 + inset, y0 + inset, x1.saturating_sub(inset).max(x0 + inset + 1), y1.saturating_sub(inset).max(y0 + inset + 1));
-                Ok(GocrInput { image: gocr_prepare(&cut(page, b, 1.0), GOCR_PATCH, GOCR_MERGE)?, prompt: TEXT_PROMPT.to_string() })
+                let piece = cut(page, b, 1.0);
+                let piece = if scale < 0.99 {
+                    let (w, h) = (((piece.width() as f32) * scale).round().max(1.0) as u32, ((piece.height() as f32) * scale).round().max(1.0) as u32);
+                    resize(&piece, w, h, FilterType::Lanczos3)
+                } else {
+                    piece
+                };
+                Ok(GocrInput { image: gocr_prepare(&piece, GOCR_PATCH, GOCR_MERGE)?, prompt: TEXT_PROMPT.to_string() })
             })
             .collect::<Result<_>>()?;
         self.gocr.recognize(&inputs)
