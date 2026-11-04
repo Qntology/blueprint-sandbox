@@ -353,5 +353,7 @@ fn main() -> Result<()> {
         dict.save(&path)?;
         println!("사전 저장: {}", path.display());
     }
+    // ROCm 을 쓴 Windows 프로세스는 보통 종료하면 rocblas 정리에서 멈춰 GPU 메모리를 쥔 채 남습니다 (accel::finish_process).
+    accel::finish_process(&device, 0);
     Ok(())
 }

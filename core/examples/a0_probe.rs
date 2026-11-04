@@ -125,5 +125,7 @@ fn main() -> Result<()> {
     }
     std::fs::write(&out_path, serde_json::to_string_pretty(&doc)?)?;
     println!("[결과] {}", out_path.display());
+    // ROCm 을 쓴 Windows 프로세스는 보통 종료하면 rocblas 정리에서 멈춰 GPU 메모리를 쥔 채 남습니다 (accel::finish_process).
+    blueprint_core::ai::accel::finish_process(&rt.device, 0);
     Ok(())
 }
