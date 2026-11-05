@@ -22,13 +22,14 @@
 | 자연어 검색 (logis-center 방식) | `search.rs`, `SearchBox.tsx` | 구현. 유형 먼저(머리 낱말 규칙) · 조건 대조 후 힌트로 내림 · 전체 질의 경로 RRF · 구제 · 식별자 교정 · 질적 상태(높음 · 고착 · 비정상 …, 지금 계측이 있을 때만 필터) · "왜 찾았나" | 계측 없음 17개 MRR 0.941 · Hit@1 15/17, P2 재생 계측 7개 MRR 0.929 · Hit@1 6/7 ([docs/search.md](docs/search.md)) |
 | 개선안: 설비 심볼 · KKS 없는 판독 | `symbols.rs`, `identify.rs`, `gen_pid_drawings.py` 심볼 범례 | 구현. 상자 오른쪽 위 심볼 10종, 잉크 연결 요소 후보 + SigLIP2 그림 사전(`symbol_dict.bin`, `crop_probe.bin` 과 별도), 이름 · 위치 · 계기 태그 · 항목 · 좌표 · 심볼 단서로 KKS 없이 설비 판독(애매하면 사람) | 시험 표본 191/200 맞음 · 틀림 0, 마스터 심볼 32/32 찾음 · 31 분류, 명판 훼손 L1 35/35 · L2 34/35 · L3 32/35 · 틀림 0 ([docs/powerplant-symbol-plan.md](docs/powerplant-symbol-plan.md)) |
 | 시계열 · SDS 고도화 | `timeseries.rs`, `sds.rs`, `physics.rs` | 구현. 신호 모양(SDS 상태 코드) · 고장 코드(`VALVE_STUCK_LOW`) · CUSUM · 2차 TTF · 한 표본 튐 막기 · 변화 시작 시차 · 회복 히스테리시스 | CUSUM 1.5σ 탐지 98.8 % (띠 51.5 %) · 같은 오경보 수준, P5 순간 잡음은 열지 않음 |
+| 개선안: 3대 병목 | `state_machine/staged.rs`, `ai/residency.rs` (`Coexist`), `ai/siglip2/delta.rs`, `ink::glyphs` | 구현 (일부는 실측으로 방식을 바꿈). 엔진 잠금을 준비 · 반영에만 쥐고 모델은 잠금 밖에서, SigLIP2 비전 타워 공존(선택, 기본 꺼짐), 마스터 대비 잉크가 바뀐 곳만 다시 읽는 델타 판독(Red-line · A0), 글자 없는 띠 건너뛰기 | 대역 모델 시험: 조회 대기 475 → 0.0 ms. Red-line P3 36.6 → 11.2 s · P3F 33.9 → 7.0 s (값 같음), 바뀌지 않은 A0 타일 17 ms. [docs/powerplant-bottleneck-plan.md](docs/powerplant-bottleneck-plan.md) |
 
 기획과 다르게 만든 곳은 [docs/powerplant-control-plan.md](docs/powerplant-control-plan.md) 0절에 **확인** 으로 적었습니다.
 
 ## 시험
 
 ```bat
-:: 단위 335개 + 시나리오 E2E 14개 (CPU, 모델 없이 규칙 · 대역 모델)
+:: 단위 351개 + 엔진 잠금 4개 + 시나리오 E2E 14개 (CPU, 모델 없이 규칙 · 대역 모델)
 cargo test -p blueprint-core --no-default-features
 cargo test -p blueprint-models
 
@@ -40,6 +41,10 @@ run\windows\rocm.bat plant_probe out\field out\plant_probe.json
 :: 설비 심볼 그림 사전 만들기 · 재기, 명판 훼손 도면의 KKS 없는 판독 (ROCm)
 python scripts\gen_pid_drawings.py --symbols
 run\windows\rocm.bat symbol_probe --save
+
+:: SDS 델타 판독: Red-line · A0 재스캔을 마스터와 견주어 바뀐 곳만 읽기 (ROCm)
+python scripts\gen_pid_drawings.py --a0-delta
+run\windows\rocm.bat delta_probe out\delta_probe.json
 
 :: 모델 없이: 자연어 검색 평가, SDS 트리거 이전 · 지금 비교
 cargo run -p blueprint-core --example search_eval

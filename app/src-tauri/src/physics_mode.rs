@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use blueprint_core::mitigation::{Action, Mitigation};
 use blueprint_core::physics::{self, Command, Fault, OpenCall, PlantSim, Tracker, TICK_MS};
+use blueprint_core::state_machine::staged;
 use blueprint_core::tsdb::LiveRing;
 use chrono::Utc;
 use serde::Serialize;
@@ -60,14 +61,14 @@ fn analyze_call(app: AppHandle, call: OpenCall) {
             physics::incident_from(&desk.db, &call, &ph.ring, "")
         };
         // 1) 글쓰기 없이 분석하고 완화 조치를 먼저 냅니다 (판단 질문만, 수 초). 2) 그다음 AOP 초안을 모델로 다시 씁니다.
-        let result = {
-            let _gpu = lock(&desk.gpu);
-            let mut engine = lock(&desk.engine);
-            let id = engine.next_id("INC", Utc::now());
+        // 엔진 잠금은 준비 · 반영 때만 쥡니다. 모델이 도는 동안에도 콘솔의 조회 · 결정 · 인터록 계측 확인이 멈추지 않습니다.
+        let desk: &Desk = &desk;
+        let result = staged::open(desk, &desk.db, "INC", Utc::now(), true, |id| {
             let mut incident = incident;
-            incident.id = id.clone();
-            engine.run_quick(&desk.db, incident, Utc::now()).and_then(|_| engine.propose_mitigation(&desk.db, &id, Utc::now()).map(|m| (id, m)))
-        };
+            incident.id = id.to_string();
+            incident
+        })
+        .and_then(|(id, _)| staged::propose_mitigation(desk, &desk.db, &id, Utc::now()).map(|m| (id, m)));
         let id = {
             let mut ph = lock(&desk.physics);
             ph.busy = false;
@@ -94,10 +95,8 @@ fn analyze_call(app: AppHandle, call: OpenCall) {
         notify_console(&app);
         let _ = app.emit("physics_update", ());
         if let Some(id) = id {
-            let done = {
-                let _gpu = lock(&desk.gpu);
-                lock(&desk.engine).redraft(&desk.db, &id)
-            };
+            // 판정은 다시 묻지 않고 글만 다시 씁니다.
+            let done = staged::redraft(desk, &desk.db, &id);
             if let Err(e) = done {
                 lock(&desk.physics).note = Some(format!("AOP 초안을 다시 쓰지 못했습니다 (템플릿 유지): {e:#}"));
             }

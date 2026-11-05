@@ -9,7 +9,7 @@ use super::accel;
 use super::document::DocumentReader;
 use super::model_store::{model_dir, models_dir};
 use super::pointer::PointerModel;
-use super::residency::{Budget, Residency};
+use super::residency::{Budget, Coexist, Residency};
 use super::zoro::{open_engine_models, SharedBackbone};
 
 pub struct Runtime {
@@ -25,7 +25,8 @@ pub struct Runtime {
 pub fn open() -> Result<Runtime> {
     let device = accel::select_device()?;
     let backend = accel::backend_name(&device);
-    let residency = Residency::shared(device.clone(), Budget::auto(&device));
+    // 공존(`BLUEPRINT_COEXIST=siglip2`)은 켰을 때만입니다. 기본은 한 번에 한 모델입니다.
+    let residency = Residency::shared_with(device.clone(), Budget::auto(&device), Coexist::from_env());
     let (model, writer) = open_engine_models(&model_dir("zoro"), residency.clone())?;
     let reader = Arc::new(DocumentReader::open(&models_dir(), residency)?);
     Ok(Runtime { backend, device, model, writer, reader })

@@ -42,6 +42,9 @@ pub struct Session {
     pub field_request: Option<String>,
     /// 자율 대응 완화 조치 (Part 8-5)
     pub mitigation: Option<crate::mitigation::Mitigation>,
+    /// 세션 판 번호. 저장소가 세션을 열 때마다(현장 보고로 다시 분석해 다시 열 때 포함) 새로 매깁니다.
+    /// 엔진 잠금 밖에서 모델을 돌린 결과를 반영하기 전에, 그사이 세션이 바뀌지 않았는지 이 값으로 봅니다.
+    pub rev: u64,
 }
 
 /// 기준치에 겹친 MOC 변경
@@ -64,6 +67,8 @@ pub struct Store {
     overlays: Vec<MocOverlay>,
     /// 실시간 계측 60초 링버퍼 (Part 8-4 시계열 질의: 촬영 시각 값 · 구간 요약 · 변곡점 시차)
     live: LiveRing,
+    /// 마지막으로 매긴 세션 판 번호
+    revs: u64,
 }
 
 impl Store {
@@ -75,11 +80,14 @@ impl Store {
         &mut self.live
     }
 
-    pub fn open(&mut self, session: Session) -> Result<()> {
+    /// 세션을 엽니다. 판 번호(`rev`)는 저장소가 새로 매깁니다.
+    pub fn open(&mut self, mut session: Session) -> Result<()> {
         let id = session.incident.id.clone();
         if self.active.contains_key(&id) {
             bail!("이미 진행 중인 사건입니다: {id}");
         }
+        self.revs += 1;
+        session.rev = self.revs;
         self.active.insert(id, session);
         Ok(())
     }

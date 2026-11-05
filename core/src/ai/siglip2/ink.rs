@@ -24,6 +24,9 @@ pub const RULE_RATIO: f32 = 0.8;
 const TEXT_UNIT: f32 = 0.012;
 /// 세로 괘선은 이 높이(글자 높이 배수) 이상인 조각에서만 찾습니다.
 const RULE_MIN_UNITS: f32 = 3.5;
+/// 글자 모양 덩어리의 높이 · 너비 범위 (글자 높이 배수)
+const GLYPH_MIN: f32 = 0.4;
+const GLYPH_MAX: f32 = 2.8;
 
 /// 잉크 지도. 행 · 열 프로파일과 경계 찾기를 맡습니다.
 pub struct InkPage {
@@ -56,6 +59,111 @@ impl InkPage {
 
     pub fn full(&self) -> Bbox {
         (0, 0, self.width, self.height)
+    }
+
+    /// 화소마다 잉크(1) · 종이(0), 행 우선
+    pub fn mask(&self) -> &[u8] {
+        &self.mask
+    }
+
+    /// 상자 안의 글자 모양 덩어리 수 (`limit` 에 닿으면 그만 셉니다).
+    /// 8 방향 연결 요소 가운데 높이 · 너비가 글자 높이의 0.4 ~ 2.8 배이고 선(길고 가는 것)이 아닌 것입니다.
+    /// 상자 테두리 · 배관 · 점선(낮고 김) · 잡티(작음)는 세지 않습니다.
+    pub fn glyphs(&self, (x0, y0, x1, y1): Bbox, limit: usize) -> usize {
+        let unit = self.text_unit();
+        let (lo, hi) = (unit * GLYPH_MIN, unit * GLYPH_MAX);
+        let is_glyph = |(a, b, c, d): (u32, u32, u32, u32)| {
+            let (w, h) = ((c - a) as f32, (d - b) as f32);
+            // 상자 테두리 · 배관: 길고(글자 높이의 1.8 배 넘게) 가늘다(짧은 변이 글자 높이의 1/4 이하)
+            let long = w.max(h) >= 4.0 * w.min(h).max(1.0) && w.max(h) > unit * 1.8 && w.min(h) <= (unit * 0.25).max(4.0);
+            !long && h >= lo && h <= hi && w <= hi
+        };
+        // 줄마다 잉크 구간을 만들고 윗줄 구간과 닿으면(8 방향) 합칩니다.
+        let mut runs: Vec<(u32, u32, u32)> = Vec::new();
+        let mut parent: Vec<usize> = Vec::new();
+        fn find(parent: &mut [usize], mut a: usize) -> usize {
+            while parent[a] != a {
+                parent[a] = parent[parent[a]];
+                a = parent[a];
+            }
+            a
+        }
+        let mut prev = 0..0;
+        for y in y0..y1.min(self.height) {
+            let row = self.row(y, x0, x1.min(self.width));
+            let start = runs.len();
+            let mut x = 0;
+            while x < row.len() {
+                if row[x] == 0 {
+                    x += 1;
+                    continue;
+                }
+                let s = x;
+                while x < row.len() && row[x] != 0 {
+                    x += 1;
+                }
+                parent.push(runs.len());
+                runs.push((y, s as u32, x as u32));
+            }
+            let mut j = prev.start;
+            for i in start..runs.len() {
+                let (_, a0, a1) = runs[i];
+                while j < prev.end && runs[j].2 < a0 {
+                    j += 1;
+                }
+                let mut k = j;
+                while k < prev.end && runs[k].1 <= a1 {
+                    let (ra, rb) = (find(&mut parent, i), find(&mut parent, k));
+                    if ra != rb {
+                        parent[ra.max(rb)] = ra.min(rb);
+                    }
+                    k += 1;
+                }
+            }
+            prev = start..runs.len();
+        }
+        let mut boxes: std::collections::HashMap<usize, (u32, u32, u32, u32)> = std::collections::HashMap::new();
+        for (i, &(y, a, b)) in runs.iter().enumerate() {
+            let root = find(&mut parent, i);
+            let e = boxes.entry(root).or_insert((a, y, b, y + 1));
+            *e = (e.0.min(a), e.1.min(y), e.2.max(b), e.3.max(y + 1));
+        }
+        boxes.into_values().filter(|b| is_glyph(*b)).take(limit).count()
+    }
+
+    /// 잉크를 사방 `radius` 화소 넓힌 지도 (정사각 이웃). 두 그림이 그만큼 어긋나도 같은 획으로 보려고 씁니다.
+    pub fn dilate(&self, radius: u32) -> Vec<u8> {
+        let (w, h, r) = (self.width as usize, self.height as usize, radius as usize);
+        let spread = |line: &[u8], out: &mut [u8]| {
+            // 창 [i - r, i + r] 안의 잉크 수를 미끄러지며 셉니다.
+            let n = line.len();
+            let mut count: usize = line[..r.min(n)].iter().map(|v| *v as usize).sum();
+            for i in 0..n {
+                if i + r < n {
+                    count += line[i + r] as usize;
+                }
+                if i > r {
+                    count -= line[i - r - 1] as usize;
+                }
+                out[i] = (count > 0) as u8;
+            }
+        };
+        let mut rows = vec![0u8; w * h];
+        for y in 0..h {
+            spread(&self.mask[y * w..(y + 1) * w], &mut rows[y * w..(y + 1) * w]);
+        }
+        let mut out = vec![0u8; w * h];
+        let (mut col, mut spread_col) = (vec![0u8; h], vec![0u8; h]);
+        for x in 0..w {
+            for y in 0..h {
+                col[y] = rows[y * w + x];
+            }
+            spread(&col, &mut spread_col);
+            for y in 0..h {
+                out[y * w + x] = spread_col[y];
+            }
+        }
+        out
     }
 
     /// 해상도와 무관하게 여백을 재는 눈금: 페이지 높이에서 짐작한 글자 높이 (A4 10 pt)

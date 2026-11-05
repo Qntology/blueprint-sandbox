@@ -5,6 +5,9 @@
 //!
 //! 여러 장은 [`DocumentReader::read_pages`] 로 함께 읽어야 합니다. 모델을 장마다 오가지 않고 단계마다 한 번만 올립니다.
 //! 픽셀 계산은 페이지 · 조각 단위로 병렬이고, 모델 계산은 한 번에 한 묶음입니다.
+//!
+//! 마스터 도면을 알면 [`DocumentReader::read_pages_delta`] 로 바뀐 조각만 읽습니다 (SDS 델타 패치, `siglip2::delta`).
+//! 어느 마스터인지는 계획 단계에서 이미 뽑는 SigLIP2 특징 격자로, 무엇이 바뀌었는지는 잉크로 가리므로 모델 계산이 더 들지 않습니다.
 
 use std::path::Path;
 use std::time::Instant;
@@ -20,11 +23,12 @@ use super::gocr::image::prepare as gocr_prepare;
 use super::gocr::{open as open_gocr, GocrEngine, GocrInput, OcrOutput, Strategy, EARLY_EXIT, TEXT_PROMPT};
 use super::residency::SharedResidency;
 use super::siglip2::config::DEFAULT_MAX_PATCHES;
+use super::siglip2::delta::{clip_to_changes, ink_changes, retain_changed, DeltaParams, Master, MasterSet};
 use super::siglip2::image::{prepare as siglip2_prepare, PatchInput};
 use super::siglip2::ink::{deskew, estimate_skew, Bbox, InkPage};
 use super::siglip2::plan::{plan_page, plan_unfiltered, CropKind, CropPlan, PagePlan, PlanParams, Scores};
 use super::siglip2::probe::ProbeBank;
-use super::siglip2::Siglip2;
+use super::siglip2::{PatchGrid, Siglip2};
 use super::trace;
 
 /// 시각 앵커 파일 이름 (siglip2 모델 폴더 안)
@@ -62,6 +66,111 @@ pub struct PageReading {
     /// 심볼 후보와 그림 사전 결과 (`ReadOptions::symbols` 를 켜고 사전이 있을 때). 버린 후보도 들어 있습니다 (`class == None`).
     pub symbols: Vec<SymbolHit>,
     pub timings: Timings,
+    /// 마스터와 견준 결과 (`read_pages_delta` 일 때만)
+    pub delta: Option<DeltaReading>,
+}
+
+/// 마스터 대조 기준 (SDS 델타 패치)
+pub enum Baseline<'a> {
+    /// 페이지마다 가장 닮은 마스터를 고릅니다 (현장 스캔)
+    Best(&'a MasterSet),
+    /// 페이지마다 정해 둔 마스터 (A0 타일처럼 자리를 아는 경우). 없는 페이지는 전부 읽습니다.
+    Each(&'a [Option<&'a Master>]),
+}
+
+/// 마스터와 견준 결과 (페이지 하나)
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeltaReading {
+    /// 견준 마스터
+    pub master: Option<String>,
+    /// SigLIP2 패치 코사인 평균 (마스터를 고른 근거)
+    pub similarity: f32,
+    /// 두 번째로 닮은 마스터와의 평균 코사인 차이 (정해 둔 마스터면 0)
+    pub margin: f32,
+    /// 잉크가 바뀐 칸 수 · 전체 칸 수
+    pub changed: usize,
+    pub blocks: usize,
+    /// 마스터와 같아 읽지 않은 조각
+    pub skipped: Vec<Bbox>,
+    /// 바뀐 곳 둘레로 좁혀 읽은 조각 수와, 좁힌 뒤 글자가 없어 뺀 조각
+    pub clipped: usize,
+    pub clipped_blank: Vec<Bbox>,
+    /// 델타를 쓰지 않고 전부 읽은 까닭
+    pub fallback: Option<String>,
+    /// 패치마다 마스터와의 SigLIP2 코사인 (진단용)
+    pub cosines: Vec<f32>,
+    /// 바뀐 칸 상자 (진단용)
+    pub changed_boxes: Vec<Bbox>,
+}
+
+/// 계획까지 마친 페이지
+struct Planned {
+    image: RgbImage,
+    skew: f32,
+    plan: PagePlan,
+    timings: Timings,
+    delta: Option<DeltaReading>,
+}
+
+/// 기울기를 바로잡고 잉크를 분석합니다 (페이지마다 병렬).
+fn straighten(pages: &[&RgbImage]) -> Vec<(RgbImage, f32, InkPage)> {
+    pages
+        .par_iter()
+        .map(|page| {
+            let skew = estimate_skew(&gray_of(page));
+            let image = deskew(page, skew);
+            let ink = InkPage::new(&gray_of(&image));
+            (image, skew, ink)
+        })
+        .collect()
+}
+
+/// 바뀐 곳에 걸치지 않는 조각을 계획에서 뺍니다. 마스터를 고르지 못했거나 너무 많이 바뀌었으면 계획을 그대로 둡니다.
+fn apply_delta(plan: &mut PagePlan, grid: &PatchGrid, ink: &InkPage, baseline: &Baseline<'_>, page: usize, p: &DeltaParams) -> DeltaReading {
+    let mut out = DeltaReading { master: None, similarity: 0.0, margin: 0.0, changed: 0, blocks: 0, skipped: Vec::new(), clipped: 0, clipped_blank: Vec::new(), fallback: None, cosines: Vec::new(), changed_boxes: Vec::new() };
+    let master = match baseline {
+        Baseline::Best(set) => {
+            let Some(m) = set.best_match(grid) else {
+                out.fallback = Some("격자가 같은 마스터가 없습니다".into());
+                return out;
+            };
+            (out.similarity, out.margin) = (m.similarity, m.margin);
+            let master = &set.pages[m.index];
+            out.master = Some(master.id().to_string());
+            out.cosines = master.patches.cosines(grid).unwrap_or_default();
+            if m.margin < p.min_margin {
+                out.fallback = Some(format!("어느 마스터인지 확신하지 못했습니다 (패치 코사인 차이 {:.3})", m.margin));
+                return out;
+            }
+            master
+        }
+        Baseline::Each(list) => {
+            let Some(master) = list.get(page).copied().flatten() else {
+                out.fallback = Some("정해 둔 마스터가 없습니다".into());
+                return out;
+            };
+            out.master = Some(master.id().to_string());
+            out.cosines = master.patches.cosines(grid).unwrap_or_default();
+            out.similarity = out.cosines.iter().sum::<f32>() / out.cosines.len().max(1) as f32;
+            master
+        }
+    };
+    let Some(diff) = ink_changes(master, ink, p) else {
+        out.fallback = Some("마스터와 크기가 다릅니다".into());
+        return out;
+    };
+    out.blocks = diff.diff.len();
+    out.changed = diff.changed(p.ink_threshold);
+    out.changed_boxes = diff.changed_boxes(p.ink_threshold);
+    if out.changed as f32 > out.blocks as f32 * p.max_changed {
+        out.fallback = Some(format!("바뀐 칸이 {}/{} 로 많아 전부 읽습니다", out.changed, out.blocks));
+        return out;
+    }
+    out.skipped = retain_changed(plan, |b| diff.touches(b, p.ink_threshold));
+    if p.clip {
+        (out.clipped, out.clipped_blank) = clip_to_changes(plan, ink, &diff, p.ink_threshold);
+    }
+    out
 }
 
 /// 읽는 방식
@@ -218,53 +327,73 @@ impl DocumentReader {
 
     /// 페이지를 곧게 펴고 읽을 조각을 정합니다. SigLIP2 비전 타워만 씁니다.
     pub fn plan(&self, page: &RgbImage) -> Result<(RgbImage, f32, PagePlan, Timings)> {
-        self.plan_pages(std::slice::from_ref(page))?.pop().ok_or_else(|| anyhow!("페이지 결과가 없습니다"))
+        let p = self.plan_pages(std::slice::from_ref(page), None)?.pop().ok_or_else(|| anyhow!("페이지 결과가 없습니다"))?;
+        Ok((p.image, p.skew, p.plan, p.timings))
+    }
+
+    /// 마스터 도면(또는 A0 타일)의 특징 격자와 잉크를 만들어 둡니다 (델타 판독의 기준). 읽을 때와 같게 곧게 편 뒤에 만듭니다.
+    pub fn index_masters(&self, pages: &[(String, RgbImage)], p: &DeltaParams) -> Result<MasterSet> {
+        let refs: Vec<&RgbImage> = pages.iter().map(|(_, p)| p).collect();
+        let straight = straighten(&refs);
+        let grids = self.grids_of(&straight.iter().map(|s| &s.0).collect::<Vec<_>>())?;
+        let masters = straight.into_par_iter().zip(grids).zip(pages.par_iter()).map(|(((_, _, ink), grid), (id, _))| Master::new(id.clone(), &grid, ink, p.radius)).collect();
+        Ok(MasterSet { pages: masters })
+    }
+
+    fn grids_of(&self, images: &[&RgbImage]) -> Result<Vec<PatchGrid>> {
+        let patch = self.siglip2.config().patch;
+        let inputs: Vec<PatchInput> = images.par_iter().map(|image| siglip2_prepare(image, patch, DEFAULT_MAX_PATCHES)).collect::<Result<_>>()?;
+        let t = Instant::now();
+        let grids = self.siglip2.encode_images(&inputs)?;
+        trace::record("siglip2", "패치 특징", t.elapsed().as_secs_f64() * 1e3, json!({ "pages": images.len(), "patches": inputs.iter().map(|i| i.rows * i.cols).sum::<usize>() }));
+        Ok(grids)
     }
 
     /// 픽셀 계산은 페이지마다 병렬로 하고, SigLIP2 는 격자가 같은 페이지를 묶어 한 번만 올려 계산합니다.
-    fn plan_pages(&self, pages: &[RgbImage]) -> Result<Vec<(RgbImage, f32, PagePlan, Timings)>> {
+    /// `delta` 가 있으면 마스터와 견주어 바뀌지 않은 조각을 계획에서 뺍니다.
+    fn plan_pages(&self, pages: &[RgbImage], delta: Option<(&Baseline<'_>, &DeltaParams)>) -> Result<Vec<Planned>> {
         let t = Instant::now();
-        let straight: Vec<(RgbImage, f32, InkPage)> = pages
-            .par_iter()
-            .map(|page| {
-                let skew = estimate_skew(&gray_of(page));
-                let image = deskew(page, skew);
-                let ink = InkPage::new(&gray_of(&image));
-                (image, skew, ink)
-            })
-            .collect();
+        let straight = straighten(&pages.iter().collect::<Vec<_>>());
         let per_page = |t: Instant| t.elapsed().as_secs_f64() * 1e3 / pages.len().max(1) as f64;
         let layout_ms = per_page(t);
         trace::record("규칙", "기울기 보정 · 잉크 분석", t.elapsed().as_secs_f64() * 1e3, json!({ "pages": pages.len() }));
 
-        let Some(bank) = &self.probes else {
-            let plan = |(image, skew, ink): (RgbImage, f32, InkPage)| {
-                let plan = plan_unfiltered(&ink, &self.options.plan);
-                (image, skew, plan, Timings { layout_ms, ..Timings::default() })
-            };
+        if self.probes.is_none() && delta.is_none() {
+            let plan = |(image, skew, ink): (RgbImage, f32, InkPage)| Planned { plan: plan_unfiltered(&ink, &self.options.plan), image, skew, timings: Timings { layout_ms, ..Timings::default() }, delta: None };
             return Ok(straight.into_iter().map(plan).collect());
-        };
+        }
         let t = Instant::now();
-        let patch = self.siglip2.config().patch;
-        let inputs: Vec<PatchInput> = straight.par_iter().map(|(image, ..)| siglip2_prepare(image, patch, DEFAULT_MAX_PATCHES)).collect::<Result<_>>()?;
-        let grids = self.siglip2.encode_images(&inputs)?;
+        let grids = self.grids_of(&straight.iter().map(|s| &s.0).collect::<Vec<_>>())?;
         let siglip2_ms = per_page(t);
-        trace::record("siglip2", "패치 특징", t.elapsed().as_secs_f64() * 1e3, json!({ "pages": pages.len(), "patches": inputs.iter().map(|i| i.rows * i.cols).sum::<usize>() }));
         let t = Instant::now();
-        let planned: Vec<(RgbImage, f32, PagePlan)> = straight
+        let planned: Vec<Planned> = straight
             .into_par_iter()
             .zip(grids)
-            .map(|((image, skew, ink), grid)| Ok((image, skew, plan_page(&ink, &Scores::new(bank, &grid)?, &self.options.plan))))
+            .enumerate()
+            .map(|(i, ((image, skew, ink), grid))| {
+                let mut plan = match &self.probes {
+                    Some(bank) => plan_page(&ink, &Scores::new(bank, &grid)?, &self.options.plan),
+                    None => plan_unfiltered(&ink, &self.options.plan),
+                };
+                let delta = delta.map(|(baseline, params)| apply_delta(&mut plan, &grid, &ink, baseline, i, params));
+                Ok(Planned { image, skew, plan, timings: Timings::default(), delta })
+            })
             .collect::<Result<_>>()?;
         let layout_ms = layout_ms + per_page(t);
         if trace::enabled() {
             let pages: Vec<_> = planned
                 .iter()
-                .map(|(_, skew, plan)| json!({ "skew": skew, "crops": plan.crops.iter().map(|c| json!({ "kind": c.kind.name(), "bbox": [c.bbox.0, c.bbox.1, c.bbox.2, c.bbox.3] })).collect::<Vec<_>>() }))
+                .map(|p| {
+                    json!({
+                        "skew": p.skew,
+                        "crops": p.plan.crops.iter().map(|c| json!({ "kind": c.kind.name(), "bbox": [c.bbox.0, c.bbox.1, c.bbox.2, c.bbox.3] })).collect::<Vec<_>>(),
+                        "delta": p.delta.as_ref().map(|d| json!({ "master": d.master, "similarity": d.similarity, "margin": d.margin, "changed": d.changed, "blocks": d.blocks, "skipped": d.skipped.len(), "clipped": d.clipped, "fallback": d.fallback })),
+                    })
+                })
                 .collect();
             trace::record("규칙", "조각 계획", t.elapsed().as_secs_f64() * 1e3, json!({ "pages": pages }));
         }
-        Ok(planned.into_iter().map(|(image, skew, plan)| (image, skew, plan, Timings { layout_ms, siglip2_ms, ..Timings::default() })).collect())
+        Ok(planned.into_iter().map(|p| Planned { timings: Timings { layout_ms, siglip2_ms, ..Timings::default() }, ..p }).collect())
     }
 
     fn prompt_of(&self, kind: CropKind) -> &'static str {
@@ -283,19 +412,31 @@ impl DocumentReader {
     /// 페이지들을 읽습니다. 모델을 페이지마다 오가지 않도록 계획을 모두 세운 뒤 조각을 한꺼번에 읽습니다.
     /// 서명 조각은 글자로 읽지 않고 좌표만 계획에 남깁니다.
     pub fn read_pages(&self, pages: &[RgbImage]) -> Result<Vec<PageReading>> {
-        let planned = self.plan_pages(pages)?;
+        let planned = self.plan_pages(pages, None)?;
+        self.read_planned(planned)
+    }
+
+    /// 마스터와 견주어 바뀐 조각만 읽습니다 (SDS 델타 패치). 표제란 · 서명은 늘 읽고,
+    /// 닮은 마스터가 없거나 너무 많이 바뀐 페이지는 [`read_pages`](Self::read_pages) 와 같이 전부 읽습니다.
+    pub fn read_pages_delta(&self, pages: &[RgbImage], baseline: &Baseline<'_>, params: &DeltaParams) -> Result<Vec<PageReading>> {
+        let planned = self.plan_pages(pages, Some((baseline, params)))?;
+        self.read_planned(planned)
+    }
+
+    fn read_planned(&self, planned: Vec<Planned>) -> Result<Vec<PageReading>> {
+        let pages = planned.len();
         // 심볼은 비전 타워가 올라와 있을 때(gocr 로 넘어가기 전) 찾습니다.
         let t = Instant::now();
-        let mut symbols = if self.options.symbols { self.find_symbols(&planned.iter().map(|p| &p.0).collect::<Vec<_>>())? } else { vec![Vec::new(); planned.len()] }.into_iter();
-        let symbol_ms = t.elapsed().as_secs_f64() * 1e3 / pages.len().max(1) as f64;
+        let mut symbols = if self.options.symbols { self.find_symbols(&planned.iter().map(|p| &p.image).collect::<Vec<_>>())? } else { vec![Vec::new(); planned.len()] }.into_iter();
+        let symbol_ms = t.elapsed().as_secs_f64() * 1e3 / pages.max(1) as f64;
         let t = Instant::now();
-        let crops: Vec<(&RgbImage, &CropPlan)> = planned.iter().flat_map(|(straight, _, plan, _)| plan.crops.iter().filter(|c| c.kind != CropKind::Sign).map(move |c| (straight, c))).collect();
+        let crops: Vec<(&RgbImage, &CropPlan)> = planned.iter().flat_map(|p| p.plan.crops.iter().filter(|c| c.kind != CropKind::Sign).map(move |c| (&p.image, c))).collect();
         let inputs: Vec<GocrInput> = crops
             .into_par_iter()
             .map(|(straight, c)| Ok(GocrInput { image: gocr_prepare(&cut(straight, c.bbox, c.upscale), GOCR_PATCH, GOCR_MERGE)?, prompt: self.prompt_of(c.kind).to_string() }))
             .collect::<Result<_>>()?;
         let outputs = self.gocr.recognize(&inputs)?;
-        let ocr_ms = t.elapsed().as_secs_f64() * 1e3 / pages.len().max(1) as f64;
+        let ocr_ms = t.elapsed().as_secs_f64() * 1e3 / pages.max(1) as f64;
         if trace::enabled() {
             let texts: Vec<_> = if trace::with_text() { outputs.iter().map(|o| json!({ "text": o.text, "conf": o.min_confidence })).collect() } else { Vec::new() };
             let detail = json!({
@@ -311,7 +452,7 @@ impl DocumentReader {
         let mut outputs = outputs.into_iter();
         Ok(planned
             .into_iter()
-            .map(|(_, skew, plan, mut timings)| {
+            .map(|Planned { skew, plan, mut timings, delta, .. }| {
                 timings.ocr_ms = ocr_ms;
                 timings.symbol_ms = if self.options.symbols { symbol_ms } else { 0.0 };
                 let crops = plan
@@ -321,7 +462,7 @@ impl DocumentReader {
                     .zip(outputs.by_ref())
                     .map(|(c, output)| CropReading { kind: c.kind, bbox: c.bbox, output })
                     .collect();
-                PageReading { skew, plan, crops, symbols: symbols.next().unwrap_or_default(), timings }
+                PageReading { skew, plan, crops, symbols: symbols.next().unwrap_or_default(), timings, delta }
             })
             .collect())
     }

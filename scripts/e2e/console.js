@@ -312,6 +312,23 @@ async function searchFlow(c) {
 }
 
 // 물리엔진 폐루프 (Part 8-5): 정상 운전 → 밸브 고착 주입 → SDS 추적 → 사건 → 완화 조치 (보조 모드면 교대감독 실행) → 회복
+// 엔진이 사건을 모델로 분석하는 동안 상태 줄 명령(console_status, 엔진 잠금을 잡음)이 얼마나 기다리는지 잽니다.
+async function statusLatency(c, ms) {
+  return await c.evaluate(async (dur) => {
+    const invoke = window.__TAURI_INTERNALS__.invoke;
+    const took = [];
+    const end = performance.now() + dur;
+    while (performance.now() < end) {
+      const t = performance.now();
+      await invoke("console_status");
+      took.push(performance.now() - t);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    took.sort((a, b) => a - b);
+    return { n: took.length, median: took[Math.floor(took.length / 2)], max: took[took.length - 1] };
+  }, ms);
+}
+
 async function phys(c) {
   await tidy(c);
   await c.locator("button", { hasText: "물리엔진 · 자율 대응" }).click();
@@ -319,6 +336,8 @@ async function phys(c) {
   await sleep(4000);
   await c.locator(".drawer button", { hasText: "급수밸브 18% 고착 주입" }).click();
   await waitText(c, "인과 사슬 잠금", 90000);
+  // 사건이 열리면 엔진이 판단 질문(수 초)을 돌립니다. 그동안에도 상태 줄 조회가 바로 돌아와야 합니다 (엔진 잠금은 준비 · 반영 때만).
+  const status = await statusLatency(c, 5000);
   await shot(c, "PHYS-1-chain");
   // SDS 고장 코드는 원장 인터록의 고장 코드와 같은 꼴입니다.
   await waitText(c, "고장 코드 VALVE_STUCK_LOW", 30000);
@@ -348,8 +367,9 @@ async function phys(c) {
   const proposed = Number((text.match(/제안 t = ([0-9.]+)s/) || [])[1]);
   const locked = Number((text.match(/t = ([0-9.]+)s · 10HAH10CT001 SLEW \(변곡\) → 인과 사슬 잠금/) || [])[1]);
   const minimum = (text.match(/최솟값\(확신도\) ([0-9.]+|없음)/) || [])[1];
-  const record = { id: "PHYS", peak, locked, proposed, minimum };
+  const record = { id: "PHYS", peak, locked, proposed, minimum, status_ms: status };
   assert(peak > 0 && peak < 645, `과열기 고점 ${peak} ℃ 가 트립(645) 아래여야 합니다 (${JSON.stringify(record)})`);
+  assert(status.max < 1000, `분석 중 상태 줄 조회가 ${status.max.toFixed(0)} ms 기다렸습니다 (${JSON.stringify(status)})`);
   await c.locator(".drawer header button", { hasText: "닫기" }).click();
   results.push({ ...record, ok: true });
 }

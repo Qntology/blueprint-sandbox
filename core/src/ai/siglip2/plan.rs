@@ -2,7 +2,10 @@
 //!
 //! 조각 안 잉크 칸의 점수를 평균해 종류끼리 겨룹니다. 값을 놓치면 판단이 틀어지지만 안내문을 더 읽는 것은 시간만 더 들 뿐이라서,
 //! 두 신호가 모두 맞을 때만 버립니다: 생김새가 문단이고(`layout::runs`), 안내문이 다른 모든 종류를 여유 있게 이겨야 합니다.
-//! 시각 앵커 파일이 없으면 버리는 조각 없이 전부 읽습니다.
+//! 시각 앵커 파일이 없으면 안내문은 버리지 않고 읽습니다.
+//!
+//! 글자 모양 덩어리가 둘이 안 되는 조각(상자 테두리 · 배관 · 점선뿐인 띠)은 앵커와 상관없이 읽지 않습니다 (`blank`).
+//! 도면에서 gocr 가 빈 글을 내던 조각입니다 (마스터 5장 12개 중 8개, A0 타일 34개 중 23개, 글자가 든 조각은 남음).
 
 use super::arena::{self, Arena};
 use super::ink::{text_height, upscale_factor, Bbox, InkPage};
@@ -42,6 +45,8 @@ const PAD: u32 = 6;
 const CONTAINED: f32 = 0.8;
 /// 안내문의 영토로 치는 칸의 최소 점수 차이. 칸 하나의 값이라 조각 평균의 `drop_margin` 보다 작습니다.
 const MIN_CELL_MARGIN: f32 = 0.05;
+/// 이보다 글자 모양 덩어리가 적은 조각은 읽지 않습니다.
+const MIN_GLYPHS: usize = 2;
 /// 패치 경쟁의 종류 순서 (`Scores::all`)
 const FORM: usize = 0;
 const TABLE: usize = 1;
@@ -92,6 +97,8 @@ pub struct PagePlan {
     pub crops: Vec<CropPlan>,
     /// 안내문으로 보고 버린 조각
     pub dropped: Vec<Bbox>,
+    /// 글자가 없어 읽지 않은 조각 (상자 테두리 · 배관 · 점선뿐인 띠)
+    pub blank: Vec<Bbox>,
     /// 시각 앵커 없이 전부 읽는 계획인가
     pub unfiltered: bool,
 }
@@ -260,21 +267,27 @@ fn reading_order(crops: &mut [CropPlan]) {
 /// 앵커 없이 잉크 조각을 모두 읽는 계획
 pub fn plan_unfiltered(ink: &InkPage, p: &PlanParams) -> PagePlan {
     let mut crops = Vec::new();
+    let mut blank = Vec::new();
     for block in blocks(ink) {
         let scale = upscale_factor(text_height(ink, block), p.text_px, block.2 - block.0, block.3 - block.1);
         for t in tiles(ink, block, scale, p.max_tile_patches) {
             let Some(t) = ink.text_box(t).or_else(|| ink.tighten(t)) else { continue };
+            if ink.glyphs(t, MIN_GLYPHS) < MIN_GLYPHS {
+                blank.push(t);
+                continue;
+            }
             crops.push(crop_of(ink, p, CropKind::Form, t, None));
         }
     }
     reading_order(&mut crops);
-    PagePlan { width: ink.width, height: ink.height, crops, dropped: Vec::new(), unfiltered: true }
+    PagePlan { width: ink.width, height: ink.height, crops, dropped: Vec::new(), blank, unfiltered: true }
 }
 
 /// 페이지 한 장의 크롭을 정합니다.
 pub fn plan_page(ink: &InkPage, s: &Scores, p: &PlanParams) -> PagePlan {
     let mut crops = Vec::new();
     let mut dropped = Vec::new();
+    let mut blank = Vec::new();
     let mut title: Option<(usize, f32)> = None;
     let contest = p.use_arena.then(|| s.compete(ink));
     for run in blocks(ink).into_iter().flat_map(|b| runs(ink, b)) {
@@ -299,8 +312,12 @@ pub fn plan_page(ink: &InkPage, s: &Scores, p: &PlanParams) -> PagePlan {
         }
         let scale = upscale_factor(text_height(ink, bbox), p.text_px, bbox.2 - bbox.0, bbox.3 - bbox.1);
         for t in tiles(ink, bbox, scale, p.max_tile_patches) {
-            // 괘선만 있는 조각은 읽을 글자가 없습니다.
+            // 괘선만 있는 조각은 읽을 글자가 없습니다. 상자 테두리 · 배관 · 점선뿐인 띠도 그렇습니다.
             let Some(t) = ink.text_box(t) else { continue };
+            if ink.glyphs(t, MIN_GLYPHS) < MIN_GLYPHS {
+                blank.push(t);
+                continue;
+            }
             let v = tally(s, ink, t);
             let table_wins = match &contest {
                 Some(a) => {
@@ -324,7 +341,7 @@ pub fn plan_page(ink: &InkPage, s: &Scores, p: &PlanParams) -> PagePlan {
         crops.push(crop_of(ink, p, CropKind::Sign, r, None));
     }
     reading_order(&mut crops);
-    PagePlan { width: ink.width, height: ink.height, crops, dropped, unfiltered: false }
+    PagePlan { width: ink.width, height: ink.height, crops, dropped, blank, unfiltered: false }
 }
 
 #[cfg(test)]

@@ -325,6 +325,9 @@ fn classify(text: &str) -> DocKind {
         } else {
             DocKind::Redline
         }
+    } else if !moc_runs(text).is_empty() && arrow_pair(text).is_some() {
+        // 표제란이 없는 조각만 읽었어도(A0 타일 · 바뀐 곳만 읽은 델타) 변경번호와 변경 수치가 함께 있으면 Red-line 입니다.
+        DocKind::Redline
     } else {
         DocKind::Unknown
     }
@@ -628,8 +631,16 @@ fn redline(db: &Lattice, page: &PageText, out: &mut Extracted) {
     if let Some(m) = ledger {
         out.unit = Some(m.unit.clone());
     }
-    // 서명자: 수기 메모 끝의 이름
-    let name = text.lines().rev().filter_map(hangul_name).find(|n| db.person_named(n).is_some());
+    // 서명자: 수기 메모 끝의 이름. 손글씨라 한 글자가 다르게 읽히면, 날짜가 함께 적힌 서명 줄(`2026-11-04 김태현`)에서만
+    // 원장에 한 명뿐인 비슷한 이름으로 고치고 교정 기록에 남깁니다.
+    let mut name = text.lines().rev().filter_map(hangul_name).find(|n| db.person_named(n).is_some());
+    if name.is_none() {
+        let dated = |l: &&str| l.split(|c: char| !c.is_ascii_digit() && c != '-').any(|w| w.len() == 10 && w.matches('-').count() == 2);
+        if let Some((raw, p)) = text.lines().rev().filter(dated).filter_map(hangul_name).find_map(|n| db.person_one_off(&n).map(|p| (n, p))) {
+            out.corrections.push(Correction { field: "서명자 이름".into(), distance: 1, raw, fixed: p.name.clone() });
+            name = Some(p.name.clone());
+        }
+    }
     resolve_worker(db, name, None, out);
 }
 
@@ -727,6 +738,26 @@ mod tests {
     }
 
     #[test]
+    fn a_signer_name_misread_by_one_letter_is_fixed_only_on_the_dated_line() {
+        let note = |last: &str| {
+            page(
+                vec![
+                    PageCrop { title: true, ..crop("도면번호: PID-103-LAB (Rev.3)", 0.99) },
+                    crop(&format!("MOC-2026-1104\n10LAB10AP001 토출압력 경보\n29.0 MPa → 31.0 MPa\n{last}"), 0.92),
+                ],
+                true,
+            )
+        };
+        let x = extract(&note("2026-11-04 김래현"), &db());
+        assert_eq!(x.worker_id.as_deref(), Some("E102"));
+        assert!(x.corrections.iter().any(|c| c.field == "서명자 이름" && c.raw == "김래현" && c.fixed == "김태현"), "{:?}", x.corrections);
+        // 날짜가 없는 줄의 비슷한 낱말은 이름으로 고치지 않습니다.
+        let x = extract(&note("김래현"), &db());
+        assert_eq!(x.worker_id, None);
+        assert!(x.uncertain.iter().any(|u| u.contains("점검자")), "{:?}", x.uncertain);
+    }
+
+    #[test]
     fn the_title_block_wins_over_jump_boxes_that_name_other_drawings() {
         // 실측: PID-102 를 읽었는데 점프 상자의 `PID-101-HAD → 인입` 이 먼저 나와 101 로 읽혔습니다.
         let p = page(vec![crop("PID-101-HAD → 인입\n101동 최종과열기 (주증기)", 0.95), PageCrop { title: true, ..crop("도면번호: PID-102-MAA (Rev.4) | 주증기 터빈 및 발전기 계통도", 0.99) }], false);
@@ -767,5 +798,7 @@ mod tests {
         assert_eq!(arrow_pair("103동 2F → PID-101-HAD"), None);
         assert_eq!(moc_runs("변경번호 : MOC - 2026 - 1104"), vec!["MOC-2026-1104".to_string()]);
         assert_eq!(classify("어떤 글"), DocKind::Unknown);
+        assert_eq!(classify("MOC-2026-1104\n29.0 MPa → 31.0 MPa"), DocKind::Redline, "표제란 없이 읽은 Red-line 메모");
+        assert_eq!(classify("MOC-2026-1104 참조"), DocKind::Unknown, "변경 수치가 없으면 Red-line 으로 보지 않음");
     }
 }

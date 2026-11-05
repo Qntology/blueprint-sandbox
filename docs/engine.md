@@ -48,13 +48,18 @@ cargo run -p blueprint-models -- download zoro
 
 | 단계 | 모델 | 무엇을 | 코드 |
 | --- | --- | --- | --- |
-| Stage 1 | SigLIP2 비전 타워 + 크롭 앵커 | 현장 스캔 · 도면에서 제목 · 입력란 · 표 · 서명만 고르고 안내문(범례)을 버림 | `ai::document`, `ai::siglip2::plan` |
+| Stage 1 | SigLIP2 비전 타워 + 크롭 앵커 | 현장 스캔 · 도면에서 제목 · 입력란 · 표 · 서명만 고르고 안내문(범례)을 버림. 글자 모양 덩어리가 둘 미만인 띠(상자 테두리 · 배관뿐)는 읽지 않음 | `ai::document`, `ai::siglip2::plan` · `ink::glyphs` |
+| Stage 1 (Red-line · A0 재스캔) | SigLIP2 특징 격자(이미 뽑은 것) + 잉크 | 어느 마스터 도면인지(패치 코사인) 가리고, 마스터와 잉크가 달라진 곳에 걸친 조각만 그 둘레로 좁혀 읽음. 표제란 · 서명은 늘 읽음 | `ai::siglip2::delta`, `DocumentReader::read_pages_delta` |
 | Stage 2 | gocr 비전 → 언어 | 고른 조각의 글자 (KKS · 수치 · MOC 번호 · 서명자) | `ai::gocr`, `extract.rs` |
 | Stage 4 | Zoro-1 백본 + `jev_head` (0-Generation 포인터) | 원인 판정 선택지 확률, SDS 축별 질문 | `ai::pointer`, `verdict::judge_by_axes`, `gate3_substantive.rs` |
 | Stage 5 | Zoro-1 백본 + 임베딩 표 (글쓰기) | AOP 원인 진단 요약 | `drafting::draft_aop` |
 | 현장 소명 | Zoro-1 글쓰기 | 자유 서술 편차 소명을 표준 코드로 | `drafting::normalize_excuse` |
 
 `SharedResidency` 규칙은 그대로입니다: GPU 에는 한 번에 한 모델, 모델 안에서도 지금 단계의 묶음만 올라갑니다. 현장 스캔이 없는 신호 알람은 SigLIP2 · gocr 를 올리지 않고 바로 Zoro-1 로 갑니다 (Stage 1 · 2 `건너뜀`).
+
+예외 하나를 켤 수 있습니다: `BLUEPRINT_COEXIST=siglip2` 이면 SigLIP2 비전 타워(약 0.8 GB)를 모델이 바뀌어도 남겨 둡니다. 다음 단계를 올리고도 여유분 640 MB + 공존 여유 512 MB(`BLUEPRINT_COEXIST_MARGIN_MB`)가 남을 때만 남기고, 모자라면 다음 단계를 올리기 **전에** 내립니다. 실측 이득이 스캔 한 번에 0.3 초 남짓이라 기본은 꺼짐입니다 ([verification.md](verification.md) 8.2).
+
+앱은 엔진(세션 · 감사 기록)을 잠그는 시간과 GPU 를 쓰는 시간을 나눕니다 (`state_machine::staged`): 준비(엔진 잠금) → 모델(GPU 잠금만) → 반영(엔진 잠금). 모델이 도는 동안에도 콘솔의 조회 · 결정이 멈추지 않습니다. GPU 잠금은 모델 계산 전체를 덮습니다 (상주 관리자는 쓰는 중인 묶음을 내리지 못하므로).
 
 ## 4. 판단 프롬프트
 
