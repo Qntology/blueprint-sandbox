@@ -1,4 +1,6 @@
 import { useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
+import { shortTag } from "../domain";
 import type { Context } from "../PlantTopologyView";
 import { equipmentLevel, fmt, hopDepths, MEDIUM_COLOR, sdsStateAt, sensorsOf, signedSecs, valueAt, type Level } from "../plant";
 
@@ -67,13 +69,20 @@ function drawLabels(g: CanvasRenderingContext2D, labels: Label[], obstacles: Rec
   }
 }
 
-/** 뷰 ③: 옵시디언 스타일 마인드맵 (힘 기반 그래프). 누르면 그 설비가 중심(Depth 0)이 되고 ±1 홉만 밝게 남습니다. */
+/** 뷰 ③: 옵시디언 스타일 마인드맵 (힘 기반 그래프). 누르면 그 설비가 중심(Depth 0)이 되고 ±1 홉만 밝게 남습니다.
+ *  2차 개선안: 캔버스가 무대 전체를 쓰고, 그래프 중심은 결재 HUD 를 뺀 빈 자리 가운데로 옮겨 갑니다 (noto-sandbox `.stage.has-unit`).
+ *  변곡을 지난 노드 옆에는 유리 핀(`t=0 발원` · `Δt +4.3s` · 지금 값)이 붙고, CCTV 말풍선은 노드 좌표에서 지시선을 긋습니다. */
 export function MindMapView({ ctx }: { ctx: Context }) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const nodes = useRef<Node[]>([]);
   const live = useRef(ctx);
   live.current = ctx;
   const drag = useRef<{ kks: string; moved: boolean } | null>(null);
+  /** 화면 좌표의 그래프 중심 (빈 자리 가운데로 부드럽게 옮겨 갑니다) */
+  const centerAt = useRef<{ x: number; y: number } | null>(null);
+  /** 노드의 무대 좌표 · 반지름 (말풍선 · 핀 자리) */
+  const screen = useRef(new Map<string, { x: number; y: number; r: number }>());
+  const pins = useRef(new Map<string, HTMLElement>());
 
   // 처음 자리: 섹터마다 원 둘레의 한쪽에 모읍니다.
   useEffect(() => {
@@ -84,6 +93,20 @@ export function MindMapView({ ctx }: { ctx: Context }) {
       return { kks: e.kks, x: Math.cos(a) * 260 + ((i * 37) % 60) - 30, y: Math.sin(a) * 200 + ((i * 53) % 60) - 30, vx: 0, vy: 0 };
     });
   }, [ctx.plant]);
+
+  // 말풍선 자리 찾기를 캔버스 노드 좌표로 바꿉니다 (캔버스는 무대 왼쪽 위에 붙어 있어 캔버스 좌표 = 무대 좌표)
+  useEffect(() => {
+    ctx.setLocator({
+      find(kks) {
+        const p = screen.current.get(kks);
+        return p ? { x: p.x - p.r, y: p.y - p.r, w: p.r * 2, h: p.r * 2 } : null;
+      },
+      others() {
+        return [...screen.current.values()].map((p) => ({ x: p.x - p.r, y: p.y - p.r, w: p.r * 2, h: p.r * 2 }));
+      },
+    });
+    return () => ctx.setLocator(null);
+  }, [ctx.setLocator]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const el = canvas.current!;
@@ -109,6 +132,11 @@ export function MindMapView({ ctx }: { ctx: Context }) {
       const ns = nodes.current;
       const byKks = new Map(ns.map((n) => [n.kks, n]));
       const depths = c.selected ? hopDepths(c.plant.edges, c.selected, 3) : new Map<string, number>();
+      // 빈 자리(결재 HUD · 코너 알약을 뺀 곳)의 가운데. HUD 를 접고 펴면 천천히 따라갑니다.
+      const want = { x: c.inset.left + (w - c.inset.left - c.inset.right) / 2, y: c.inset.top + (h - c.inset.top - c.inset.bottom) / 2 };
+      const cur = centerAt.current ?? want;
+      centerAt.current = { x: cur.x + (want.x - cur.x) * 0.15, y: cur.y + (want.y - cur.y) * 0.15 };
+      const { x: ox, y: oy } = centerAt.current;
 
       // 힘: 반발 · 간선 탄성 · 중심 · 선택 설비를 가운데로
       for (const a of ns) {
@@ -150,7 +178,7 @@ export function MindMapView({ ctx }: { ctx: Context }) {
       g.fillStyle = "#161922";
       g.fillRect(0, 0, w, h);
       g.save();
-      g.translate(w / 2, h / 2);
+      g.translate(ox, oy);
       const bright = (k: string) => !c.selected || (depths.has(k) && Math.abs(depths.get(k)!) <= 1);
       const near = (k: string) => depths.has(k) && Math.abs(depths.get(k)!) <= 2;
       const phase = (now - started) / 1000;
@@ -209,6 +237,7 @@ export function MindMapView({ ctx }: { ctx: Context }) {
         const lit = c.departures.has(n.kks) && c.departures.get(n.kks)! <= c.t;
         let r = center ? 20 : 12;
         if (c.mining && isRoot) r *= 2;
+        screen.current.set(n.kks, { x: ox + n.x, y: oy + n.y, r: center ? r + 18 : r });
         g.globalAlpha = bright(n.kks) ? 1 : near(n.kks) ? 0.45 : 0.18;
         if (c.mining && isRoot) {
           const ripple = (phase % 1.6) / 1.6;
@@ -219,7 +248,10 @@ export function MindMapView({ ctx }: { ctx: Context }) {
           g.stroke();
         }
         // 개선안 2-3: SDS 변곡 링. 재생 시각이 그 설비의 첫 변곡을 지나면 켜집니다 (발원지는 적색 이중 링, 파급은 황색 링).
+        // 시차 글은 캔버스가 아니라 노드 옆 유리 핀(.mm-pin)에 씁니다.
         const dep = c.departures.get(n.kks);
+        const pin = pins.current.get(n.kks);
+        if (pin) pin.style.transform = `translate(${Math.round(ox + n.x)}px, ${Math.round(oy + n.y - r - 12)}px) translate(-50%, -100%)`;
         if (dep !== undefined && dep <= c.t) {
           const rings = isRoot ? [r + 6, r + 11] : [r + 6];
           for (const rad of rings) {
@@ -229,11 +261,6 @@ export function MindMapView({ ctx }: { ctx: Context }) {
             g.lineWidth = 2.5;
             g.stroke();
           }
-          g.fillStyle = isRoot ? "#ff9d9d" : "#ffe08a";
-          g.font = "bold 11px Malgun Gothic, sans-serif";
-          g.textAlign = "center";
-          g.fillText(isRoot ? "t=0 발원" : `Δt ${signedSecs(dep, c.origin)}`, n.x, n.y - r - 14);
-          g.textAlign = "left";
         }
         if (center) {
           for (const [rad, a] of [
@@ -274,14 +301,12 @@ export function MindMapView({ ctx }: { ctx: Context }) {
           rank: center ? 0 : isRoot ? 1 : isAlarm ? 2 : bright(n.kks) ? 3 : 4,
         });
         if (center || (c.mining && isRoot)) obstacles.push([n.x - r, n.y - r, n.x + r, n.y + r]);
+        // 유리 핀 자리는 이름표가 비켜 갑니다
+        if (pin) obstacles.push([n.x - pin.offsetWidth / 2, n.y - r - 12 - pin.offsetHeight, n.x + pin.offsetWidth / 2, n.y - r - 12]);
       }
       drawLabels(g, labels, obstacles);
       g.restore();
       g.globalAlpha = 1;
-      g.fillStyle = "#8b96ad";
-      g.font = "12px Malgun Gothic, sans-serif";
-      g.textAlign = "left";
-      g.fillText("(◎) 선택 중심 Depth 0   (○) 1홉 ±1   (.) 2홉 이상 흐림   🔴 이중 링 최초 변곡 발원지(t=0)   🟡 링 시차 매칭 파급   🔥 근본원인   ⚠️ 경보   드래그로 이동", 14, h - 14);
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
@@ -293,39 +318,72 @@ export function MindMapView({ ctx }: { ctx: Context }) {
 
   const hit = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
-    const x = e.clientX - r.left - r.width / 2;
-    const y = e.clientY - r.top - r.height / 2;
+    const o = centerAt.current ?? { x: r.width / 2, y: r.height / 2 };
+    const x = e.clientX - r.left - o.x;
+    const y = e.clientY - r.top - o.y;
     return { x, y, node: nodes.current.find((n) => Math.hypot(n.x - x, n.y - y) < 22) };
   };
 
+  // 변곡을 지난 노드의 유리 핀: 발원은 t=0, 파급은 Δt, 그리고 재생 시각의 대표 계측값
+  const departed = [...ctx.departures.entries()].filter(([, at]) => at <= ctx.t);
+  const pinText = (kks: string, at: number) => {
+    const s = ctx.tracks.get(kks)?.[0] ? ctx.plant.sensors.find((x) => x.tag === ctx.tracks.get(kks)![0].tag) : sensorsOf(ctx.plant, kks)[0];
+    const v = s && ctx.detail ? valueAt(ctx.detail.timeline, s.tag, ctx.t) : null;
+    const value = s ? ` · ${shortTag(s.tag)} ${fmt(v)} ${s.unit}` : "";
+    return kks === ctx.rootKks ? `🔴 t=0 발원${value}` : `🟡 Δt ${signedSecs(at, ctx.origin)}${value}`;
+  };
+
   return (
-    <canvas
-      ref={canvas}
-      className="mindmap"
-      onPointerDown={(e) => {
-        const h = hit(e);
-        if (h.node) {
-          e.currentTarget.setPointerCapture(e.pointerId);
-          drag.current = { kks: h.node.kks, moved: false };
-        }
-      }}
-      onPointerMove={(e) => {
-        if (!drag.current) return;
-        const h = hit(e);
-        const n = nodes.current.find((x) => x.kks === drag.current!.kks);
-        if (n) {
-          n.x = h.x;
-          n.y = h.y;
-          n.vx = 0;
-          n.vy = 0;
-          drag.current.moved = true;
-        }
-      }}
-      onPointerUp={() => {
-        if (drag.current && !drag.current.moved) ctx.onSelect(drag.current.kks);
-        else if (drag.current) ctx.onSelect(drag.current.kks);
-        drag.current = null;
-      }}
-    />
+    <>
+      <canvas
+        ref={canvas}
+        className="mindmap"
+        onPointerDown={(e) => {
+          const h = hit(e);
+          if (h.node) {
+            e.currentTarget.setPointerCapture(e.pointerId);
+            drag.current = { kks: h.node.kks, moved: false };
+          }
+        }}
+        onPointerMove={(e) => {
+          if (!drag.current) return;
+          const h = hit(e);
+          const n = nodes.current.find((x) => x.kks === drag.current!.kks);
+          if (n) {
+            n.x = h.x;
+            n.y = h.y;
+            n.vx = 0;
+            n.vy = 0;
+            drag.current.moved = true;
+          }
+        }}
+        onPointerUp={() => {
+          if (drag.current) ctx.onSelect(drag.current.kks);
+          drag.current = null;
+        }}
+      />
+      <div className="mm-pins" aria-hidden="true">
+        {departed.map(([kks, at]) => (
+          <span
+            key={kks}
+            className={`mm-pin ${kks === ctx.rootKks ? "root" : ""}`}
+            ref={(el) => {
+              if (el) pins.current.set(kks, el);
+              else pins.current.delete(kks);
+            }}
+          >
+            {pinText(kks, at)}
+          </span>
+        ))}
+      </div>
+      {ctx.bar &&
+        createPortal(
+          <div className="view-bar ov-bar mm-legend">
+            <span className="bar-label">🕸️ 마인드맵</span>
+            <span>(◎) 선택 중심 Depth 0 · (○) 1홉 ±1 · (.) 2홉 이상 흐림 · 🔴 이중 링 최초 변곡 발원지(t=0) · 🟡 링 시차 매칭 파급 · 🔥 근본원인 · ⚠️ 경보 · 드래그로 이동</span>
+          </div>,
+          ctx.bar,
+        )}
+    </>
   );
 }

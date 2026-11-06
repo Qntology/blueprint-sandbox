@@ -1,12 +1,13 @@
-import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
+import { createPortal } from "react-dom";
+import { fitRect, usePanZoom } from "../cctv/stage";
+import { ZoomCtl } from "../cctv/ZoomCtl";
 import { shortTag, useTerms } from "../domain";
+import { SHEET_PX, useDrawingImage } from "../drawings";
 import type { Context, EdgeLag } from "../PlantTopologyView";
 import { equipmentLevel, fixed, fmt, hopDepths, MEDIUM_COLOR, SDS_COLOR, sdsStateAt, sensorsOf, signedSecs, valueAt } from "../plant";
 import type { Timeline } from "../types";
 import { A0View } from "./A0View";
-
-const images = new Map<string, string>();
 
 type Box = [number, number, number, number];
 
@@ -50,34 +51,16 @@ function midpoint(points: [number, number][]): [number, number] {
   return points[0];
 }
 
-/** 뷰 ①: P&ID 도면 오버레이 캔버스. 설비 상자를 누르면 선택, 가장자리 점프 커넥터(OPC)를 누르면 연결된 도면으로 넘어갑니다. */
+/** 뷰 ①: P&ID 도면 오버레이 캔버스 (2차 개선안: 무대 전체에 깔린 배경 월드).
+ *  도면은 결재 HUD 를 뺀 빈 자리에 비율을 지켜 맞추고, 휠로 확대 · 끌어서 이동합니다. 설비 상자를 누르면 선택,
+ *  가장자리 점프 커넥터(OPC)를 누르면 연결된 도면으로 넘어갑니다. 도면 고르기는 좌상단 도구줄에 있습니다. */
 export function DrawingView({ ctx }: { ctx: Context }) {
   const terms = useTerms();
-  const { plant, detail, selected, onSelect, mining, t } = ctx;
-  const initial = plant.equipment.find((e) => e.kks === selected)?.drawing ?? plant.drawings[0].id;
-  const [drawing, setDrawing] = useState(initial);
-  const [src, setSrc] = useState<string | null>(images.get(initial) ?? null);
-
-  // 다른 뷰에서 다른 도면의 설비를 고르면 그 도면으로 넘어갑니다.
-  useEffect(() => {
-    const d = plant.equipment.find((e) => e.kks === selected)?.drawing;
-    // A0 종합 뷰에서는 설비를 골라도 마스터 도면으로 넘어가지 않습니다.
-    if (d && d !== drawing && !drawing.startsWith("A0:")) setDrawing(d);
-  }, [selected, plant]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    if (drawing.startsWith("A0:")) return;
-    const cached = images.get(drawing);
-    if (cached) {
-      setSrc(cached);
-      return;
-    }
-    setSrc(null);
-    invoke<string>("drawing_image", { id: drawing }).then((url) => {
-      images.set(drawing, url);
-      setSrc(url);
-    });
-  }, [drawing]);
+  const { plant, detail, selected, onSelect, mining, t, drawing, setDrawing } = ctx;
+  const a0 = drawing.startsWith("A0:") ? plant.a0.find((a) => `A0:${a.id}` === drawing) : undefined;
+  const src = useDrawingImage(a0 || drawing.startsWith("A0:") ? null : drawing);
+  const fit = fitRect(ctx.stage, ctx.inset, SHEET_PX[0] / SHEET_PX[1]);
+  const pz = usePanZoom(fit, drawing);
 
   const tl = detail?.timeline ?? null;
   const info = plant.drawings.find((d) => d.id === drawing);
@@ -97,137 +80,168 @@ export function DrawingView({ ctx }: { ctx: Context }) {
   const sparkFrom = ctx.origin - 10_000;
   const sparkTo = Math.max(detail?.timeline.now_ms ?? 0, ctx.origin + 15_000);
 
+  const bar = ctx.bar
+    ? createPortal(
+        <div className="view-bar ov-bar">
+          <span className="bar-label">🗺️ {terms.drawing}</span>
+          {plant.drawings.map((d) => {
+            const sector = plant.sectors.find((s) => s.key === d.sector);
+            return (
+              <button key={d.id} className={d.id === drawing ? "chip active" : "chip"} onClick={() => setDrawing(d.id)} title={`${d.id} (${d.rev}) · ${d.title} · ${sector?.building ?? ""}`}>
+                {d.id === drawing ? "● " : ""}
+                {d.id} · {sector?.building}
+              </button>
+            );
+          })}
+          {plant.a0.map((a) => (
+            <button key={a.id} className={drawing === `A0:${a.id}` ? "chip active a0-chip" : "chip a0-chip"} onClick={() => setDrawing(`A0:${a.id}`)}>
+              {drawing === `A0:${a.id}` ? "● " : ""}A0 종합 · {a.grid.rows}×{a.grid.cols}
+            </button>
+          ))}
+          <label className="chip dark-toggle" title="도면을 관제실 톤으로 뒤집어 그립니다 (설비 상태 색은 그대로)">
+            <input type="checkbox" checked={ctx.dark} onChange={(e) => ctx.onDark(e.target.checked)} />
+            🌓 어둡게
+          </label>
+          {info && !a0 && (
+            <span className="bar-note" title={`[표제란] ${terms.drawing} 도면번호 ${info.id} (${info.rev}) · ${info.title} · 발행 ${info.issued}`}>
+              {info.rev} · {info.title}
+            </span>
+          )}
+        </div>,
+        ctx.bar,
+      )
+    : null;
+
+  if (a0) {
+    return (
+      <>
+        {bar}
+        <A0View ctx={ctx} a0={a0} />
+      </>
+    );
+  }
+
   return (
-    <div className="drawing-view">
-      <div className="drawing-select">
-        <span className="muted">도면 선택</span>
-        {plant.drawings.map((d) => {
-          const sector = plant.sectors.find((s) => s.key === d.sector);
-          return (
-            <button key={d.id} className={d.id === drawing ? "chip active" : "chip"} onClick={() => setDrawing(d.id)}>
-              {d.id === drawing ? "● " : "○ "}
-              {d.id} · {sector?.building}
-            </button>
-          );
-        })}
-        {plant.a0.map((a) => (
-          <button key={a.id} className={drawing === `A0:${a.id}` ? "chip active a0-chip" : "chip a0-chip"} onClick={() => setDrawing(`A0:${a.id}`)}>
-            {drawing === `A0:${a.id}` ? "● " : "○ "}A0 종합 · {a.grid.rows}×{a.grid.cols} 타일
-          </button>
-        ))}
-      </div>
-      {drawing.startsWith("A0:") && plant.a0.some((a) => `A0:${a.id}` === drawing) ? (
-        <A0View ctx={ctx} a0={plant.a0.find((a) => `A0:${a.id}` === drawing)!} />
-      ) : (
-        <>
-      <div className="drawing-title">
-        [표제란] {terms.drawing} 도면번호 <b>{info?.id}</b> ({info?.rev}) · {info?.title} · 발행 {info?.issued}
-      </div>
-      <div className="sheet">
-        {src ? <img src={src} alt={drawing} draggable={false} /> : <div className="sheet-loading">도면을 불러오는 중</div>}
-        {mining && (
-          <svg className="pipes" viewBox="0 0 1 1" preserveAspectRatio="none">
-            {ctx.flows
-              .filter((f) => pipes.has(`${f.from}>${f.to}`))
-              .map((f) => {
-                const pts = pipes.get(`${f.from}>${f.to}`)!;
-                const color = f.bottleneck ? "#ff4d4f" : f.on_path ? "#f0a020" : MEDIUM_COLOR[f.medium] ?? "#2fb4c9";
-                return (
-                  <polyline
-                    key={`${f.from}-${f.to}`}
-                    points={pts.map((p) => p.join(",")).join(" ")}
-                    className={f.bottleneck ? "flow starve" : "flow"}
-                    style={{ stroke: color, strokeWidth: (f.bottleneck ? 0.004 : 0.006) * Math.max(0.4, Math.min(1.4, f.ratio)) }}
-                  />
-                );
-              })}
-          </svg>
-        )}
-        {lagLabels.map((l) => (
-          <span key={l.key} className={`lag-label ${l.ok ? "ok" : "bad"}`} style={{ left: `${l.at[0] * 100}%`, top: `${l.at[1] * 100}%` }}>
-            ⏱️ Δt {l.lag >= 0 ? "+" : ""}
-            {l.lag.toFixed(1)}s{l.hops > 1 ? ` · ${l.hops}홉` : ""} (허용 {fmt(l.range[0])}~{fmt(l.range[1])}s {l.ok ? "✓" : "✗"})
-          </span>
-        ))}
-        {onSheet.map((e) => {
-          const lv = tl ? equipmentLevel(plant, e.kks, tl, t) : "normal";
-          const depth = depths.get(e.kks);
-          const track = ctx.tracks.get(e.kks)?.[0];
-          const sds = track ? sdsStateAt(track.transitions, t) : null;
-          const metric = track ? ctx.metrics.get(track.tag) : undefined;
-          const lit = ctx.departures.has(e.kks) && ctx.departures.get(e.kks)! <= t;
-          const roles = [e.kks === ctx.rootKks ? "root" : "", e.kks === ctx.alarmKks ? "alarm" : "", ctx.path.includes(e.kks) ? "path" : ""].join(" ");
-          const flow = ctx.flows.find((f) => f.from === e.kks && f.bottleneck);
-          return (
-            <button key={e.kks} className={`eq-box lv-${lv} ${roles} ${e.kks === selected ? "selected" : ""} ${lit ? "lit" : ""}`} style={pct(e.bbox as Box)} onClick={() => onSelect(e.kks)} title={`${e.name} · ${e.place}`}>
-              {depth !== undefined && <span className="depth">D {depth > 0 ? `+${depth}` : depth}</span>}
-              {track && sds && (
-                <span className={`sds-chip ${(e.bbox as Box)[0] > 0.55 ? "flip" : ""}`} style={{ borderColor: SDS_COLOR[sds] ?? "#59606e" }} title={`${track.tag} SDS 상태 전이: ${track.transitions.map(([, c]) => c).join(" → ")}`}>
-                  <b style={{ color: SDS_COLOR[sds] }}>{sds}</b>
-                  {metric && (
-                    <i>
-                      {" "}
-                      {shortTag(track.tag)} {fixed(metric.slope_per_sec_milli / 1000, 2)}/s
-                    </i>
-                  )}
-                  {tl && <Spark tl={tl} tag={track.tag} from={sparkFrom} to={sparkTo} t={t} color={SDS_COLOR[sds] ?? "#4fd1c5"} />}
+    <>
+      {bar}
+      <div className="sheet-viewport" ref={pz.bind}>
+        <div className={`sheet ${ctx.dark ? "dark" : ""}`} style={pz.style}>
+          {src ? <img src={src} alt={drawing} draggable={false} /> : <div className="sheet-loading">도면을 불러오는 중</div>}
+          {mining && (
+            <svg className="pipes" viewBox="0 0 1 1" preserveAspectRatio="none">
+              {ctx.flows
+                .filter((f) => pipes.has(`${f.from}>${f.to}`))
+                .map((f) => {
+                  const pts = pipes.get(`${f.from}>${f.to}`)!;
+                  const color = f.bottleneck ? "#ff4d4f" : f.on_path ? "#f0a020" : MEDIUM_COLOR[f.medium] ?? "#2fb4c9";
+                  return (
+                    <polyline
+                      key={`${f.from}-${f.to}`}
+                      points={pts.map((p) => p.join(",")).join(" ")}
+                      className={f.bottleneck ? "flow starve" : "flow"}
+                      style={{ stroke: color, strokeWidth: (f.bottleneck ? 0.004 : 0.006) * Math.max(0.4, Math.min(1.4, f.ratio)) }}
+                    />
+                  );
+                })}
+            </svg>
+          )}
+          {lagLabels.map((l) => (
+            <span key={l.key} className={`lag-label ${l.ok ? "ok" : "bad"}`} style={{ left: `${l.at[0] * 100}%`, top: `${l.at[1] * 100}%` }}>
+              ⏱️ Δt {l.lag >= 0 ? "+" : ""}
+              {l.lag.toFixed(1)}s{l.hops > 1 ? ` · ${l.hops}홉` : ""} (허용 {fmt(l.range[0])}~{fmt(l.range[1])}s {l.ok ? "✓" : "✗"})
+            </span>
+          ))}
+          {onSheet.map((e) => {
+            const lv = tl ? equipmentLevel(plant, e.kks, tl, t) : "normal";
+            const depth = depths.get(e.kks);
+            const track = ctx.tracks.get(e.kks)?.[0];
+            const sds = track ? sdsStateAt(track.transitions, t) : null;
+            const metric = track ? ctx.metrics.get(track.tag) : undefined;
+            const lit = ctx.departures.has(e.kks) && ctx.departures.get(e.kks)! <= t;
+            const roles = [e.kks === ctx.rootKks ? "root" : "", e.kks === ctx.alarmKks ? "alarm" : "", ctx.path.includes(e.kks) ? "path" : ""].join(" ");
+            const flow = ctx.flows.find((f) => f.from === e.kks && f.bottleneck);
+            const mark = ctx.marks.get(e.kks);
+            return (
+              <button
+                key={e.kks}
+                data-kks={e.kks}
+                className={`eq-box lv-${lv} ${roles} ${e.kks === selected ? "selected" : ""} ${lit ? "lit" : ""} ${mark ? `hit hit-${mark.rank}` : ""}`}
+                style={pct(e.bbox as Box)}
+                onClick={() => onSelect(e.kks)}
+                title={`${e.name} · ${e.place}`}
+              >
+                {depth !== undefined && <span className="depth">D {depth > 0 ? `+${depth}` : depth}</span>}
+                {mark && <span className="hit-badge">#{mark.rank}</span>}
+                {/* CCTV 말풍선이 붙은 설비는 말풍선이 같은 내용을 크게 보이므로 작은 칩은 다른 설비에만 */}
+                {track && sds && !ctx.carded.has(e.kks) && (
+                  <span className={`sds-chip ${(e.bbox as Box)[0] > 0.55 ? "flip" : ""}`} style={{ borderColor: SDS_COLOR[sds] ?? "#59606e" }} title={`${track.tag} SDS 상태 전이: ${track.transitions.map(([, c]) => c).join(" → ")}`}>
+                    <b style={{ color: SDS_COLOR[sds] }}>{sds}</b>
+                    {metric && (
+                      <i>
+                        {" "}
+                        {shortTag(track.tag)} {fixed(metric.slope_per_sec_milli / 1000, 2)}/s
+                      </i>
+                    )}
+                    {tl && <Spark tl={tl} tag={track.tag} from={sparkFrom} to={sparkTo} t={t} color={SDS_COLOR[sds] ?? "#4fd1c5"} />}
+                  </span>
+                )}
+                {e.kks === ctx.rootKks && <span className="badge root">🔥 근본원인</span>}
+                {e.kks === ctx.alarmKks && <span className="badge alarm">⚠️ 경보</span>}
+                <span className="eq-values">
+                  {sensorsOf(plant, e.kks)
+                    .slice(0, 2)
+                    .map((s) => (
+                      <i key={s.tag}>
+                        {shortTag(s.tag)} {fmt(tl ? valueAt(tl, s.tag, t) : s.normal)} {s.unit}
+                      </i>
+                    ))}
                 </span>
-              )}
-              {e.kks === ctx.rootKks && <span className="badge root">🔥 근본원인</span>}
-              {e.kks === ctx.alarmKks && <span className="badge alarm">⚠️ 경보</span>}
-              <span className="eq-values">
-                {sensorsOf(plant, e.kks)
-                  .slice(0, 2)
-                  .map((s) => (
-                    <i key={s.tag}>
-                      {shortTag(s.tag)} {fmt(tl ? valueAt(tl, s.tag, t) : s.normal)} {s.unit}
-                    </i>
-                  ))}
-              </span>
-              {mining && flow && (
-                <span className="pin">
-                  🚨 {flow.label} {((flow.ratio - 1) * 100).toFixed(1)}%{flow.lag_secs !== null ? ` · Δt +${flow.lag_secs.toFixed(1)}s` : ""}
+                {mining && flow && (
+                  <span className="pin">
+                    🚨 {flow.label} {((flow.ratio - 1) * 100).toFixed(1)}%{flow.lag_secs !== null ? ` · Δt +${flow.lag_secs.toFixed(1)}s` : ""}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+          {opcs.map((c) => {
+            const out = c.from_drawing === drawing;
+            const box = (out ? c.out_bbox : c.in_bbox) as Box;
+            const target = out ? c.to_drawing : c.from_drawing;
+            const other = plant.equipment.find((e) => e.kks === (out ? c.to : c.from));
+            const lag = ctx.edgeLags.get(`${c.from}>${c.to}`);
+            const arrive = ctx.departures.get(c.to);
+            return (
+              <button
+                key={c.id + (out ? "o" : "i")}
+                className={`opc ${ctx.path.includes(c.from) && ctx.path.includes(c.to) ? "path" : ""}`}
+                style={pct(box)}
+                data-drawing={target}
+                data-other={other?.kks}
+                title={`${c.id} · ${c.label} · 누르면 ${target} 로 이동`}
+                aria-label={out ? `점프 ${target}` : `${target} 인입`}
+                onClick={() => {
+                  setDrawing(target);
+                  if (other) onSelect(other.kks);
+                }}
+              >
+                <span className="opc-icon">
+                  {out ? "⤴" : "⤵"}
+                  {lag && ` ${c.id}`}
                 </span>
-              )}
-            </button>
-          );
-        })}
-        {opcs.map((c) => {
-          const out = c.from_drawing === drawing;
-          const box = (out ? c.out_bbox : c.in_bbox) as Box;
-          const target = out ? c.to_drawing : c.from_drawing;
-          const other = plant.equipment.find((e) => e.kks === (out ? c.to : c.from));
-          const lag = ctx.edgeLags.get(`${c.from}>${c.to}`);
-          const arrive = ctx.departures.get(c.to);
-          return (
-            <button
-              key={c.id + (out ? "o" : "i")}
-              className={`opc ${ctx.path.includes(c.from) && ctx.path.includes(c.to) ? "path" : ""}`}
-              style={pct(box)}
-              title={`${c.id} · ${c.label} · 누르면 ${target} 로 이동`}
-              aria-label={out ? `점프 ${target}` : `${target} 인입`}
-              onClick={() => {
-                setDrawing(target);
-                if (other) onSelect(other.kks);
-              }}
-            >
-              <span className="opc-icon">
-                {out ? "⤴" : "⤵"}
-                {lag && ` ${c.id}`}
-              </span>
-              {lag && (
-                <span className="opc-osd">
-                  {out ? "하류" : "상류"} 전파 Δt {lag.lag >= 0 ? "+" : ""}
-                  {lag.lag.toFixed(1)}s {lag.ok ? "✓" : "✗"}
-                  {arrive !== undefined ? ` · 도착 ${signedSecs(arrive, ctx.origin)}` : ""}
-                </span>
-              )}
-            </button>
-          );
-        })}
+                {lag && (
+                  <span className="opc-osd">
+                    {out ? "하류" : "상류"} 전파 Δt {lag.lag >= 0 ? "+" : ""}
+                    {lag.lag.toFixed(1)}s {lag.ok ? "✓" : "✗"}
+                    {arrive !== undefined ? ` · 도착 ${signedSecs(arrive, ctx.origin)}` : ""}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
       </div>
-        </>
-      )}
-    </div>
+      <ZoomCtl scale={pz.view.s} onZoom={(f) => pz.zoomAt(f)} onReset={pz.reset} />
+    </>
   );
 }

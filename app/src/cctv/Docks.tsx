@@ -2,46 +2,20 @@ import { useMemo } from "react";
 import { shortTag, useTerms } from "../domain";
 import { clock, fixed, fmt, SDS_COLOR, sdsStateAt, signedSecs } from "../plant";
 import type { Detail, Plant } from "../types";
-import { WaveChart, type Trace } from "../WaveChart";
+import { WaveChart } from "../WaveChart";
 import { CamPanel } from "./CamPanel";
+import { causalTraces, originOf } from "./traces";
 
-/** 사건의 t = 0 (근본 원인 변곡, 없으면 첫 변곡 · SDS 중심) */
-export function originOf(detail: Detail): number {
-  return detail.analysis.substantive?.causal?.root?.at_ms ?? detail.analysis.chain[0]?.at_ms ?? detail.analysis.sds.center_ms;
-}
-
-const CHANNEL_COLORS = ["#ff6b3d", "#4fd1c5", "#7aa2ff"];
+export { originOf };
 
 /** 개선안 Part 3 좌측: 상류(역류) → 원인(D 0) → 하류(경보) 파형을 한 시간축에 겹쳐 그리고, 60초 링버퍼 지표(변곡 · 기울기 · 가속도 · TTF)를 붙입니다.
- *  하단 타임 스크러버의 시각 t 가 커서로 따라옵니다. */
+ *  하단 타임 스크러버의 시각 t 가 커서로 따라옵니다. 2차 개선안부터는 하단 허브의 [📈 차트] Drop-up 안에 있습니다. */
 export function TimeSeriesDock({ detail, plant, t }: { detail: Detail; plant: Plant; t: number }) {
   const terms = useTerms();
   const a = detail.analysis;
   const root = a.substantive?.causal?.root ?? null;
   const origin = originOf(detail);
-  const traces = useMemo<Trace[]>(() => {
-    const out: Trace[] = [];
-    const label = (tag: string) => {
-      const s = plant.sensors.find((x) => x.tag === tag);
-      const e = plant.equipment.find((x) => x.kks === s?.kks);
-      return `${e?.name ?? ""} ${s?.label ?? ""} (${shortTag(tag)}, ${s?.unit ?? ""})`;
-    };
-    const add = (tag: string, title: string, color: string, channel?: string) => {
-      if (!out.some((x) => x.tag === tag && x.channel === channel)) out.push({ tag, title, color, channel });
-    };
-    const prop = a.substantive?.causal?.propagation ?? [];
-    // 원인 기준 깊이: 원인보다 상류면 음수 (펌프 역류 여파 = D-1)
-    const depth = (hops: number) => (root ? root.hops - hops : -hops);
-    for (const p of prop.filter((x) => x.backflow)) add(p.upstream_tag, `[D${depth(p.hops)} 역류 여파] ${label(p.upstream_tag)}`, "#7aa2ff");
-    if (root) add(root.tag, `[D 0 근본 원인] ${label(root.tag)}`, "#ff6b3d");
-    for (const p of prop.filter((x) => x.causal_match && !x.backflow && x.upstream_tag !== root?.tag)) add(p.upstream_tag, `[D${depth(p.hops)} 파급] ${label(p.upstream_tag)}`, "#c084fc");
-    if (a.route.tag) {
-      const chs = detail.timeline.channels[a.route.tag];
-      if (chs) Object.keys(chs).forEach((c, i) => add(a.route.tag!, `[채널 ${c}] ${label(a.route.tag!)}`, CHANNEL_COLORS[i % 3], c));
-      else add(a.route.tag, `[${root ? `D+${root.hops}` : "D 0"} 경보] ${label(a.route.tag)}`, "#f6c453");
-    }
-    return out.slice(0, 4);
-  }, [a, detail, plant, root]);
+  const traces = useMemo(() => causalTraces(detail, plant), [detail, plant]);
   const markers = a.chain.map((ev) => ({
     at_ms: ev.at_ms,
     label: `${signedSecs(ev.at_ms, origin)} ${shortTag(ev.tag)} ${ev.kind === "limit" ? "한계" : ev.direction === "Up" ? "↑" : "↓"}`,

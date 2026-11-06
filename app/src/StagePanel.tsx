@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { shortTag, useTerms } from "./domain";
 import type { DrawerKey } from "./OfficerView";
 import { clock, fixed, fmt, mmss, signedSecs, STAGE_LABEL } from "./plant";
@@ -17,17 +17,11 @@ function duration(ms: number): string {
 /** 단계 카드에 붙일 프로세스 마이닝 레인 (개선안 3단계 3번: 단계 바 + 마이닝 레인 두 줄을 한 줄로) */
 const STAGE_LANES: Record<number, string[]> = { 1: ["gate01"], 2: ["gate01"], 3: ["gate2"], 4: ["gate3"], 5: ["gate45", "approval"] };
 
-/** 하단 파이프라인 바 (Stage 1 ~ 5). 카드마다 그 단계 레인의 건수 · 최대 대기를 함께 적습니다. 누르면 단계 상세가 열립니다. */
-export function StageBar({ detail, onOpen, refreshKey }: { detail: Detail | null; onOpen: (k: DrawerKey) => void; refreshKey: number }) {
+/** 파이프라인 줄 (Stage 1 ~ 5). 카드마다 그 단계 레인의 건수 · 최대 대기를 함께 적습니다. 누르면 단계 상세가 열립니다.
+ *  2차 개선안: 하단 허브 맨 윗줄(noto-sandbox 의 퀘스트 줄 자리)에 한 줄로 들어가고, 단계 요약은 마우스를 올리면 보입니다. */
+export function StageBar({ detail, onOpen, lanes, tail }: { detail: Detail | null; onOpen: (k: DrawerKey) => void; lanes: Lane[]; tail?: ReactNode }) {
   const terms = useTerms();
   const stages = detail?.analysis.stages ?? [];
-  const [lanes, setLanes] = useState<Lane[]>([]);
-  useEffect(() => {
-    const load = () => invoke<{ lanes: Lane[] }>("mining_overview").then((m) => setLanes(m.lanes)).catch(() => {});
-    load();
-    const timer = window.setInterval(load, 3000);
-    return () => window.clearInterval(timer);
-  }, [refreshKey]);
   const lane = (n: number) => {
     const ls = lanes.filter((l) => STAGE_LANES[n].includes(l.key));
     return { count: Math.max(0, ...ls.map((l) => l.count)), wait: Math.max(0, ...ls.map((l) => (l.count > 0 ? l.max_wait_secs : 0))) };
@@ -35,28 +29,34 @@ export function StageBar({ detail, onOpen, refreshKey }: { detail: Detail | null
   const done = lanes.find((l) => l.key === "done")?.count ?? 0;
   return (
     <div className="stagebar">
-      <span className="stagebar-title">
-        [{detail ? `${detail.analysis.route.kks} ` : ""}파이프라인 · 마이닝 레인]
+      <span className="stagebar-title" title={detail ? `${detail.analysis.route.kks} 파이프라인 · 마이닝 레인` : "파이프라인 · 마이닝 레인"}>
+        🧩 파이프라인
         <i>처리 완료 {done}건</i>
       </span>
       {[1, 2, 3, 4, 5].map((n) => {
         const s = stages.find((x) => x.stage === n);
         const l = lane(n);
         return (
-          <button key={n} className={`stage-card ${s ? STAGE_CLASS[s.status] : "skip"}`} disabled={!detail} onClick={() => onOpen(n as DrawerKey)}>
+          <button
+            key={n}
+            className={`stage-card ${s ? STAGE_CLASS[s.status] : "skip"}`}
+            disabled={!detail}
+            onClick={() => onOpen(n as DrawerKey)}
+            title={`${s?.summary ?? "-"} (${duration(s?.ms ?? 0)}) · 레인 ${l.count}건${l.wait > 0 ? ` · 최대 대기 ${mmss(l.wait)}` : ""}`}
+          >
             <strong>
               Stage {n}. {s?.name ?? ["SigLIP2 크롭", "gocr 판독 + 대장 교정", "Gate 1~2 원장 대조", "Gate 3 + Zoro-1 판단", `Zoro-1 ${terms.procedure} 초안`][n - 1]}
+            </strong>
+            <em>
+              [{s ? STAGE_LABEL[s.status] : "대기"}]
               <span className={`lane-badge ${l.wait > 0 ? "hold" : ""}`}>
                 {l.count}건{l.wait > 0 ? ` · ⏳ ${mmss(l.wait)}` : ""}
               </span>
-            </strong>
-            <span>{s?.summary ?? "-"}</span>
-            <em>
-              ({duration(s?.ms ?? 0)}) [{s ? STAGE_LABEL[s.status] : "대기"}]
             </em>
           </button>
         );
       })}
+      {tail}
     </div>
   );
 }

@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import mermaid from "mermaid";
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { fitRect, usePanZoom, type Size } from "../cctv/stage";
+import { ZoomCtl } from "../cctv/ZoomCtl";
 import type { Context } from "../PlantTopologyView";
 
 let ready = false;
@@ -12,13 +15,20 @@ function init() {
   ready = true;
 }
 
-/** 뷰 ②: Mermaid 계통 다이어그램. 원본은 코어(`mermaid.rs`)가 만들고, 블록을 누르면 선택 설비가 바뀝니다. */
+/** 작은 다이어그램(선택 설비 2홉)을 화면 가득 키우면 글자가 지나치게 커집니다: 원래 크기의 1.6 배까지만 */
+const MAX_FIT = 1.6;
+
+/** 뷰 ②: Mermaid 계통 다이어그램 (2차 개선안: 무대 전체로 넓혀 스크롤 없이 한눈에). 원본은 코어(`mermaid.rs`)가 만들고,
+ *  블록을 누르면 선택 설비가 바뀝니다. 노드마다 `data-kks` 를 달아 CCTV 말풍선이 그 노드에서 지시선을 긋습니다. */
 export function MermaidView({ ctx }: { ctx: Context }) {
   const host = useRef<HTMLDivElement>(null);
   const [whole, setWhole] = useState(false);
   const [source, setSource] = useState("");
   const [showSource, setShowSource] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [natural, setNatural] = useState<Size>({ w: 800, h: 500 });
+  const fit = fitRect(ctx.stage, ctx.inset, natural.w / natural.h, natural, MAX_FIT);
+  const pz = usePanZoom(fit, source);
 
   useEffect(() => {
     invoke<string>("mermaid_source", { input: { incident: ctx.incident, selected: ctx.selected, mining: ctx.mining, whole } })
@@ -36,9 +46,19 @@ export function MermaidView({ ctx }: { ctx: Context }) {
       .then(({ svg }) => {
         if (!alive || !host.current) return;
         host.current.innerHTML = svg;
+        const el = host.current.querySelector("svg");
+        if (el) {
+          // 판 크기는 viewBox 에서 읽고, 그림은 판에 맞춰 늘입니다 (확대 · 이동은 판에 겁니다)
+          const vb = el.viewBox.baseVal;
+          if (vb && vb.width > 0 && vb.height > 0) setNatural({ w: vb.width, h: vb.height });
+          el.removeAttribute("style");
+          el.setAttribute("width", "100%");
+          el.setAttribute("height", "100%");
+        }
         host.current.querySelectorAll<SVGGElement>("g.node").forEach((g) => {
           const m = /N_([0-9A-Z]{12})/.exec(g.id);
           if (!m) return;
+          g.dataset.kks = m[1];
           g.style.cursor = "pointer";
           g.addEventListener("click", () => ctx.onSelect(m[1]));
         });
@@ -50,22 +70,32 @@ export function MermaidView({ ctx }: { ctx: Context }) {
     };
   }, [source]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const bar = ctx.bar
+    ? createPortal(
+        <div className="view-bar ov-bar mermaid-head">
+          <span className="bar-label">🧭 Mermaid 계통</span>
+          <span className="muted">섹터(Lv2)별 서브그래프 · 상 · 하류 파급 경로 (노드 클릭 시 연동)</span>
+          <label className="chip">
+            <input type="checkbox" checked={whole} onChange={(e) => setWhole(e.target.checked)} />
+            전체 계통 (끄면 선택 설비 2홉 + 원인 경로)
+          </label>
+          <button className={`chip ${showSource ? "active" : ""}`} onClick={() => setShowSource((s) => !s)}>
+            {showSource ? "▲" : "▼"} Mermaid.js 원본
+          </button>
+          {error && <span className="error">{error}</span>}
+          {showSource && <pre className="mermaid-source vp-glass">{source}</pre>}
+        </div>,
+        ctx.bar,
+      )
+    : null;
+
   return (
-    <div className="mermaid-view">
-      <div className="mermaid-head">
-        <span>[Mermaid 계통 다이어그램] 섹터(Lv2)별 서브그래프 · 상 · 하류 파급 경로 (노드 클릭 시 연동)</span>
-        <span className="grow" />
-        <label className="check">
-          <input type="checkbox" checked={whole} onChange={(e) => setWhole(e.target.checked)} />
-          전체 계통 (끄면 선택 설비 2홉 + 원인 경로)
-        </label>
+    <>
+      {bar}
+      <div className="sheet-viewport mermaid-view" ref={pz.bind}>
+        <div className="mermaid-host" ref={host} style={pz.style} />
       </div>
-      {error && <p className="error">{error}</p>}
-      <div className="mermaid-host" ref={host} />
-      <details className="mermaid-source" open={showSource} onToggle={(e) => setShowSource((e.target as HTMLDetailsElement).open)}>
-        <summary>▼ 자동 생성된 Mermaid.js 원본 스크립트 펼치기/접기</summary>
-        <pre>{source}</pre>
-      </details>
-    </div>
+      <ZoomCtl scale={pz.view.s} onZoom={(f) => pz.zoomAt(f)} onReset={pz.reset} />
+    </>
   );
 }

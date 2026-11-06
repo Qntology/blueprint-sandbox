@@ -1,11 +1,25 @@
-import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { mmss } from "../plant";
 import { SidePanel } from "../SidePanel";
 import { InterlockPanel, QuickApproval } from "../StagePanel";
 import type { Bottleneck, Detail, Plant, VerdictInfo } from "../types";
 
-/** 우측 통합 병목 · 결재창 (개선안 3단계 2번). 마이닝 토글과 상관없이 병목 배지 → 인터록 신호등 게이트 → 표준 조치 · 결재 → 선택 설비가 한 줄로 늘 보입니다. */
+/** 접을 수 있는 HUD 한 칸 (아코디언) */
+function Section({ title, open, onToggle, children, sectionRef }: { title: ReactNode; open: boolean; onToggle: () => void; children: ReactNode; sectionRef?: React.Ref<HTMLElement> }) {
+  return (
+    <section className={`hud-sec ${open ? "open" : ""}`} ref={sectionRef}>
+      <button className="hud-sec-head" onClick={onToggle} aria-expanded={open}>
+        <span>{title}</span>
+        <i>{open ? "▾" : "▸"}</i>
+      </button>
+      {open && <div className="hud-sec-body">{children}</div>}
+    </section>
+  );
+}
+
+/** 우측 통합 병목 · 결재 HUD (개선안 3단계 2번 → 2차 개선안: noto-sandbox `.unit-hud` 처럼 도면 위에 뜬 반투명 유리 판).
+ *  병목 배지 → 인터록 신호등 게이트 → 표준 조치 · 결재 → 선택 설비가 아코디언으로 이어지고, [접기 ▸] 로 제목 줄만 남깁니다.
+ *  CCTV 말풍선의 [📋 인터록 이동] 은 `focus` 를 올려 인터록 칸을 펴고 그 자리로 옮깁니다. */
 export function RightRail(props: {
   plant: Plant | null;
   detail: Detail | null;
@@ -17,46 +31,80 @@ export function RightRail(props: {
   supervisor: string;
   onDecided: (m: string) => void;
   onOpenApproval: () => void;
+  bottlenecks: Bottleneck[];
+  folded: boolean;
+  onFold: (folded: boolean) => void;
+  focus: number;
+  ttf: string | null;
 }) {
-  const { plant, detail, selected, onSelect, onPick, t, catalog, supervisor, onDecided, onOpenApproval } = props;
-  const [bottlenecks, setBottlenecks] = useState<Bottleneck[]>([]);
+  const { plant, detail, selected, onSelect, onPick, t, catalog, supervisor, onDecided, onOpenApproval, bottlenecks, folded, onFold, focus, ttf } = props;
+  const [open, setOpen] = useState({ bottleneck: true, approval: true, equipment: true });
+  const [flash, setFlash] = useState(false);
+  const interlock = useRef<HTMLElement>(null);
+  const toggle = (k: keyof typeof open) => setOpen((o) => ({ ...o, [k]: !o[k] }));
+
   useEffect(() => {
-    const load = () => invoke<{ bottlenecks: Bottleneck[] }>("mining_overview").then((m) => setBottlenecks(m.bottlenecks)).catch(() => {});
-    load();
-    const timer = window.setInterval(load, 3000);
-    return () => window.clearInterval(timer);
-  }, [detail?.id]);
+    if (!focus) return;
+    setOpen((o) => ({ ...o, approval: true }));
+    setFlash(true);
+    const raf = requestAnimationFrame(() => interlock.current?.scrollIntoView({ block: "start", behavior: "smooth" }));
+    const timer = window.setTimeout(() => setFlash(false), 1600);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.clearTimeout(timer);
+    };
+  }, [focus]);
+
+  const pending = detail?.analysis.interlock?.steps.find((s) => s.status !== "passed") ?? null;
   return (
-    <div className="rail">
-      <section className="side rail-block">
-        <h4>🚨 감지된 핵심 병목 ({bottlenecks.length}건)</h4>
-        {bottlenecks.length === 0 && <p className="muted">진행 중인 병목이 없습니다.</p>}
-        {bottlenecks.slice(0, 4).map((b, i) => (
-          <button
-            key={i}
-            className={`bottleneck ${b.kind}`}
-            onClick={() => {
-              onPick(b.incident);
-              if (b.kks) onSelect(b.kks);
-            }}
-          >
-            <strong>
-              {i + 1}. [{b.kind === "physical" ? "물리" : "절차"}] {b.title}
-            </strong>
-            {b.lines.slice(0, 2).map((l, k) => (
-              <span key={k}>• {l}</span>
+    <aside className={`approval-hud vp-glass ov-avoid ${folded ? "folded" : ""}`} aria-label="통합 병목 · 인터록 · 결재">
+      <header className="hud-head">
+        <b>🛡️ 통합 병목 · 결재</b>
+        <span className="hud-sum">
+          {bottlenecks.length ? `🚨 병목 ${bottlenecks.length}건` : "병목 없음"}
+          {pending ? ` · 🔒 Step ${pending.no}` : ""}
+          {ttf ? ` · ${ttf}` : ""}
+        </span>
+        <button className="bh-toggle" onClick={() => onFold(!folded)} aria-expanded={!folded} title={folded ? "결재 HUD 펼치기" : "결재 HUD 접기 (도면 오른쪽을 넓게)"}>
+          {folded ? "◂ 펼치기" : "접기 ▸"}
+        </button>
+      </header>
+      {!folded && (
+        <div className="hud-body">
+          <Section title={`🚨 감지된 핵심 병목 (${bottlenecks.length}건)`} open={open.bottleneck} onToggle={() => toggle("bottleneck")}>
+            {bottlenecks.length === 0 && <p className="muted">진행 중인 병목이 없습니다.</p>}
+            {bottlenecks.slice(0, 4).map((b, i) => (
+              <button
+                key={i}
+                className={`bottleneck ${b.kind}`}
+                onClick={() => {
+                  onPick(b.incident);
+                  if (b.kks) onSelect(b.kks);
+                }}
+              >
+                <strong>
+                  {i + 1}. [{b.kind === "physical" ? "물리" : "절차"}] {b.title}
+                </strong>
+                {b.lines.slice(0, 2).map((l, k) => (
+                  <span key={k}>• {l}</span>
+                ))}
+                {b.waiting_secs !== null && <em>⏳ {mmss(b.waiting_secs)}</em>}
+              </button>
             ))}
-            {b.waiting_secs !== null && <em>⏳ {mmss(b.waiting_secs)}</em>}
-          </button>
-        ))}
-      </section>
-      {detail && (
-        <section className="side rail-block">
-          <InterlockPanel detail={detail} supervisor={supervisor} onChanged={onDecided} compact />
-          <QuickApproval detail={detail} supervisor={supervisor} onDecided={onDecided} onOpenDetail={onOpenApproval} />
-        </section>
+          </Section>
+          {detail && (
+            <Section title={`🚦 인터록 게이트 · 결재${pending ? ` (🔒 Step ${pending.no})` : ""}`} open={open.approval} onToggle={() => toggle("approval")} sectionRef={interlock}>
+              <div className={flash ? "flash" : ""}>
+                <InterlockPanel detail={detail} supervisor={supervisor} onChanged={onDecided} compact />
+                <QuickApproval detail={detail} supervisor={supervisor} onDecided={onDecided} onOpenDetail={onOpenApproval} />
+              </div>
+            </Section>
+          )}
+          <Section title="🔎 선택 설비 · 이슈 트리 · 홉 뎁스" open={open.equipment} onToggle={() => toggle("equipment")}>
+            <SidePanel plant={plant} detail={detail} selected={selected} onSelect={onSelect} t={t} catalog={catalog} />
+          </Section>
+        </div>
       )}
-      <SidePanel plant={plant} detail={detail} selected={selected} onSelect={onSelect} t={t} catalog={catalog} />
-    </div>
+    </aside>
   );
 }
