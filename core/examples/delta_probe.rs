@@ -1,6 +1,12 @@
 //! SDS 델타 패치 실측 (개선안 2절). 마스터와 견주어 바뀐 조각만 읽을 때의 시간과 판독 결과를 전부 읽을 때와 비교합니다.
 //!
 //!   cargo run -p blueprint-core --release --example delta_probe -- [결과 JSON] [--no-scans] [--no-a0] [--no-full] [--no-clip]
+//!       [--domain aidc] [--no-ignore] [--no-chroma] [--no-align] [--only 스캔이름] [--shift 9x6]
+//!
+//! `--domain aidc` 는 AI 데이터센터 원장 · 마스터(MEP · SLD)와 D3 · D3F Red-line · D1 점검표를 씁니다 (A0 는 건너뜀).
+//! 개선안 1단계 전처리는 기본으로 켜져 있고 하나씩 끌 수 있습니다: `--no-ignore` 고정 안내문 자리(1-1) · `--no-chroma` 유채색 잉크(1-2) ·
+//! `--no-align` 도각 평행 이동 맞춤(1-3). `--shift 9x6` 은 (cmd 는 쉼표를 인자 구분으로 읽음) 스캔(과 정답 그림)을 오른쪽 9 px · 아래 6 px 밀어 급지가 밀린 스캔을 흉내 냅니다
+//! (빈 곳은 흰색, 정답은 늘 도각을 맞춰 셉니다). `--only P3_redline` 은 그 스캔만 읽습니다.
 //!
 //! 1. 마스터 색인: 마스터 도면 5장의 SigLIP2 특징 격자(int8)와 잉크를 만듭니다. 패치 특징은 `out/delta/master_patches.bin` 에 씁니다.
 //! 2. 현장 스캔 (`out/field`): P3 · P3F Red-line 과 P1 점검표를 전부 읽기 / 델타로 읽기. 시간 · 읽은 조각 · 뽑은 값을 비교합니다.
@@ -17,8 +23,9 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use blueprint_core::ai::document::{Baseline, PageReading};
 use blueprint_core::ai::runtime;
-use blueprint_core::ai::siglip2::delta::{cells_of, ink_changes, DeltaParams, Master};
+use blueprint_core::ai::siglip2::delta::{cells_of, frame_offset, ink_changes, DeltaParams, Master};
 use blueprint_core::ai::siglip2::ink::{deskew, estimate_skew, InkPage};
+use blueprint_core::domain::DomainMode;
 use blueprint_core::extract::{extract, Extracted, PageText};
 use blueprint_core::lattice::Lattice;
 use blueprint_core::tiling::{tiles, Tile};
@@ -34,7 +41,20 @@ fn open(path: &Path) -> Result<RgbImage> {
 }
 
 fn ink_of(img: &RgbImage) -> InkPage {
-    InkPage::new(&image::imageops::grayscale(img))
+    InkPage::new(&image::imageops::grayscale(img)).with_color(img)
+}
+
+/// 그림을 (dx, dy) 만큼 옮깁니다 (크기 그대로, 빈 곳은 흰색).
+fn shifted(img: &RgbImage, (dx, dy): (i64, i64)) -> RgbImage {
+    let (w, h) = img.dimensions();
+    RgbImage::from_fn(w, h, |x, y| {
+        let (sx, sy) = (x as i64 - dx, y as i64 - dy);
+        if sx < 0 || sy < 0 || sx >= w as i64 || sy >= h as i64 {
+            image::Rgb([255, 255, 255])
+        } else {
+            *img.get_pixel(sx as u32, sy as u32)
+        }
+    })
 }
 
 /// 읽을 때와 같게 곧게 편 잉크
@@ -69,8 +89,15 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
     let out_path = PathBuf::from(args.iter().find(|a| a.ends_with(".json")).cloned().unwrap_or_else(|| "out/delta_probe.json".into()));
-    let params = DeltaParams { clip: !flag("--no-clip"), ..DeltaParams::default() };
-    let db = Lattice::embedded()?;
+    let params = DeltaParams { clip: !flag("--no-clip"), chroma: !flag("--no-chroma"), align: !flag("--no-align"), ..DeltaParams::default() };
+    let aidc = args.windows(2).any(|w| w[0] == "--domain" && w[1] == "aidc");
+    let only = args.windows(2).find(|w| w[0] == "--only").map(|w| w[1].clone());
+    let shift: Option<(i64, i64)> = args.windows(2).find(|w| w[0] == "--shift").and_then(|w| {
+        let (a, b) = w[1].split_once(['x', ','])?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    });
+    let db = Lattice::embedded_for(if aidc { DomainMode::AiDataCenter } else { DomainMode::PowerPlant })?;
+    let scan_names: [&str; 3] = if aidc { ["D3_redline", "D3F_redline", "D1_gauge"] } else { ["P3_redline", "P3F_redline", "P1_gauge"] };
     let t = Instant::now();
     let rt = runtime::open()?;
     println!("[엔진] {} · 모델 열기 {:.1}s · {params:?}", rt.backend, t.elapsed().as_secs_f64());
@@ -79,7 +106,12 @@ fn main() -> Result<()> {
     // 1. 마스터 색인
     let masters: Vec<(String, RgbImage)> = db.drawings().iter().map(|d| Ok((d.id.clone(), open(Path::new(&format!("core/fixtures/drawings/{}.png", d.id)))?))).collect::<Result<_>>()?;
     let t = Instant::now();
-    let set = rt.reader.index_masters(&masters, &params)?;
+    let mut set = rt.reader.index_masters(&masters, &params)?;
+    if !flag("--no-ignore") {
+        for d in db.drawings() {
+            set.set_ignore(&d.id, &d.ignore_zones);
+        }
+    }
     let index_ms = t.elapsed().as_secs_f64() * 1e3;
     let raw = set.patches_to_bytes();
     std::fs::write("out/delta/master_patches.bin", &raw)?;
@@ -89,13 +121,20 @@ fn main() -> Result<()> {
     // 2. 현장 스캔
     if !flag("--no-scans") {
         let mut scans = Vec::new();
-        for name in ["P3_redline", "P3F_redline", "P1_gauge"] {
+        for name in scan_names {
+            if only.as_deref().is_some_and(|o| o != name) {
+                continue;
+            }
             let path = PathBuf::from(format!("out/field/{name}.png"));
             if !path.exists() {
                 println!("[스캔] {} 없음", path.display());
                 continue;
             }
             let img = open(&path)?;
+            let img = match shift {
+                Some(s) => shifted(&img, s),
+                None => img,
+            };
             let t = Instant::now();
             let full = rt.reader.read_pages(std::slice::from_ref(&img))?.remove(0);
             let full_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -108,7 +147,7 @@ fn main() -> Result<()> {
             let same = values(&x_full) == values(&x_delta);
             let title_ok = d.master.is_none() || x_delta.drawing.is_none() || x_delta.drawing == d.master;
             println!(
-                "[스캔 {name}] 전부 {:.1}s (조각 {} · 빈 조각 {}) · 델타 {:.1}s (조각 {} · 건너뜀 {} · 좁힘 {}) · 마스터 {:?} 코사인 {:.3} 차이 {:.3} · 바뀐 칸 {}/{} {} · 값 {} · 표제란 {}",
+                "[스캔 {name}] 전부 {:.1}s (조각 {} · 빈 조각 {}) · 델타 {:.1}s (조각 {} · 건너뜀 {} · 좁힘 {} · 안내문 자름 {}) · 마스터 {:?} 코사인 {:.3} 차이 {:.3} · 바뀐 칸 {}/{} {} · 값 {} · 표제란 {}",
                 full_ms / 1e3,
                 full.crops.len(),
                 full.plan.blank.len(),
@@ -116,6 +155,7 @@ fn main() -> Result<()> {
                 delta.crops.len(),
                 d.skipped.len(),
                 d.clipped,
+                d.trimmed,
                 d.master,
                 d.similarity,
                 d.margin,
@@ -132,8 +172,16 @@ fn main() -> Result<()> {
             let clean = PathBuf::from(format!("out/field/{name}_clean.png"));
             let mut analysis = Value::Null;
             if let (Some(m), true) = (d.master.as_deref().and_then(|id| set.get(id)), clean.exists()) {
-                let truth = ink_changes(m, &ink_of(&open(&clean)?), &params).context("크기")?;
-                let found = ink_changes(m, &straight_ink(&img), &params).context("크기")?;
+                let (clean_img, truth_params) = match shift {
+                    Some(s) => (shifted(&open(&clean)?, s), DeltaParams { align: true, ..params }),
+                    None => (open(&clean)?, params),
+                };
+                let truth = ink_changes(m, &ink_of(&clean_img), &truth_params).context("크기")?;
+                let scan_ink = straight_ink(&img);
+                if shift.is_some() || params.align {
+                    println!("  도각으로 잰 평행 이동 {:?} (밀어 넣은 값 {:?})", frame_offset(&m.ink, &scan_ink), shift.unwrap_or((0, 0)));
+                }
+                let found = ink_changes(m, &scan_ink, &params).context("크기")?;
                 let (t_set, f_set): (Vec<bool>, Vec<bool>) = (truth.diff.iter().map(|v| *v > params.ink_threshold).collect(), found.diff.iter().map(|v| *v > params.ink_threshold).collect());
                 let hit = t_set.iter().zip(&f_set).filter(|(a, b)| **a && **b).count();
                 let (n_truth, n_found) = (t_set.iter().filter(|v| **v).count(), f_set.iter().filter(|v| **v).count());
@@ -164,7 +212,7 @@ fn main() -> Result<()> {
             scans.push(json!({
                 "scan": name,
                 "full": { "ms": full_ms, "crops": full.crops.len(), "blank": full.plan.blank.len(), "values": values(&x_full), "texts": texts(&full) },
-                "delta": { "ms": delta_ms, "crops": delta.crops.len(), "skipped": d.skipped.len(), "clipped": d.clipped, "master": d.master, "similarity": d.similarity, "margin": d.margin, "changed": d.changed, "blocks": d.blocks, "fallback": d.fallback, "values": values(&x_delta), "texts": texts(&delta) },
+                "delta": { "ms": delta_ms, "crops": delta.crops.len(), "skipped": d.skipped.len(), "clipped": d.clipped, "trimmed": d.trimmed, "master": d.master, "similarity": d.similarity, "margin": d.margin, "changed": d.changed, "blocks": d.blocks, "fallback": d.fallback, "values": values(&x_delta), "texts": texts(&delta) },
                 "same_values": same,
                 "title_matches_master": title_ok,
                 "analysis": analysis,
@@ -174,7 +222,7 @@ fn main() -> Result<()> {
     }
 
     // 3. A0: 타일마다 잉크를 견주어 바뀐 타일만 델타로
-    if !flag("--no-a0") {
+    if !flag("--no-a0") && !aidc {
         let a0 = db.a0(A0_ID).context("원장에 A0 배치가 없습니다")?.clone();
         let base = open(Path::new(&format!("out/a0/{A0_ID}.png")))?;
         let grid = tiles(base.dimensions(), a0.grid.rows, a0.grid.cols, a0.grid.overlap);

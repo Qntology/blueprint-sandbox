@@ -1,8 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { shortTag, useTerms } from "./domain";
 import type { DrawerKey } from "./OfficerView";
-import { clock, fixed, fmt, signedSecs, STAGE_LABEL } from "./plant";
-import type { ArchiveDoc, Asked, Detail, InterlockStep, Plant, VerdictInfo } from "./types";
+import { clock, fixed, fmt, mmss, signedSecs, STAGE_LABEL } from "./plant";
+import type { ArchiveDoc, Asked, Detail, InterlockStep, Lane, Plant, VerdictInfo } from "./types";
 import { WaveChart, type Trace } from "./WaveChart";
 
 const STAGE_CLASS: Record<string, string> = { Done: "ok", Skipped: "skip", Corrected: "fix", Alert: "alert", Waiting: "wait", Blocked: "block" };
@@ -13,18 +14,41 @@ function duration(ms: number): string {
   return ms < 1000 ? `${ms.toFixed(1)}ms` : `${(ms / 1000).toFixed(2)}초`;
 }
 
-/** 하단 파이프라인 바 (Stage 1 ~ 5). 누르면 단계 상세가 열립니다. */
-export function StageBar({ detail, onOpen }: { detail: Detail | null; onOpen: (k: DrawerKey) => void }) {
+/** 단계 카드에 붙일 프로세스 마이닝 레인 (개선안 3단계 3번: 단계 바 + 마이닝 레인 두 줄을 한 줄로) */
+const STAGE_LANES: Record<number, string[]> = { 1: ["gate01"], 2: ["gate01"], 3: ["gate2"], 4: ["gate3"], 5: ["gate45", "approval"] };
+
+/** 하단 파이프라인 바 (Stage 1 ~ 5). 카드마다 그 단계 레인의 건수 · 최대 대기를 함께 적습니다. 누르면 단계 상세가 열립니다. */
+export function StageBar({ detail, onOpen, refreshKey }: { detail: Detail | null; onOpen: (k: DrawerKey) => void; refreshKey: number }) {
+  const terms = useTerms();
   const stages = detail?.analysis.stages ?? [];
+  const [lanes, setLanes] = useState<Lane[]>([]);
+  useEffect(() => {
+    const load = () => invoke<{ lanes: Lane[] }>("mining_overview").then((m) => setLanes(m.lanes)).catch(() => {});
+    load();
+    const timer = window.setInterval(load, 3000);
+    return () => window.clearInterval(timer);
+  }, [refreshKey]);
+  const lane = (n: number) => {
+    const ls = lanes.filter((l) => STAGE_LANES[n].includes(l.key));
+    return { count: Math.max(0, ...ls.map((l) => l.count)), wait: Math.max(0, ...ls.map((l) => (l.count > 0 ? l.max_wait_secs : 0))) };
+  };
+  const done = lanes.find((l) => l.key === "done")?.count ?? 0;
   return (
     <div className="stagebar">
-      <span className="stagebar-title">[{detail ? `${detail.analysis.route.kks} ` : ""}파이프라인 실행 단계 · 누르면 상세]</span>
+      <span className="stagebar-title">
+        [{detail ? `${detail.analysis.route.kks} ` : ""}파이프라인 · 마이닝 레인]
+        <i>처리 완료 {done}건</i>
+      </span>
       {[1, 2, 3, 4, 5].map((n) => {
         const s = stages.find((x) => x.stage === n);
+        const l = lane(n);
         return (
           <button key={n} className={`stage-card ${s ? STAGE_CLASS[s.status] : "skip"}`} disabled={!detail} onClick={() => onOpen(n as DrawerKey)}>
             <strong>
-              Stage {n}. {s?.name ?? ["SigLIP2 크롭", "gocr 판독 + 대장 교정", "Gate 1~2 원장 대조", "Gate 3 + Zoro-1 판단", "Zoro-1 AOP 초안"][n - 1]}
+              Stage {n}. {s?.name ?? ["SigLIP2 크롭", "gocr 판독 + 대장 교정", "Gate 1~2 원장 대조", "Gate 3 + Zoro-1 판단", `Zoro-1 ${terms.procedure} 초안`][n - 1]}
+              <span className={`lane-badge ${l.wait > 0 ? "hold" : ""}`}>
+                {l.count}건{l.wait > 0 ? ` · ⏳ ${mmss(l.wait)}` : ""}
+              </span>
             </strong>
             <span>{s?.summary ?? "-"}</span>
             <em>
@@ -56,6 +80,7 @@ function Bars({ asked, catalog, highlight }: { asked: Asked; catalog: Record<str
 }
 
 function Scan({ detail }: { detail: Detail }) {
+  const terms = useTerms();
   const stages = detail.analysis.stages;
   if (detail.reports.length === 0) {
     return (
@@ -72,10 +97,10 @@ function Scan({ detail }: { detail: Detail }) {
       {detail.reports.map((r, i) => (
         <section key={i} className="card">
           <h4>
-            {r.kind} · {r.taken_at} · {r.worker} ({r.worker_id}) {r.signed ? "· 서명 검출" : "· 서명 없음"} {r.permit_confirmed ? "· PTW/LOTO 확인" : ""}
+            {r.kind} · {r.taken_at} · {r.worker} ({r.worker_id}) {r.signed ? "· 서명 검출" : "· 서명 없음"} {r.permit_confirmed ? `· ${terms.permit} 확인` : ""}
           </h4>
           <dl className="props">
-            <dt>설비 KKS</dt>
+            <dt>설비 {terms.code}</dt>
             <dd className="mono">{r.kks}</dd>
             <dt>센서 태그</dt>
             <dd className="mono">{r.tag}</dd>
@@ -155,13 +180,16 @@ function stateText(v: unknown): string {
 }
 
 function Truth({ detail, supervisor }: { detail: Detail; supervisor: string }) {
+  const terms = useTerms();
   const a = detail.analysis;
   const [checked, setChecked] = useState<Record<number, boolean>>({});
   const [names, setNames] = useState<string | null>(null);
   return (
     <div className="two-col">
       <section>
-        <div className="timeline-strip">[3중 진실 우선순위] ① 현장 스캔 증빙(게이지 · Red-line) &gt; ② DCS 다중 보팅 · MOC 승인 원장 &gt; ③ 단일 센서 신고값</div>
+        <div className="timeline-strip">
+          [3중 진실 우선순위] ① 현장 스캔 증빙(게이지 · Red-line) &gt; ② {terms.telemetry} 다중 보팅 · {terms.change} 승인 원장 &gt; ③ 단일 센서 신고값
+        </div>
         <table className="grid">
           <thead>
             <tr>
@@ -211,13 +239,13 @@ function Truth({ detail, supervisor }: { detail: Detail; supervisor: string }) {
             <div key={i} className="sensor-line">
               <dt>시점 동기화 대조</dt>
               <dd>
-                촬영 {clock(f.taken_at_ms)} · 현장 {fmt(f.field_value)} vs 같은 시각 DCS {fmt(f.dcs_value)} (허용 ±{fmt(f.tolerance)}) {f.matches_dcs ? "✓ 일치" : "✗ 불일치"}
+                촬영 {clock(f.taken_at_ms)} · 현장 {fmt(f.field_value)} vs 같은 시각 {terms.telemetry} {fmt(f.dcs_value)} (허용 ±{fmt(f.tolerance)}) {f.matches_dcs ? "✓ 일치" : "✗ 불일치"}
               </dd>
             </div>
           ))}
           {a.moc && (
             <>
-              <dt>MOC 대조</dt>
+              <dt>{terms.change} 대조</dt>
               <dd>
                 {a.moc.moc_no} · {stateText(a.moc.outcome)}
               </dd>
@@ -230,7 +258,7 @@ function Truth({ detail, supervisor }: { detail: Detail; supervisor: string }) {
             </>
           )}
         </dl>
-        <h4>[Gate 2 검출 사항 · 교대감독 확인 체크리스트]</h4>
+        <h4>[Gate 2 검출 사항 · {terms.supervisor} 확인 체크리스트]</h4>
         {(detail.notes.length ? detail.notes : [a.reason]).map((n, i) => (
           <label key={i} className="check">
             <input type="checkbox" checked={!!checked[i]} onChange={(e) => setChecked((c) => ({ ...c, [i]: e.target.checked }))} />
@@ -333,8 +361,10 @@ function requirement(s: InterlockStep): string {
   return "현장 LOTO 서명";
 }
 
-/** 깊이별 선행 절차(Interlock) 체크 (Part 8-4). 순서대로 끝나야 아래 확정이 풀립니다. */
-function InterlockPanel({ detail, supervisor, onChanged }: { detail: Detail; supervisor: string; onChanged: (m: string) => void }) {
+/** 깊이별 선행 절차(Interlock) 체크 (Part 8-4). 순서대로 끝나야 아래 확정이 풀립니다.
+ *  `compact` 는 우측 결재창의 신호등 게이트 (개선안 3단계 2번: 마이닝 · 인터록 · 결재를 한 화면에) */
+export function InterlockPanel({ detail, supervisor, onChanged, compact = false }: { detail: Detail; supervisor: string; onChanged: (m: string) => void; compact?: boolean }) {
+  const terms = useTerms();
   const il = detail.analysis.interlock;
   const [values, setValues] = useState<Record<number, string>>({});
   const [busy, setBusy] = useState(false);
@@ -352,14 +382,17 @@ function InterlockPanel({ detail, supervisor, onChanged }: { detail: Detail; sup
     }
   };
   return (
-    <div className="interlock">
+    <div className={`interlock ${compact ? "compact" : ""}`}>
       <h4>
-        [{il.aop_id} 깊이별 선행 절차 (Interlock)] <span className="muted">순서대로 끝나야 확정이 풀립니다</span>
+        [{il.aop_id} 인터록 게이트] <span className="muted">{compact ? "순서대로 통과해야 확정" : "순서대로 끝나야 확정이 풀립니다"}</span>
       </h4>
       {il.steps.map((s) => (
         <div key={s.no} className={`il-step ${s.status}`}>
           <div className="il-head">
-            <b>[Step {s.no}]</b> Depth {DEPTH(s.req_depth)} · <span className="mono">{s.kks}</span>
+            <b>
+              {s.status === "passed" ? "🟢" : next?.no === s.no ? "🛑" : "⚪"} [Step {s.no}]
+            </b>{" "}
+            Depth {DEPTH(s.req_depth)} · <span className="mono">{s.kks}</span>
           </div>
           <div>
             {s.status === "passed" ? "☑" : "☐"} {s.text}
@@ -382,7 +415,7 @@ function InterlockPanel({ detail, supervisor, onChanged }: { detail: Detail; sup
           {s.status !== "passed" && s.check.kind === "loto" && (
             <div className="il-input">
               <button className="plain" disabled={busy || next?.no !== s.no} onClick={() => submit(s.no, null, true)}>
-                교대감독 무전 확인으로 갈음 (사번 날인)
+                📻 {terms.supervisor} 무전 확인으로 갈음 (사번 날인)
               </button>
             </div>
           )}
@@ -393,6 +426,7 @@ function InterlockPanel({ detail, supervisor, onChanged }: { detail: Detail; sup
 }
 
 function Approval({ detail, supervisor, onDecided }: { detail: Detail; supervisor: string; onDecided: (m: string) => void }) {
+  const terms = useTerms();
   const d = detail.analysis.draft;
   const [ref, setRef] = useState(d?.aop_id ?? "");
   const [cosign, setCosign] = useState(false);
@@ -455,7 +489,7 @@ function Approval({ detail, supervisor, onDecided }: { detail: Detail; superviso
             onDecided(m);
           }}
         />
-        <h4>[{d?.high_risk ? "고위험 계통 조작 승인 (policy.rs 안전 가드레일)" : "교대감독 확정"}]</h4>
+        <h4>[{d?.high_risk ? "고위험 계통 조작 승인 (policy.rs 안전 가드레일)" : `${terms.supervisor} 확정`}]</h4>
         {d?.high_risk && (
           <>
             <p className="muted">고위험 조치: {d.risk_actions.join(", ")}</p>
@@ -465,7 +499,7 @@ function Approval({ detail, supervisor, onDecided }: { detail: Detail; superviso
             </label>
             <label className="check">
               <input type="checkbox" checked={cosign} onChange={(e) => setCosign(e.target.checked)} />
-              교대감독(파트장) 공동 결재를 받았습니다 (team_lead_cosign)
+              {terms.supervisor}(파트장) 공동 결재를 받았습니다 (team_lead_cosign)
             </label>
             <label className="field">
               오경보 입증 현장 증빙 스캔 (장)
@@ -475,7 +509,7 @@ function Approval({ detail, supervisor, onDecided }: { detail: Detail; superviso
         )}
         <label className="field">
           현장 재점검 요청 메모
-          <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="예: 2층 급수조절밸브 포지셔너 현장 확인" />
+          <input value={note} onChange={(e) => setNote(e.target.value)} placeholder={terms.code === "KKS" ? "예: 2층 급수조절밸브 포지셔너 현장 확인" : "예: 2층 CDU 유량조절밸브 액추에이터 현장 확인"} />
         </label>
         <div className="actions">
           {d?.high_risk && (
@@ -535,7 +569,7 @@ function Sds({ detail, plant }: { detail: Detail; plant: Plant }) {
     }
     return out.slice(0, 5);
   }, [a, detail, plant]);
-  const markers = a.chain.map((ev) => ({ at_ms: ev.at_ms, label: `${signedSecs(ev.at_ms, origin)} ${ev.tag.slice(7)} ${ev.kind === "limit" ? "한계" : ev.direction === "Up" ? "↑" : "↓"}`, color: ev.kind === "limit" ? "#ff4d4f" : "#f6c453" }));
+  const markers = a.chain.map((ev) => ({ at_ms: ev.at_ms, label: `${signedSecs(ev.at_ms, origin)} ${shortTag(ev.tag)} ${ev.kind === "limit" ? "한계" : ev.direction === "Up" ? "↑" : "↓"}`, color: ev.kind === "limit" ? "#ff4d4f" : "#f6c453" }));
   const from = Math.max(detail.timeline.t0_ms, origin - 20_000);
   const to = Math.min(detail.timeline.now_ms + 15_000, detail.timeline.t0_ms + 150_000);
   return (
@@ -641,10 +675,72 @@ const TITLES: Record<string, string> = {
   "2": "🔍 [Stage 1 & 2 상세] SigLIP2 시각 앵커 조각 계획 & gocr + Lattice 대장 교정 결과",
   "3": "⚖️ [Stage 3 상세] Gate 1 형식 심사 & Gate 2 3중 진실 정합성 교차 대조",
   "4": "🧠 [Stage 4 상세] Gate 3 마인드맵 파급 분석 & Zoro-1 포인터 판단 (jev_head)",
-  "5": "✍️ [Stage 5 상세] Zoro-1 글쓰기 AOP 조치 절차서 초안 · Factcheck 수치 검증 · 최종 결재",
+  "5": "✍️ [Stage 5 상세] Zoro-1 글쓰기 조치 절차서 초안 · Factcheck 수치 검증 · 최종 결재",
   sds: "⏱️ [시계열 & SDS 심층 분석기] 다중 계통 시계열 파형 동기화 (Δt) 및 SDS 직교 분할 검증",
   archive: "🗄️ 보관 문서 (Gate 5)",
 };
+
+/** 우측 통합 결재창의 짧은 결재 (개선안 Part 1 우측 아래: 표준 조치 요약 + [재점검 지시] [확정]).
+ *  고위험이면 파트장 공동 결재와 절차서 번호(초안의 번호로 미리 채움)가 함께 갑니다. 오경보 처리 · 시험 버튼은 Stage 5 상세에 있습니다. */
+export function QuickApproval({ detail, supervisor, onDecided, onOpenDetail }: { detail: Detail; supervisor: string; onDecided: (m: string) => void; onOpenDetail: () => void }) {
+  const terms = useTerms();
+  const d = detail.analysis.draft;
+  const pending = detail.analysis.interlock?.steps.find((s) => s.status !== "passed") ?? null;
+  const [cosign, setCosign] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [reply, setReply] = useState<string | null>(null);
+  useEffect(() => {
+    setCosign(false);
+    setReply(null);
+  }, [detail.id]);
+  const act = async (action: string, note = "") => {
+    setBusy(true);
+    try {
+      const r = await invoke<{ ok: boolean; message: string }>("decide_incident", { input: { id: detail.id, supervisor_id: supervisor, action, team_lead_cosign: cosign, procedure_ref: d?.aop_id ?? "", evidence_scans: 0, note } });
+      setReply(r.message);
+      onDecided(r.message);
+    } catch (e) {
+      setReply(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const awaiting = detail.state === "awaiting_field";
+  return (
+    <div className="quick-approval">
+      <h4>[표준 조치 요약 {d ? (d.problems.length ? "(Fact ✗ 템플릿)" : "(Fact ✓)") : ""}]</h4>
+      {d ? (
+        <ol className="quick-steps">
+          {d.steps.map((s, i) => (
+            <li key={i}>
+              {i + 1}. {s}
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <p className="muted">조치 절차서가 없는 판정입니다 ({detail.analysis.moc ? "Red-line 변경 반영 심사" : "기록만"}).</p>
+      )}
+      {d?.high_risk && (
+        <label className="check">
+          <input type="checkbox" checked={cosign} onChange={(e) => setCosign(e.target.checked)} />
+          파트장 공동 결재 ({d.aop_id}) · 고위험: {d.risk_actions.join(", ")}
+        </label>
+      )}
+      <div className="actions">
+        <button className="plain" disabled={busy} onClick={() => act("recheck", `${terms.control_room} 재점검 지시`)}>
+          재점검 지시
+        </button>
+        <button className="plain" disabled={busy} onClick={onOpenDetail}>
+          상세 결재
+        </button>
+        <button className="danger-fill" disabled={busy || !!pending || awaiting || (!!d?.high_risk && !cosign)} onClick={() => act(d?.high_risk ? "approve_procedure" : "confirm")}>
+          {awaiting ? "⏳ 현장 대기" : pending ? `🔒 Step ${pending.no} 필요` : d?.high_risk && !cosign ? "🔒 공동 결재 필요" : "🚨 조치확정"}
+        </button>
+      </div>
+      {reply && <p className="note">{reply}</p>}
+    </div>
+  );
+}
 
 export function StageDrawer({ which, detail, archive, plant, catalog, supervisor, onClose, onDecided }: { which: DrawerKey; detail: Detail | null; archive: ArchiveDoc | null; plant: Plant | null; catalog: Record<string, VerdictInfo>; supervisor: string; onClose: () => void; onDecided: (m: string) => void }) {
   return (

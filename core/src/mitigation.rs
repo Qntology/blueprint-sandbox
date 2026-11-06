@@ -96,7 +96,7 @@ pub fn plan(db: &Lattice, a: &Analysis) -> Option<(Action, Vec<(String, bool)>, 
         (format!("근본 원인 {} 이 절차서 {} 인터록의 대상 (Depth 0)", root.kks, draft.aop_id), true),
         ("상류 Depth -1 선행 조건 충족 (인터록 Step 1)".to_string(), upstream_ok),
         ("경보 계측 건전성 (동결 · 순간 잡음 없음)".to_string(), signal_ok),
-        ("변경관리(MOC) 원장 충돌 없음".to_string(), moc_ok),
+        (format!("변경관리({}) 원장 충돌 없음", db.terms().change), moc_ok),
     ];
 
     let mut facts = vec![Fact::new("적용 규칙", "설비를 멈추지 않는 우회 개방은 상류 선행 조건 · 계측 건전성 · 원장 충돌 없음이 모두 맞을 때만 자동 대응 후보")];
@@ -118,10 +118,15 @@ pub fn plan(db: &Lattice, a: &Analysis) -> Option<(Action, Vec<(String, bool)>, 
     Some((action, gates, facts))
 }
 
+/// 완화 조치 심사의 제목 (발전소 `급수 바이패스`, 데이터센터 `CDU 우회밸브`)
+pub fn review_title(db: &Lattice) -> String {
+    format!("{} 자동 완화 조치 심사", db.terms().bypass)
+}
+
 /// 네 기준을 하나씩 따로 묻고 최솟값을 확신도로 씁니다 (Part 8-6, 방식 C).
-pub fn judge(facts: &[Fact], model: Option<&dyn DecisionModel>) -> anyhow::Result<Decided> {
+pub fn judge(title: &str, facts: &[Fact], model: Option<&dyn DecisionModel>) -> anyhow::Result<Decided> {
     let task = DecisionTask {
-        title: "급수 바이패스 자동 완화 조치 심사".into(),
+        title: title.to_string(),
         facts: facts.to_vec(),
         options: vec![Verdict::G3EligibleAutoBypassMitigation, Verdict::G3AdverseUpstreamCause, Verdict::G3ViolationHighRisk],
     };
@@ -145,7 +150,8 @@ mod tests {
         assert!(gates.iter().all(|g| g.1), "{gates:?}");
         assert!(facts.iter().any(|f| f.key == "전파 시차"));
         // 모델이 없으면 확신도가 없고, 정책은 자동 실행하지 않습니다
-        let d = judge(&facts, None).unwrap();
+        assert_eq!(review_title(&db), "급수 바이패스 자동 완화 조치 심사");
+        let d = judge(&review_title(&db), &facts, None).unwrap();
         assert!(d.judgement.confidence.is_none());
         // 원인이 다른 사건(베어링 단독 고장)에는 우회 조치가 없습니다
         let p4 = set.get("P4").unwrap();

@@ -48,13 +48,14 @@ fn place(db: &Lattice, kks: &str) -> String {
     }
 }
 
-fn limits(s: &SensorRow) -> String {
+/// 경보 · 보호 정지 한계 (보호 정지 이름은 도메인 용어: 발전소 트립 · 데이터센터 셧다운)
+fn limits(db: &Lattice, s: &SensorRow) -> String {
     let mut parts = Vec::new();
     if let Some(v) = s.alarm_high.or(s.alarm_low) {
         parts.push(format!("경보 한계 {} {}", fmt_value(v), s.unit));
     }
     if let Some(v) = s.trip_high.or(s.trip_low) {
-        parts.push(format!("트립 한계 {} {}", fmt_value(v), s.unit));
+        parts.push(format!("{} 한계 {} {}", db.terms().trip, fmt_value(v), s.unit));
     }
     parts.join(", ")
 }
@@ -64,7 +65,7 @@ fn change(s: &SensorRow, now: f64) -> String {
     format!("{} {} {} (정상 {} {}, {:+.1}%)", s.label, fmt_value(now), s.unit, fmt_value(s.normal), s.unit, pct)
 }
 
-fn sensor_health_text(signal: &SignalReport, vote: Option<&VoteResult>, field: Option<&FieldCheck>) -> String {
+fn sensor_health_text(db: &Lattice, signal: &SignalReport, vote: Option<&VoteResult>, field: Option<&FieldCheck>) -> String {
     let mut parts = vec![match &signal.state {
         SignalState::Valid => "동결 · 순간 잡음 없음".to_string(),
         SignalState::SpikeFiltered { spikes } => format!("순간 잡음 {}건을 걸러 냄", spikes.len()),
@@ -75,7 +76,8 @@ fn sensor_health_text(signal: &SignalReport, vote: Option<&VoteResult>, field: O
         parts.push(if v.outliers.is_empty() { format!("{} 보팅 채널 일치", v.logic) } else { format!("{} 보팅에서 채널 {} 편차", v.logic, v.outliers.join(", ")) });
     }
     if let Some(f) = field {
-        parts.push(if f.matches_dcs { "현장 게이지가 DCS 와 일치".to_string() } else { "현장 게이지가 DCS 와 다름".to_string() });
+        let dcs = &db.terms().telemetry;
+        parts.push(if f.matches_dcs { format!("현장 게이지가 {dcs} 와 일치") } else { format!("현장 게이지가 {dcs} 와 다름") });
     }
     parts.join(", ")
 }
@@ -96,7 +98,8 @@ pub fn evaluate_alarm(
     let now_value = series.and_then(|s| s.value_at(now_ms)).unwrap_or(sensor.normal);
     let slope = series.and_then(|s| s.slope_at(now_ms, SLOPE_SAMPLES)).unwrap_or(0.0);
     let ttf_secs = ttf(sensor, now_value, slope);
-    let health = sensor_health_text(signal, vote, None);
+    let health = sensor_health_text(db, signal, vote, None);
+    let trip = &db.terms().trip;
 
     let rule = if causal.root.is_some() {
         Verdict::G3AdverseUpstreamCause
@@ -108,10 +111,10 @@ pub fn evaluate_alarm(
     let mut facts = vec![
         Fact::new("적용 규칙", "상류 설비의 변곡이 배관 지연 범위 안에서 하류 경보보다 앞서면 상류 파급 원인, 상류 이상 없이 경보 설비만 변하면 단위 설비 단독 고장"),
         Fact::new("경보 위치", place(db, &sensor.kks)),
-        Fact::new("경보 계측값", format!("{} {} {} ({})", sensor.label, fmt_value(now_value), sensor.unit, limits(sensor))),
+        Fact::new("경보 계측값", format!("{} {} {} ({})", sensor.label, fmt_value(now_value), sensor.unit, limits(db, sensor))),
     ];
     if let Some(t) = ttf_secs {
-        facts.push(Fact::new("트립 도달 예상", format!("{t:.0}초 (초당 {:+.2} {})", slope, sensor.unit)));
+        facts.push(Fact::new(format!("{trip} 도달 예상"), format!("{t:.0}초 (초당 {:+.2} {})", slope, sensor.unit)));
     }
     let mut axes = Vec::new();
     match &causal.root {
@@ -163,15 +166,15 @@ pub fn evaluate_alarm(
                 name: "경보 계측값 추세".into(),
                 facts: vec![
                     Fact::new("현재값", change(sensor, now_value)),
-                    Fact::new("한계", limits(sensor)),
-                    Fact::new("추세", ttf_secs.map(|t| format!("트립까지 {t:.0}초")).unwrap_or_else(|| "트립 방향 추세 없음".into())),
+                    Fact::new("한계", limits(db, sensor)),
+                    Fact::new("추세", ttf_secs.map(|t| format!("{trip}까지 {t:.0}초")).unwrap_or_else(|| format!("{trip} 방향 추세 없음"))),
                 ],
             });
         }
     }
     axes.push(Axis { name: AXIS_SENSOR.into(), facts: vec![Fact::new("신호 상태", health)] });
 
-    let task = DecisionTask { title: "발전소 계통 이상 근본 원인 및 처분 판정".into(), facts: facts.clone(), options: OPTIONS.to_vec() };
+    let task = DecisionTask { title: db.terms().decision_title(), facts: facts.clone(), options: OPTIONS.to_vec() };
     let decided = match rule {
         Verdict::G3EligibleNormal => judge_by_criteria(rule, &task, (Verdict::G3EligibleNormal, Verdict::G3ViolationHighRisk), &NORMAL_CRITERIA, model)?,
         Verdict::G3AdverseUpstreamCause => judge_by_axes(rule, &task, Verdict::G3ViolationHighRisk, &axes, model)?,
@@ -204,12 +207,12 @@ pub fn evaluate_instrument(
     }
     if let Some(f) = field {
         let unit = sensor.map(|s| s.unit.as_str()).unwrap_or("");
-        facts.push(Fact::new("현장 게이지", format!("{} {unit} (같은 시각 DCS 대표값 {} {unit})", fmt_value(f.field_value), f.dcs_value.map(fmt_value).unwrap_or_else(|| "없음".into()))));
+        facts.push(Fact::new("현장 게이지", format!("{} {unit} (같은 시각 {} 대표값 {} {unit})", fmt_value(f.field_value), db.terms().telemetry, f.dcs_value.map(fmt_value).unwrap_or_else(|| "없음".into()))));
     }
     if let Some(DriftFinding::Isolated { channel, field_confirmed }) = finding {
         facts.push(Fact::new("채널 판정", format!("채널 {channel} 단독 편차{}", if *field_confirmed { ", 현장 게이지가 나머지 채널과 일치" } else { ", 현장 확인 전" })));
     }
-    facts.push(Fact::new("센서 건전성", sensor_health_text(signal, vote, field)));
+    facts.push(Fact::new("센서 건전성", sensor_health_text(db, signal, vote, field)));
     let task = DecisionTask { title: "계측 이상과 실제 공정 변화 판정".into(), facts: facts.clone(), options: vec![rule, Verdict::G3ViolationHighRisk] };
     let decided = decide(rule, &task, model)?;
     Ok(Substantive { decided, causal: None, facts: facts.into_iter().map(|f| (f.key, f.value)).collect(), ttf_secs: None })

@@ -1,0 +1,356 @@
+{
+  "version": 1,
+  "as_of": "2026-11-04",
+  "note": "모두 합성 데이터입니다. 실제 데이터센터 · 설비 · 사람이 아닙니다. 정의는 docs/synthetic-aidc-data.md 에 있습니다.",
+  "plant": {
+    "name": "AI 데이터센터 A캠퍼스 (합성)",
+    "kind": "100MW 하이퍼스케일 AI 데이터센터 (DLC 수냉 GPU 클러스터)",
+    "units": [
+      { "code": "DC1", "label": "센터A", "capacity_mw": 100 },
+      { "code": "DC2", "label": "센터B", "capacity_mw": 100 },
+      { "code": "DC0", "label": "공용설비", "capacity_mw": 0 }
+    ],
+    "domain": "aidc",
+    "code_scheme": "dcim",
+    "terms": {
+      "code": "자산코드",
+      "procedure": "EOP",
+      "procedure_long": "비상 운영절차서(EOP)",
+      "change": "MOP",
+      "telemetry": "BMC·DCIM",
+      "control_room": "NOC 관제실",
+      "drawing": "MEP·SLD",
+      "site": "AI 데이터센터",
+      "field_worker": "현장 엔지니어",
+      "trip": "셧다운",
+      "supervisor": "교대감독",
+      "archive_prefix": "NOC",
+      "permit": "MOP · Hot-Work · LoTo",
+      "bypass": "CDU 우회밸브",
+      "console_title": "100MW AI 데이터센터 자율 관제 콘솔",
+      "kiosk_title": "AI 데이터센터 현장 엔지니어 단말"
+    }
+  },
+  "sectors": [
+    { "key": "compute", "code": "Sector01Compute", "building": "101동", "label": "GPU 컴퓨트 홀", "kks": "DC1Z01", "drawing": "MEP-101-POD", "blurb": "액체냉각(DLC) GPU 랙 · 인랙 매니폴드 · 환수 매니폴드 (Pod A · B)" },
+    { "key": "network", "code": "Sector02Network", "building": "102동", "label": "패브릭·스토리지 홀", "kks": "DC1Z02", "drawing": "NET-102-FAB", "blurb": "800G 광트랜시버 · NVLink/RoCE 리프 · 스파인 스위치 · NVMe 스토리지" },
+    { "key": "cooling", "code": "Sector03Cooling", "building": "103동", "label": "수냉 CDU·칠러룸", "kks": "DC1Z03", "drawing": "MEP-103-CDU", "blurb": "1차 냉수펌프 · CDU 열교환기 · 2차 순환펌프 · 유량조절밸브 · 우회밸브" },
+    { "key": "power", "code": "Sector04Power", "building": "104동", "label": "전력·UPS·수변전실", "kks": "DC1Z04", "drawing": "SLD-104-PWR", "blurb": "22.9kV 수배전반 · UPS · 리튬이온 배터리 · 정적 절체 스위치 · 랙 PDU" },
+    { "key": "facility", "code": "Sector05Facility", "building": "105동", "label": "열원·냉각탑·공조동", "kks": "DC1Z05", "drawing": "MEP-105-CHL", "blurb": "프리쿨링 칠러 · 냉각탑 팬 · 항온항습기(CRAH) · 청정소화설비" }
+  ],
+  "floors": [
+    { "code": "B1F", "label": "지하 1층", "elevation_m": -5.0 },
+    { "code": "1F", "label": "1층", "elevation_m": 0.0 },
+    { "code": "2F", "label": "2층 데이터홀", "elevation_m": 6.0 },
+    { "code": "3F", "label": "3층", "elevation_m": 12.0 },
+    { "code": "RF", "label": "옥상", "elevation_m": 18.0 },
+    { "code": "OUT", "label": "옥외", "elevation_m": 0.0 }
+  ],
+  "drawings": [
+    { "id": "MEP-101-POD", "sector": "compute", "title": "GPU Pod 액체냉각(DLC) 배관 계통도", "rev": "Rev.4", "issued": "2026-09-17", "signer": "FE-102", "ignore_zones": [[0.035, 0.895, 0.66, 0.975]] },
+    { "id": "NET-102-FAB", "sector": "network", "title": "AI 패브릭 · 스토리지 네트워크 계통도", "rev": "Rev.2", "issued": "2026-06-02", "signer": "FE-118", "ignore_zones": [[0.035, 0.895, 0.66, 0.975]] },
+    { "id": "MEP-103-CDU", "sector": "cooling", "title": "CDU 2차 냉각수 분배 및 1차 냉수 계통도", "rev": "Rev.3", "issued": "2026-03-15", "signer": "FE-102", "ignore_zones": [[0.035, 0.895, 0.66, 0.975]] },
+    { "id": "SLD-104-PWR", "sector": "power", "title": "22.9kV 수변전 · UPS · PDU 단선결선도", "rev": "Rev.2", "issued": "2025-12-08", "signer": "FE-118", "ignore_zones": [[0.035, 0.895, 0.66, 0.975]] },
+    { "id": "MEP-105-CHL", "sector": "facility", "title": "열원 · 냉각탑 · 공조 계통도", "rev": "Rev.2", "issued": "2026-01-20", "signer": "FE-102", "ignore_zones": [[0.035, 0.895, 0.66, 0.975]] }
+  ],
+  "equipment": [
+    { "kks": "DC1MNF20MV01", "name": "인랙 매니폴드 Pod B", "sector": "compute", "floor": "2F", "drawing": "MEP-101-POD", "kind": "manifold", "bbox": [0.14, 0.13, 0.305, 0.255] },
+    { "kks": "DC1GPU20RK01", "name": "GPU 랙 Pod B (B200 NVL72)", "sector": "compute", "floor": "2F", "drawing": "MEP-101-POD", "kind": "gpu_rack", "bbox": [0.325, 0.13, 0.49, 0.255] },
+    { "kks": "DC1MNF10MV01", "name": "인랙 매니폴드 Pod A", "sector": "compute", "floor": "2F", "drawing": "MEP-101-POD", "kind": "manifold", "bbox": [0.14, 0.31, 0.305, 0.435] },
+    { "kks": "DC1GPU10RK01", "name": "GPU 랙 Pod A (B200 NVL72)", "sector": "compute", "floor": "2F", "drawing": "MEP-101-POD", "kind": "gpu_rack", "bbox": [0.325, 0.31, 0.49, 0.435] },
+    { "kks": "DC1RTN10MV01", "name": "환수 매니폴드", "sector": "compute", "floor": "2F", "drawing": "MEP-101-POD", "kind": "manifold", "bbox": [0.51, 0.31, 0.675, 0.435] },
+    { "kks": "DC1LKD10BB01", "name": "누수 감지 드립 트레이", "sector": "compute", "floor": "2F", "drawing": "MEP-101-POD", "kind": "tray", "bbox": [0.325, 0.49, 0.49, 0.615] },
+
+    { "kks": "DC1FAB10SW02", "name": "리프 스위치 (NVLink/RoCE)", "sector": "network", "floor": "2F", "drawing": "NET-102-FAB", "kind": "switch", "bbox": [0.14, 0.13, 0.305, 0.255] },
+    { "kks": "DC1FAB10SW01", "name": "스파인 스위치", "sector": "network", "floor": "2F", "drawing": "NET-102-FAB", "kind": "switch", "bbox": [0.325, 0.13, 0.49, 0.255] },
+    { "kks": "DC1OPT10SW01", "name": "800G 광트랜시버 모듈", "sector": "network", "floor": "2F", "drawing": "NET-102-FAB", "kind": "transceiver", "bbox": [0.51, 0.13, 0.675, 0.255] },
+    { "kks": "DC1STR10NV01", "name": "NVMe 스토리지 어레이", "sector": "network", "floor": "1F", "drawing": "NET-102-FAB", "kind": "storage", "bbox": [0.325, 0.31, 0.49, 0.435] },
+    { "kks": "DC1IRC10AN01", "name": "인로우 쿨러 (패브릭 홀)", "sector": "network", "floor": "2F", "drawing": "NET-102-FAB", "kind": "fan", "bbox": [0.51, 0.31, 0.675, 0.435] },
+
+    { "kks": "DC1CHW10AP01", "name": "1차 냉수펌프 A", "sector": "cooling", "floor": "1F", "drawing": "MEP-103-CDU", "kind": "pump", "bbox": [0.14, 0.13, 0.305, 0.255] },
+    { "kks": "DC1CDU10AC01", "name": "CDU 판형 열교환기", "sector": "cooling", "floor": "2F", "drawing": "MEP-103-CDU", "kind": "exchanger", "bbox": [0.325, 0.13, 0.49, 0.255] },
+    { "kks": "DC1CDU10BB01", "name": "CDU 팽창탱크", "sector": "cooling", "floor": "2F", "drawing": "MEP-103-CDU", "kind": "tank", "bbox": [0.51, 0.13, 0.675, 0.255] },
+    { "kks": "DC1CDU20AA03", "name": "CDU 우회밸브", "sector": "cooling", "floor": "2F", "drawing": "MEP-103-CDU", "kind": "valve", "bbox": [0.695, 0.13, 0.86, 0.255] },
+    { "kks": "DC1CDU10AP01", "name": "CDU 2차 순환펌프 A", "sector": "cooling", "floor": "2F", "drawing": "MEP-103-CDU", "kind": "pump", "bbox": [0.325, 0.31, 0.49, 0.435] },
+    { "kks": "DC1CDU20AA02", "name": "CDU 2차측 유량조절밸브", "sector": "cooling", "floor": "2F", "drawing": "MEP-103-CDU", "kind": "valve", "bbox": [0.695, 0.31, 0.86, 0.435] },
+    { "kks": "DC1MKU10AP01", "name": "보충수 펌프", "sector": "cooling", "floor": "B1F", "drawing": "MEP-103-CDU", "kind": "pump", "bbox": [0.695, 0.49, 0.86, 0.615] },
+
+    { "kks": "DC1TRF10GT01", "name": "22.9kV 주변압기", "sector": "power", "floor": "OUT", "drawing": "SLD-104-PWR", "kind": "transformer", "bbox": [0.14, 0.13, 0.305, 0.255] },
+    { "kks": "DC1SWG10CB01", "name": "22.9kV 수배전반 VCB", "sector": "power", "floor": "1F", "drawing": "SLD-104-PWR", "kind": "breaker", "bbox": [0.325, 0.13, 0.49, 0.255] },
+    { "kks": "DC1UPS10GU01", "name": "UPS 모듈 A", "sector": "power", "floor": "1F", "drawing": "SLD-104-PWR", "kind": "ups", "bbox": [0.51, 0.13, 0.675, 0.255] },
+    { "kks": "DC1PDU10CB01", "name": "랙 PDU A (Pod A)", "sector": "power", "floor": "2F", "drawing": "SLD-104-PWR", "kind": "pdu", "bbox": [0.695, 0.13, 0.86, 0.255] },
+    { "kks": "DC1BES10BT01", "name": "리튬이온 배터리 랙", "sector": "power", "floor": "B1F", "drawing": "SLD-104-PWR", "kind": "battery", "bbox": [0.14, 0.31, 0.305, 0.435] },
+    { "kks": "DC1STS10CB01", "name": "정적 절체 스위치(STS)", "sector": "power", "floor": "1F", "drawing": "SLD-104-PWR", "kind": "breaker", "bbox": [0.325, 0.31, 0.49, 0.435] },
+    { "kks": "DC1GEN10GS01", "name": "비상 디젤 발전기", "sector": "power", "floor": "OUT", "drawing": "SLD-104-PWR", "kind": "generator", "bbox": [0.51, 0.31, 0.675, 0.435] },
+    { "kks": "DC1CRA20AN01", "name": "배터리실 공조기", "sector": "power", "floor": "B1F", "drawing": "SLD-104-PWR", "kind": "crah", "bbox": [0.14, 0.49, 0.305, 0.615] },
+
+    { "kks": "DC1CWP10AP01", "name": "냉각수 펌프", "sector": "facility", "floor": "1F", "drawing": "MEP-105-CHL", "kind": "pump", "bbox": [0.14, 0.13, 0.305, 0.255] },
+    { "kks": "DC1CTW10AN01", "name": "냉각탑 팬 A", "sector": "facility", "floor": "RF", "drawing": "MEP-105-CHL", "kind": "fan", "bbox": [0.325, 0.13, 0.49, 0.255] },
+    { "kks": "DC1CRA10AN01", "name": "항온항습기(CRAH) A", "sector": "facility", "floor": "2F", "drawing": "MEP-105-CHL", "kind": "crah", "bbox": [0.695, 0.13, 0.86, 0.255] },
+    { "kks": "DC1CHL10CH01", "name": "프리쿨링 칠러 A", "sector": "facility", "floor": "1F", "drawing": "MEP-105-CHL", "kind": "chiller", "bbox": [0.51, 0.31, 0.675, 0.435] },
+    { "kks": "DC1CTW20AN01", "name": "냉각탑 팬 B (예비)", "sector": "facility", "floor": "RF", "drawing": "MEP-105-CHL", "kind": "fan", "bbox": [0.325, 0.49, 0.49, 0.615] },
+    { "kks": "DC1FMS10BB01", "name": "청정소화설비(FM-200) 저장용기", "sector": "facility", "floor": "1F", "drawing": "MEP-105-CHL", "kind": "fire", "bbox": [0.695, 0.49, 0.86, 0.615] }
+  ],
+  "sensors": [
+    { "tag": "DC1MNF20CP01", "kks": "DC1MNF20MV01", "label": "매니폴드 공급 압력", "unit": "bar", "normal": 2.4, "alarm_low": 1.6, "trip_low": 1.2, "deadband": 0.02, "max_slew": 1.0 },
+    { "tag": "DC1GPU20CT01", "kks": "DC1GPU20RK01", "label": "GPU 정션 온도", "unit": "°C", "normal": 67.0, "alarm_high": 88.0, "trip_high": 95.0, "deadband": 0.3, "max_slew": 12.0 },
+    { "tag": "DC1MNF10CP01", "kks": "DC1MNF10MV01", "label": "매니폴드 공급 압력", "unit": "bar", "normal": 2.4, "alarm_low": 1.6, "trip_low": 1.2, "deadband": 0.02, "max_slew": 1.0 },
+    { "tag": "DC1GPU10CT01", "kks": "DC1GPU10RK01", "label": "GPU 정션 온도", "unit": "°C", "normal": 68.0, "alarm_high": 88.0, "trip_high": 95.0, "deadband": 0.3, "max_slew": 12.0 },
+    { "tag": "DC1GPU10CT02", "kks": "DC1GPU10RK01", "label": "랙 냉각수 출구 온도", "unit": "°C", "normal": 38.0, "alarm_high": 41.0, "trip_high": 45.0, "deadband": 0.2, "max_slew": 3.0 },
+    { "tag": "DC1GPU10CE01", "kks": "DC1GPU10RK01", "label": "랙 소비전력", "unit": "kW", "normal": 132.0, "alarm_high": 150.0, "trip_high": 160.0, "deadband": 1.0, "max_slew": 60.0 },
+    { "tag": "DC1RTN10CT01", "kks": "DC1RTN10MV01", "label": "환수 온도", "unit": "°C", "normal": 40.0, "alarm_high": 45.0, "trip_high": 50.0, "deadband": 0.2, "max_slew": 3.0 },
+    { "tag": "DC1OPT10CT01", "kks": "DC1OPT10SW01", "label": "광트랜시버 온도", "unit": "°C", "normal": 55.0, "alarm_high": 75.0, "trip_high": 85.0, "deadband": 0.3, "max_slew": 5.0 },
+    { "tag": "DC1FAB10CE01", "kks": "DC1FAB10SW01", "label": "스위치 소비전력", "unit": "kW", "normal": 2.8, "alarm_high": 3.6, "deadband": 0.05, "max_slew": 1.0 },
+    { "tag": "DC1IRC10CT01", "kks": "DC1IRC10AN01", "label": "토출 공기 온도", "unit": "°C", "normal": 22.0, "alarm_high": 27.0, "trip_high": 32.0, "deadband": 0.2, "max_slew": 3.0 },
+    { "tag": "DC1CHW10CF01", "kks": "DC1CHW10AP01", "label": "1차 냉수 유량", "unit": "LPM", "normal": 2400.0, "alarm_low": 1800.0, "deadband": 20.0, "max_slew": 600.0 },
+    { "tag": "DC1CDU10CT01", "kks": "DC1CDU10AC01", "label": "2차 공급 온도", "unit": "°C", "normal": 32.0, "alarm_high": 35.0, "trip_high": 38.0, "deadband": 0.2, "max_slew": 3.0 },
+    { "tag": "DC1CDU10CL01", "kks": "DC1CDU10BB01", "label": "팽창탱크 수위", "unit": "%", "normal": 60.0, "alarm_low": 35.0, "alarm_high": 85.0, "deadband": 0.5, "max_slew": 5.0 },
+    { "tag": "DC1CDU10CP01", "kks": "DC1CDU10AP01", "label": "토출 압력", "unit": "bar", "normal": 2.8, "alarm_high": 3.0, "trip_high": 4.0, "deadband": 0.02, "max_slew": 1.0 },
+    { "tag": "DC1CDU10CY01", "kks": "DC1CDU10AP01", "label": "베어링 진동", "unit": "mm/s", "normal": 2.2, "alarm_high": 7.1, "trip_high": 11.0, "deadband": 0.1, "max_slew": 3.0 },
+    { "tag": "DC1CDU20CG02", "kks": "DC1CDU20AA02", "label": "밸브 개도", "unit": "%", "normal": 78.0, "alarm_low": 45.0, "deadband": 0.5, "max_slew": 100.0 },
+    { "tag": "DC1CDU20CF01", "kks": "DC1CDU20AA02", "label": "2차측 공급 유량", "unit": "LPM", "normal": 1200.0, "alarm_low": 900.0, "deadband": 10.0, "max_slew": 600.0 },
+    { "tag": "DC1CDU20CG03", "kks": "DC1CDU20AA03", "label": "우회밸브 개도", "unit": "%", "normal": 0.0, "deadband": 0.5, "max_slew": 100.0 },
+    { "tag": "DC1TRF10CT01", "kks": "DC1TRF10GT01", "label": "변압기 유온", "unit": "°C", "normal": 62.0, "alarm_high": 85.0, "trip_high": 95.0, "deadband": 0.5, "max_slew": 3.0 },
+    { "tag": "DC1UPS10CE01", "kks": "DC1UPS10GU01", "label": "UPS 출력 부하", "unit": "kW", "normal": 1250.0, "alarm_high": 1500.0, "trip_high": 1650.0, "deadband": 5.0, "max_slew": 400.0 },
+    { "tag": "DC1PDU10CE01", "kks": "DC1PDU10CB01", "label": "PDU 분기 전류", "unit": "A", "normal": 182.0, "alarm_high": 230.0, "trip_high": 250.0, "deadband": 2.0, "max_slew": 200.0 },
+    { "tag": "DC1BES10CT01", "kks": "DC1BES10BT01", "label": "배터리 셀 최고 온도", "unit": "°C", "normal": 31.0, "alarm_high": 60.0, "trip_high": 90.0, "deadband": 0.3, "max_slew": 6.0 },
+    { "tag": "DC1BES10CQ01", "kks": "DC1BES10BT01", "label": "오프가스(H2) 농도", "unit": "ppm", "normal": 2.0, "alarm_high": 25.0, "trip_high": 50.0, "deadband": 0.2, "max_slew": 15.0 },
+    { "tag": "DC1CRA20CT01", "kks": "DC1CRA20AN01", "label": "배터리실 공기 온도", "unit": "°C", "normal": 23.0, "alarm_high": 30.0, "trip_high": 35.0, "deadband": 0.2, "max_slew": 3.0 },
+    { "tag": "DC1CTW10CE01", "kks": "DC1CTW10AN01", "label": "냉각탑 팬 인버터 전류", "unit": "A", "normal": 360.0, "alarm_low": 250.0, "deadband": 5.0, "max_slew": 200.0 },
+    { "tag": "DC1CHL10CT01", "kks": "DC1CHL10CH01", "label": "냉수 공급 온도", "unit": "°C", "normal": 18.0, "alarm_high": 21.0, "trip_high": 26.0, "deadband": 0.15, "max_slew": 5.0 },
+    { "tag": "DC1CRA10CT01", "kks": "DC1CRA10AN01", "label": "공급 공기 온도", "unit": "°C", "normal": 22.0, "alarm_high": 27.0, "trip_high": 32.0, "deadband": 0.2, "max_slew": 3.0 },
+    { "tag": "DC1FMS10CP01", "kks": "DC1FMS10BB01", "label": "소화약제 저장 압력", "unit": "bar", "normal": 25.0, "alarm_low": 21.0, "deadband": 0.1, "max_slew": 2.0 }
+  ],
+  "edges": [
+    { "from": "DC1TRF10GT01", "to": "DC1SWG10CB01", "medium": "power", "label": "22.9kV 수전", "lag": [0.0, 0.2] },
+    { "from": "DC1GEN10GS01", "to": "DC1SWG10CB01", "medium": "power", "label": "비상 전원", "lag": [0.0, 0.5] },
+    { "from": "DC1SWG10CB01", "to": "DC1UPS10GU01", "medium": "power", "label": "UPS 입력", "lag": [0.0, 0.2] },
+    { "from": "DC1BES10BT01", "to": "DC1UPS10GU01", "medium": "power", "label": "배터리 DC", "lag": [0.0, 0.2] },
+    { "from": "DC1UPS10GU01", "to": "DC1STS10CB01", "medium": "power", "label": "UPS 출력", "lag": [0.0, 0.2], "flow_tag": "DC1UPS10CE01" },
+    { "from": "DC1STS10CB01", "to": "DC1PDU10CB01", "medium": "power", "label": "415V 분기", "lag": [0.0, 0.2] },
+    { "from": "DC1PDU10CB01", "to": "DC1GPU10RK01", "medium": "power", "label": "랙 전원 415V", "lag": [0.0, 0.5], "flow_tag": "DC1PDU10CE01" },
+    { "from": "DC1UPS10GU01", "to": "DC1CDU10AP01", "medium": "power", "label": "UPS 전원 480V", "lag": [0.0, 0.5] },
+    { "from": "DC1SWG10CB01", "to": "DC1CHL10CH01", "medium": "power", "label": "칠러 전원", "lag": [0.0, 0.5] },
+    { "from": "DC1CRA20AN01", "to": "DC1BES10BT01", "medium": "airflow", "label": "배터리실 냉기", "lag": [2.0, 20.0] },
+
+    { "from": "DC1CWP10AP01", "to": "DC1CTW10AN01", "medium": "condenser_water", "label": "냉각수", "lag": [1.0, 6.0] },
+    { "from": "DC1CTW10AN01", "to": "DC1CHL10CH01", "medium": "condenser_water", "label": "냉각수 (응축기)", "lag": [0.5, 4.0] },
+    { "from": "DC1CTW20AN01", "to": "DC1CHL10CH01", "medium": "condenser_water", "label": "냉각수 (예비)", "lag": [0.5, 4.0] },
+    { "from": "DC1CHL10CH01", "to": "DC1CRA10AN01", "medium": "chilled_water", "label": "냉수", "lag": [2.0, 10.0] },
+    { "from": "DC1CHL10CH01", "to": "DC1CHW10AP01", "medium": "chilled_water", "label": "1차 냉수 공급", "lag": [2.0, 10.0] },
+    { "from": "DC1CRA10AN01", "to": "DC1IRC10AN01", "medium": "airflow", "label": "냉기 공급", "lag": [1.0, 8.0] },
+    { "from": "DC1IRC10AN01", "to": "DC1OPT10SW01", "medium": "airflow", "label": "랙 흡입 냉기", "lag": [1.0, 8.0] },
+
+    { "from": "DC1CHW10AP01", "to": "DC1CDU10AC01", "medium": "chilled_water", "label": "1차 냉수", "lag": [1.0, 5.0], "flow_tag": "DC1CHW10CF01" },
+    { "from": "DC1CDU10AC01", "to": "DC1CDU10AP01", "medium": "coolant", "label": "2차 냉각수", "lag": [0.5, 3.0] },
+    { "from": "DC1CDU10BB01", "to": "DC1CDU10AP01", "medium": "coolant", "label": "팽창 · 보충", "lag": [1.0, 6.0] },
+    { "from": "DC1MKU10AP01", "to": "DC1CDU10BB01", "medium": "coolant", "label": "보충수", "lag": [5.0, 30.0] },
+    { "from": "DC1CDU10AP01", "to": "DC1CDU20AA02", "medium": "coolant", "label": "2차 냉각수 공급", "lag": [0.2, 2.0] },
+    { "from": "DC1CDU20AA02", "to": "DC1MNF10MV01", "medium": "coolant", "label": "2차 냉각수 공급", "lag": [1.5, 8.0], "flow_tag": "DC1CDU20CF01" },
+    { "from": "DC1CDU10AP01", "to": "DC1CDU20AA03", "medium": "coolant", "label": "우회", "lag": [0.2, 2.0] },
+    { "from": "DC1CDU20AA03", "to": "DC1MNF10MV01", "medium": "coolant", "label": "2차 냉각수 공급", "lag": [1.5, 8.0] },
+
+    { "from": "DC1MNF10MV01", "to": "DC1GPU10RK01", "medium": "coolant", "label": "콜드플레이트 공급", "lag": [0.5, 4.0] },
+    { "from": "DC1MNF10MV01", "to": "DC1MNF20MV01", "medium": "coolant", "label": "Pod B 분기", "lag": [0.5, 3.0] },
+    { "from": "DC1MNF20MV01", "to": "DC1GPU20RK01", "medium": "coolant", "label": "콜드플레이트 공급", "lag": [0.5, 4.0] },
+    { "from": "DC1GPU10RK01", "to": "DC1RTN10MV01", "medium": "coolant", "label": "환수", "lag": [0.5, 3.0] },
+    { "from": "DC1GPU20RK01", "to": "DC1RTN10MV01", "medium": "coolant", "label": "환수", "lag": [0.5, 3.0] },
+    { "from": "DC1RTN10MV01", "to": "DC1CDU10AC01", "medium": "coolant", "label": "2차 냉각수 환수", "lag": [2.0, 10.0] },
+    { "from": "DC1GPU10RK01", "to": "DC1LKD10BB01", "medium": "coolant", "label": "드립 배수", "lag": [1.0, 10.0] },
+
+    { "from": "DC1GPU10RK01", "to": "DC1FAB10SW02", "medium": "network", "label": "RoCE 400G × 8", "lag": [0.0, 0.1] },
+    { "from": "DC1FAB10SW02", "to": "DC1FAB10SW01", "medium": "network", "label": "스파인 업링크", "lag": [0.0, 0.1] },
+    { "from": "DC1FAB10SW01", "to": "DC1OPT10SW01", "medium": "network", "label": "800G 광링크", "lag": [0.0, 0.1] },
+    { "from": "DC1FAB10SW01", "to": "DC1STR10NV01", "medium": "network", "label": "스토리지 패브릭", "lag": [0.0, 0.1] }
+  ],
+  "connectors": [
+    { "id": "OPC-104-101", "from": "DC1PDU10CB01", "to": "DC1GPU10RK01", "out_bbox": [0.882, 0.13, 0.988, 0.23], "in_bbox": [0.012, 0.13, 0.118, 0.23] },
+    { "id": "OPC-104-103", "from": "DC1UPS10GU01", "to": "DC1CDU10AP01", "out_bbox": [0.882, 0.31, 0.988, 0.41], "in_bbox": [0.012, 0.49, 0.118, 0.59] },
+    { "id": "OPC-104-105", "from": "DC1SWG10CB01", "to": "DC1CHL10CH01", "out_bbox": [0.882, 0.49, 0.988, 0.59], "in_bbox": [0.012, 0.31, 0.118, 0.41] },
+    { "id": "OPC-105-103", "from": "DC1CHL10CH01", "to": "DC1CHW10AP01", "out_bbox": [0.882, 0.31, 0.988, 0.41], "in_bbox": [0.012, 0.13, 0.118, 0.23] },
+    { "id": "OPC-105-102", "from": "DC1CRA10AN01", "to": "DC1IRC10AN01", "out_bbox": [0.882, 0.13, 0.988, 0.23], "in_bbox": [0.012, 0.31, 0.118, 0.41] },
+    { "id": "OPC-103-101", "from": "DC1CDU20AA02", "to": "DC1MNF10MV01", "out_bbox": [0.882, 0.31, 0.988, 0.41], "in_bbox": [0.012, 0.31, 0.118, 0.41] },
+    { "id": "OPC-103-101B", "from": "DC1CDU20AA03", "to": "DC1MNF10MV01", "out_bbox": [0.882, 0.13, 0.988, 0.23], "in_bbox": [0.012, 0.49, 0.118, 0.59] },
+    { "id": "OPC-101-103", "from": "DC1RTN10MV01", "to": "DC1CDU10AC01", "out_bbox": [0.882, 0.31, 0.988, 0.41], "in_bbox": [0.012, 0.31, 0.118, 0.41] },
+    { "id": "OPC-101-102", "from": "DC1GPU10RK01", "to": "DC1FAB10SW02", "out_bbox": [0.882, 0.13, 0.988, 0.23], "in_bbox": [0.012, 0.13, 0.118, 0.23] }
+  ],
+  "voting": [
+    { "tag": "DC1MNF10CP01", "logic": "2oo3", "channels": ["A", "B", "C"], "tolerance": 0.15 }
+  ],
+  "moc": [
+    { "moc_no": "MOP-2026-1104", "kks": "DC1CDU10AP01", "tag": "DC1CDU10CP01", "param": "alarm_high", "old": 3.0, "new": 3.5, "unit": "bar", "design_limit": 4.0, "approved_by": "FE-102", "approved_on": "2026-11-03", "status": "approved", "reason": "B200 랙 2단계 증설로 CDU 2차 순환펌프 A 토출 압력 운전 범위 조정 (콜드플레이트 내압 한계 4.0 bar)" },
+    { "moc_no": "MOP-2026-0917", "kks": "DC1GPU10RK01", "tag": "DC1GPU10CT01", "param": "alarm_high", "old": 85.0, "new": 88.0, "unit": "°C", "design_limit": 95.0, "approved_by": "FE-102", "approved_on": "2026-09-10", "status": "closed", "reason": "Rev.4 정식 도면 개정에 반영 완료 (B200 스로틀링 경보 상향)" },
+    { "moc_no": "MOP-2026-1021", "kks": "DC1BES10BT01", "tag": "DC1BES10CT01", "param": "alarm_high", "old": 60.0, "new": 62.0, "unit": "°C", "design_limit": 90.0, "approved_by": "FE-118", "approved_on": null, "status": "pending", "reason": "배터리 모듈 교체 검토 중 (승인 전)" }
+  ],
+  "personnel": [
+    { "id": "NOC-201", "name": "정민호", "role": "교대감독 (NOC)", "authorized_sectors": ["*"] },
+    { "id": "NOC-202", "name": "윤서진", "role": "교대감독 파트장 (NOC)", "authorized_sectors": ["*"] },
+    { "id": "FE-102", "name": "김태현", "role": "기계설비 기술책임자", "authorized_sectors": ["cooling", "compute"] },
+    { "id": "FE-118", "name": "최유나", "role": "전력 · 네트워크 기술책임자", "authorized_sectors": ["power", "network"] },
+    { "id": "FE-205", "name": "이승민", "role": "현장 엔지니어", "authorized_sectors": ["cooling", "compute"] },
+    { "id": "FE-301", "name": "박지훈", "role": "BMC · 계측 담당", "authorized_sectors": ["*"] },
+    { "id": "FE-207", "name": "한도윤", "role": "현장 엔지니어", "authorized_sectors": ["facility", "power"] }
+  ],
+  "aop": [
+    {
+      "id": "EOP-103-CDU02",
+      "title": "CDU 2차측 유량 저하 · 유량조절밸브 고착",
+      "sectors": ["cooling", "compute"],
+      "triggers": ["DC1CDU20CG02", "DC1CDU20CF01", "DC1GPU10CT01"],
+      "steps": [
+        "103동 2층(EL.+6.0m) CDU 우회밸브를 열어 2차측 냉각수 유량을 정상 수준으로 회복한다",
+        "GPU 정션 온도가 셧다운 한계에 가까우면 인접 Pod 로 학습 잡을 드레인(라이브 마이그레이션)한다",
+        "CDU 유량조절밸브 액추에이터와 포지셔너를 현장 점검한다"
+      ],
+      "risk_actions": ["CDU 우회밸브 개방", "학습 잡 드레인"],
+      "high_risk": true
+    },
+    {
+      "id": "EOP-104-BAT01",
+      "title": "UPS 배터리 열폭주 전조 (셀 온도 · 오프가스)",
+      "sectors": ["power"],
+      "triggers": ["DC1BES10CT01", "DC1BES10CQ01"],
+      "steps": [
+        "배터리 랙을 UPS 에서 분리하고 셀 온도와 오프가스 추이를 감시한다",
+        "배터리실 환기와 청정소화설비 대기 상태를 확인한다",
+        "셀 온도가 계속 오르면 Pod 비상 전원 차단(EPO) 뒤 클러스터를 강제 종료한다"
+      ],
+      "risk_actions": ["Pod 비상 전원 차단(EPO)", "클러스터 강제 종료"],
+      "high_risk": true
+    },
+    {
+      "id": "EOP-101-IC01",
+      "title": "계측 채널 편차 (압력 전송기 이상)",
+      "sectors": ["compute"],
+      "triggers": ["DC1MNF10CP01"],
+      "steps": [
+        "편차가 난 채널을 보팅 논리에서 우회하고 남은 채널로 감시한다",
+        "EPO · 밸브 차단을 보류하고 현장 매니폴드 압력계로 실측값을 다시 확인한다",
+        "BMC · 계측 담당이 압력 전송기 영점과 배선을 점검한다"
+      ],
+      "risk_actions": ["EPO · 밸브 차단 보류"],
+      "high_risk": false
+    },
+    {
+      "id": "EOP-105-CTW01",
+      "title": "냉각탑 팬 인버터 이상 · 냉수 공급 온도 상승",
+      "sectors": ["facility", "cooling"],
+      "triggers": ["DC1CHL10CT01", "DC1CTW10CE01"],
+      "steps": [
+        "냉각탑 팬 인버터 전류와 운전 상태를 확인한다",
+        "냉수 공급 온도가 오르면 예비 냉각탑 팬과 프리쿨링 칠러를 추가 기동한다",
+        "온도 상승이 계속되면 GPU 클러스터 전력 상한(Power Capping)을 낮춘다"
+      ],
+      "risk_actions": ["예비 설비 추가 기동", "GPU 전력 상한 하향"],
+      "high_risk": true
+    },
+    {
+      "id": "EOP-102-NET01",
+      "title": "광트랜시버 과열 · 링크 플랩",
+      "sectors": ["network"],
+      "triggers": ["DC1OPT10CT01"],
+      "steps": [
+        "과열된 광트랜시버의 링크를 예비 경로로 우회한다",
+        "패브릭 홀 인로우 쿨러와 항온항습기 토출 온도를 확인한다",
+        "링크 플랩이 계속되면 트랜시버를 현장 교체한다"
+      ],
+      "risk_actions": [],
+      "high_risk": false
+    },
+    {
+      "id": "EOP-COM-BMC02",
+      "title": "텔레메트리 값 고정 (BMC 데몬 행)",
+      "sectors": ["*"],
+      "triggers": [],
+      "steps": [
+        "고정된 텔레메트리를 감시 대상에서 빼고 예비 센서나 현장 순시로 감시한다",
+        "BMC · 계측 담당이 BMC 텔레메트리 데몬과 수집 에이전트를 점검한다"
+      ],
+      "risk_actions": [],
+      "high_risk": false,
+      "role": "flatline"
+    },
+    {
+      "id": "EOP-COM-EMI01",
+      "title": "순간 잡음 (스파이크)",
+      "sectors": ["*"],
+      "triggers": [],
+      "steps": [
+        "잡음으로 걸러진 값은 감시 기록에 남기고 계속 감시한다",
+        "같은 잡음이 반복되면 센서 케이블 차폐 · 접지와 BMC 펌웨어를 점검한다"
+      ],
+      "risk_actions": [],
+      "high_risk": false,
+      "role": "spike"
+    }
+  ],
+  "a0_drawings": [
+    {
+      "id": "MEP-100-ALL-A0",
+      "title": "센터A 주요 계통 종합 계통도",
+      "rev": "Rev.1",
+      "size_mm": [1189, 841],
+      "dpi": 150,
+      "pixel_size": [7016, 4961],
+      "sheet_px": [2000, 1400],
+      "grid": { "rows": 4, "cols": 4, "overlap": 0.1 },
+      "sheets": [
+        { "drawing": "MEP-101-POD", "x": 170, "y": 930 },
+        { "drawing": "NET-102-FAB", "x": 2508, "y": 930 },
+        { "drawing": "MEP-103-CDU", "x": 4846, "y": 930 },
+        { "drawing": "SLD-104-PWR", "x": 170, "y": 2630 },
+        { "drawing": "MEP-105-CHL", "x": 2508, "y": 2630 }
+      ]
+    }
+  ],
+  "interlocks": [
+    {
+      "aop_id": "EOP-103-CDU02",
+      "target": "DC1CDU20AA02",
+      "fault": "VALVE_STUCK_LOW",
+      "steps": [
+        { "no": 1, "req_depth": -1, "kks": "DC1CDU10AP01", "check": { "kind": "below", "tag": "DC1CDU10CP01", "value": 3.8 }, "text": "[Depth -1 선행] 상류 CDU 2차 순환펌프 A 토출압력이 3.8 bar 이하(안전 범위)인지 확인" },
+        { "no": 2, "req_depth": 0, "kks": "DC1CDU20AA03", "check": { "kind": "at_least", "tag": "DC1CDU20CG03", "value": 50.0 }, "text": "[Depth 0 우회] CDU 우회밸브(DC1CDU20AA03) 개도 50% 이상 개방 확인" },
+        { "no": 3, "req_depth": 0, "kks": "DC1CDU20AA02", "check": { "kind": "loto" }, "text": "[현장 서명] 고착된 2차측 유량조절밸브 차단과 현장 엔지니어 LoTo 점검표 서명 확인" }
+      ]
+    }
+  ],
+  "symbol_legend": [
+    { "class": "pump", "label": "펌프", "shape": "원 + 삼각 받침 + 토출구", "kinds": ["pump"] },
+    { "class": "valve", "label": "밸브", "shape": "나비넥타이 (▷◁)", "kinds": ["valve"] },
+    { "class": "fan", "label": "팬 · 공조기", "shape": "원 + 날개", "kinds": ["fan", "crah"] },
+    { "class": "exchanger", "label": "열교환기 · 칠러", "shape": "원 + 지그재그 관", "kinds": ["exchanger", "chiller"] },
+    { "class": "vessel", "label": "용기 · 매니폴드", "shape": "세로 캡슐", "kinds": ["manifold", "tank", "fire", "tray"] },
+    { "class": "breaker", "label": "차단기 · 절체 스위치", "shape": "사각 + X", "kinds": ["breaker"] },
+    { "class": "transformer", "label": "변압기", "shape": "겹친 원 두 개", "kinds": ["transformer"] },
+    { "class": "generator", "label": "발전기", "shape": "원 + 사인파", "kinds": ["generator"] },
+    { "class": "panel", "label": "랙 · 전원 · 네트워크반", "shape": "사각 + 가로줄", "kinds": ["gpu_rack", "ups", "pdu", "battery", "switch", "transceiver", "storage"] }
+  ],
+  "history": [
+    { "date": "2026-03-15", "drawing": "MEP-103-CDU", "kind": "revision", "rev": "Rev.3", "note": "B200 1단계 증설 후 정식 도면 개정" },
+    { "date": "2026-05-20", "kks": "DC1CDU10AP01", "kind": "like_for_like", "note": "메커니컬 실 동일 사양 교체 (도면 변경 없음)" },
+    { "date": "2026-09-17", "drawing": "MEP-101-POD", "kind": "revision", "rev": "Rev.4", "note": "GPU 정션 경보 한계 MOP-2026-0917 반영" },
+    { "date": "2026-10-28", "kks": "DC1CDU10AP01", "kind": "moc", "moc": "MOP-2026-1104", "note": "B200 2단계 증설 · Red-line 반영 대기" }
+  ],
+  "physics": {
+    "valve": "DC1CDU20AA02",
+    "bypass": "DC1CDU20AA03",
+    "tag_valve": "DC1CDU20CG02",
+    "tag_bypass": "DC1CDU20CG03",
+    "tag_flow": "DC1CDU20CF01",
+    "tag_pump": "DC1CDU10CP01",
+    "tag_hot": "DC1GPU10CT01",
+    "qd": 1200.0,
+    "u0": 0.78,
+    "kb": 0.42,
+    "p0": 2.8,
+    "p_gain": 0.6,
+    "t0": 68.0,
+    "tin": 20.0,
+    "m": 14400.0,
+    "advection_ms": 4200,
+    "shown": ["DC1CDU20CG02", "DC1CDU20CG03", "DC1CDU20CF01", "DC1CDU10CP01", "DC1GPU10CT01"],
+    "drift_tag": "DC1MNF10CP01",
+    "drift_bias": -1.6
+  }
+}

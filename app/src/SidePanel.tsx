@@ -1,8 +1,9 @@
 import { useMemo } from "react";
+import { shortTag, useTerms } from "./domain";
 import { fmt, hopDepths, level, sensorsOf, valueAt } from "./plant";
 import type { Detail, IssueReport, Plant, VerdictInfo } from "./types";
 
-const LEVEL_TEXT = { normal: "정상", warn: "주의", alarm: "경보", trip: "트립 한계" };
+const LEVEL_TEXT = { normal: "정상", warn: "주의", alarm: "경보", trip: "보호 정지 한계" };
 
 /** 우측 속성 패널: 선택 설비의 계측 · 기준치와 마인드맵 홉 뎁스 목록 (기획 Part 8 6.2절) */
 const ISSUE_ICON: Record<string, string> = { equipment: "🔥", cascade: "⚠️", sensor: "📟", procedure: "🛑", moc: "📝" };
@@ -33,6 +34,7 @@ function IssueTree({ issues, onSelect }: { issues: IssueReport; onSelect: (kks: 
 }
 
 export function SidePanel({ plant, detail, selected, onSelect, t, catalog }: { plant: Plant | null; detail: Detail | null; selected: string | null; onSelect: (kks: string) => void; t: number | null; catalog: Record<string, VerdictInfo> }) {
+  const terms = useTerms();
   const eq = plant?.equipment.find((e) => e.kks === selected);
   const depths = useMemo(() => (plant && selected ? [...hopDepths(plant.edges, selected, 3)].sort((a, b) => a[1] - b[1]) : []), [plant, selected]);
   if (!plant || !eq) return <section className="side empty">설비를 고르세요 (도면 · Mermaid · 마인드맵 어디서든)</section>;
@@ -49,7 +51,7 @@ export function SidePanel({ plant, detail, selected, onSelect, t, catalog }: { p
       {isAlarm && !isRoot && <div className="callout procedural">⚠️ [경보 설비] {eq.name}</div>}
       {!isRoot && !isAlarm && <div className="callout">[선택 설비] {eq.name}</div>}
       <dl className="props">
-        <dt>KKS</dt>
+        <dt>{terms.code}</dt>
         <dd className="mono">{eq.kks}</dd>
         <dt>섹터 · 층</dt>
         <dd>
@@ -64,17 +66,17 @@ export function SidePanel({ plant, detail, selected, onSelect, t, catalog }: { p
           return (
             <div key={s.tag} className="sensor-line">
               <dt>
-                {s.label} <span className="mono muted">{s.tag.slice(7)}</span>
+                {s.label} <span className="mono muted">{shortTag(s.tag)}</span>
               </dt>
               <dd>
                 <b className={`lv-text-${lv}`}>
                   {fmt(v)} {s.unit}
                 </b>{" "}
                 <span className="muted">
-                  (정상 {fmt(s.normal)} · 경보 {fmt(limit[0])} · 트립 {fmt(limit[1])})
+                  (정상 {fmt(s.normal)} · 경보 {fmt(limit[0])} · {terms.trip} {fmt(limit[1])})
                 </span>{" "}
                 <em className={`lv-tag lv-${lv}`}>{LEVEL_TEXT[lv]}</em>
-                {s.overlay && <em className="overlay-tag">MOC {s.overlay} 반영</em>}
+                {s.overlay && <em className="overlay-tag">{s.overlay} 반영</em>}
               </dd>
             </div>
           );

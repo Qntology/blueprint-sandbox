@@ -16,6 +16,7 @@ pub mod audit;
 pub mod case;
 pub mod causal;
 pub mod decision;
+pub mod domain;
 pub mod drafting;
 pub mod extract;
 pub mod factcheck;

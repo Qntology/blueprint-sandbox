@@ -21,7 +21,6 @@ pub trait TextWriter: Send + Sync {
     fn complete(&self, system: &str, user: &str, max_tokens: usize) -> Result<String>;
 }
 
-const AOP_SYSTEM: &str = "발전소 주제어실의 비정상 운전절차서(AOP) 초안 작성 담당입니다. 주어진 사실만 씁니다. 사실에 없는 숫자, 설비 코드, 시각을 만들지 않습니다. 영문 판정 코드를 쓰지 않습니다.";
 const AOP_TOKENS: usize = 140;
 const EXCUSE_TOKENS: usize = 24;
 
@@ -93,7 +92,8 @@ fn problems_of(text: &str, source: &str) -> Vec<String> {
 }
 
 /// AOP 초안을 씁니다. 모델이 없거나 두 번 다 대조에 걸리면 `template` 요약을 씁니다.
-pub fn draft_aop(writer: Option<&dyn TextWriter>, aop: &AopRow, facts: &[String], template: &str) -> AopDraft {
+/// `system` 은 도메인 용어로 만든 지시문입니다 ([`crate::domain::Terms::drafting_system`]: 발전소 주제어실 · 데이터센터 NOC 관제실).
+pub fn draft_aop(writer: Option<&dyn TextWriter>, system: &str, aop: &AopRow, facts: &[String], template: &str) -> AopDraft {
     // 표준 절차서 문장의 숫자(EL.+9.0m 등)도 원문으로 봅니다.
     let source = format!("{}\n{}\n{}", facts.join("\n"), aop.steps.join("\n"), aop.id);
     let base = AopDraft {
@@ -126,7 +126,7 @@ pub fn draft_aop(writer: Option<&dyn TextWriter>, aop: &AopRow, facts: &[String]
     tries.push(format!("{ask}\n\n주의: 숫자와 설비 코드는 사실에 있는 것만 그대로 쓰세요. 쓸 수 있는 값: {}", known.join(", ")));
     for prompt in tries {
         attempts += 1;
-        let text = match writer.complete(AOP_SYSTEM, &prompt, AOP_TOKENS) {
+        let text = match writer.complete(system, &prompt, AOP_TOKENS) {
             Ok(t) => clean(&t),
             Err(e) => {
                 problems.push(format!("글쓰기 실패: {e}"));
@@ -144,12 +144,11 @@ pub fn draft_aop(writer: Option<&dyn TextWriter>, aop: &AopRow, facts: &[String]
 }
 
 /// 현장 자유 서술 소명을 표준 소명으로 바꿉니다. 모르는 답이면 None 이고, 그대로 교대감독에게 갑니다.
-pub fn normalize_excuse(writer: &dyn TextWriter, text: &str) -> Result<Option<DeviationExcuse>> {
-    const SYSTEM: &str = "발전소 현장 운전원의 편차 소명을 표준 코드로 분류합니다. 코드 하나만 답합니다.";
+pub fn normalize_excuse(writer: &dyn TextWriter, system: &str, text: &str) -> Result<Option<DeviationExcuse>> {
     let ask = format!(
         "코드 목록:\nEXCUSE_TRANSMITTER_DRIFT: 현장 게이지는 정상이고 전송기 · 계측기 값이 흔들린다는 내용\nEXCUSE_MOC_CHANGE: 정비 · 부품 교체로 운전 사양이 바뀌었다는 내용\nEXCUSE_MANUAL_BYPASS: 현장에서 바이패스 밸브를 손으로 조작 중이라는 내용\nEXCUSE_OTHER: 그 밖의 내용\n\n소명: {text}"
     );
-    let answer = writer.complete(SYSTEM, &ask, EXCUSE_TOKENS)?;
+    let answer = writer.complete(system, &ask, EXCUSE_TOKENS)?;
     Ok(if answer.contains("EXCUSE_TRANSMITTER_DRIFT") {
         Some(DeviationExcuse::TransmitterDrift)
     } else if answer.contains("EXCUSE_MOC_CHANGE") {
@@ -192,6 +191,7 @@ mod tests {
             steps: vec!["103동 2층(EL.+9.0m) 보조 급수 바이패스 밸브를 수동으로 연다".into(), "출력을 감발한다".into()],
             risk_actions: vec!["출력 감발".into()],
             high_risk: true,
+            role: None,
         }
     }
 
@@ -205,11 +205,12 @@ mod tests {
     }
 
     const TEMPLATE: &str = "과열기 출구 증기 온도가 638.0 °C 로 올랐습니다.";
+    const SYS: &str = "발전소 주제어실의 비정상 운전절차서(AOP) 초안 작성 담당입니다.";
 
     #[test]
     fn a_clean_model_summary_is_kept() {
         let w = script(&["101동 과열기 출구 온도 638.0 °C 상승은 103동 급수조절밸브(10LAB20AA102) 개도가 18.0 %로 고착되어 급수 유량이 1,120 t/h 로 줄었기 때문입니다."]);
-        let d = draft_aop(Some(&w), &aop(), &facts(), TEMPLATE);
+        let d = draft_aop(Some(&w), SYS, &aop(), &facts(), TEMPLATE);
         assert!(d.by_model && d.verified, "{:?}", d.problems);
         assert_eq!(d.attempts, 1);
         assert!(d.numbers.iter().all(|(_, ok)| *ok), "{:?}", d.numbers);
@@ -221,7 +222,7 @@ mod tests {
     fn an_invented_number_is_retried_with_the_real_values_then_replaced_by_the_template() {
         let bad = "급수조절밸브 개도가 15.0 %로 고착되었습니다.";
         let w = script(&[bad, bad]);
-        let d = draft_aop(Some(&w), &aop(), &facts(), TEMPLATE);
+        let d = draft_aop(Some(&w), SYS, &aop(), &facts(), TEMPLATE);
         assert!(!d.by_model);
         assert_eq!(d.summary, TEMPLATE, "모델 글을 버리고 템플릿을 씁니다");
         assert!(d.problems.iter().any(|p| p.contains("15.0")), "{:?}", d.problems);
@@ -233,7 +234,7 @@ mod tests {
     #[test]
     fn a_wrong_equipment_code_or_an_internal_code_is_not_accepted() {
         let w = script(&["10LAB20AA103 밸브 고착", "G3_ADVERSE_UPSTREAM_CAUSE 판정입니다."]);
-        let d = draft_aop(Some(&w), &aop(), &facts(), TEMPLATE);
+        let d = draft_aop(Some(&w), SYS, &aop(), &facts(), TEMPLATE);
         assert!(!d.by_model);
         assert!(d.problems.iter().any(|p| p.contains("10LAB20AA103")));
         assert!(d.problems.iter().any(|p| p.contains("내부 판정 코드")));
@@ -241,14 +242,14 @@ mod tests {
 
     #[test]
     fn without_a_writer_the_template_is_used() {
-        let d = draft_aop(None, &aop(), &facts(), TEMPLATE);
+        let d = draft_aop(None, SYS, &aop(), &facts(), TEMPLATE);
         assert!(!d.by_model && d.verified && d.attempts == 0);
         assert_eq!(d.steps.len(), 2);
     }
 
     #[test]
     fn free_text_excuses_map_to_standard_codes() {
-        let n = |answer: &str| normalize_excuse(&script(&[answer]), "1층 윤활유 냉각기 스트레이너 차압 청소 중");
+        let n = |answer: &str| normalize_excuse(&script(&[answer]), SYS, "1층 윤활유 냉각기 스트레이너 차압 청소 중");
         assert_eq!(n("EXCUSE_TRANSMITTER_DRIFT").unwrap(), Some(DeviationExcuse::TransmitterDrift));
         assert_eq!(n("EXCUSE_MANUAL_BYPASS").unwrap(), Some(DeviationExcuse::ManualBypass));
         assert_eq!(n("EXCUSE_OTHER").unwrap(), None);

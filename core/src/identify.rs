@@ -136,10 +136,10 @@ fn hangul(c: char) -> bool {
     ('가'..='힣').contains(&c)
 }
 
-/// `CG1O2` → `CG102`. 앞 두 글자는 영문, 뒤 세 글자는 숫자로 오독을 고칩니다.
+/// `CG1O2` → `CG102`. 앞 두 글자는 영문, 뒤 글자는 숫자로 오독을 고칩니다 (KKS 는 숫자 셋, DCIM 은 숫자 둘: `CG02`).
 fn short_tag(token: &str) -> Option<String> {
     let t: Vec<char> = token.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_uppercase().chars().collect();
-    if t.len() != 5 {
+    if t.len() != 5 && t.len() != 4 {
         return None;
     }
     let letter = |c: char| match c {
@@ -175,6 +175,9 @@ fn unit_of(token: &str) -> Option<String> {
         "kV" | "KV" => "kV",
         "MW" => "MW",
         "kPa" | "KPa" => "kPa",
+        "bar" | "Bar" | "BAR" => "bar",
+        "LPM" | "lpm" | "L/min" => "LPM",
+        "kW" | "KW" => "kW",
         "ppm" => "ppm",
         "mg/Nm3" | "mg/Nm³" => "mg/Nm³",
         "rpm" => "rpm",
@@ -194,7 +197,7 @@ pub fn parse_lines(lines: &[String]) -> TextClues {
     let mut out = TextClues::default();
     for raw in lines.iter().flat_map(|l| l.lines()) {
         let line = raw.trim();
-        if line.is_empty() || line.to_uppercase().starts_with("KKS") {
+        if line.is_empty() || line.to_uppercase().starts_with("KKS") || line.starts_with("자산") {
             continue;
         }
         if line.contains("위치") || line.contains("EL.") {

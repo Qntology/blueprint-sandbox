@@ -1,11 +1,12 @@
 //! 합성 시드 원장 (`Lattice`). 발전소 설비 대장 · 센서 기준치 · 계통 간선 · 도면 간 연결점 · DCS 보팅 · 변경관리(MOC) 원장 ·
 //! 근무자 권한 · 비정상 운전절차서(AOP) 목록을 한 파일(`fixtures/synthetic_db.json`)로 미리 넣어 둔 상태로 진단합니다.
+//! AI 데이터센터 원장(`fixtures/aidc_db.json`)도 같은 모양입니다 (DCIM 자산 · BMC 텔레메트리 · MOP · EOP).
 //!
 //! 발전소 DCS · CMMS 연계가 없어서 시드를 씁니다. 값은 모두 합성이며, 실제 연계가 생기면 이 모듈의 조회 함수 자리가 바뀝니다.
-//! 정의는 `docs/synthetic-plant-data.md` 에 있습니다.
+//! 정의는 `docs/synthetic-plant-data.md` · `docs/synthetic-aidc-data.md` 에 있습니다.
 //!
 //! 도면 ↔ 원장 상호작용 ① (KKS 오독 교정): [`Lattice::match_kks`] 가 OCR 글자를 자리별로 고친 뒤 대장과 편집 거리 2 이내로 맞춥니다.
-//! 가까운 코드가 둘 이상이면 고르지 않고 사람에게 넘깁니다.
+//! 가까운 코드가 둘 이상이면 고르지 않고 사람에게 넘깁니다. 자리 꼴은 원장의 코드 체계(KKS · DCIM)를 따릅니다.
 
 use std::collections::HashMap;
 
@@ -13,9 +14,8 @@ use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
-use crate::plant::{repair_kks, Medium, Sector};
-
-const EMBEDDED: &str = include_str!("../fixtures/synthetic_db.json");
+use crate::domain::{DomainMode, PhysicsConfig, Terms};
+use crate::plant::{repair_code, CodeScheme, Medium, Sector};
 
 /// 편집 거리로 교정할 때 허용하는 최대 글자 수 (기획안: `edit_distance <= 2`)
 pub const MAX_KKS_DISTANCE: usize = 2;
@@ -32,6 +32,15 @@ pub struct PlantRow {
     pub name: String,
     pub kind: String,
     pub units: Vec<UnitRow>,
+    /// 관제 도메인 (없으면 발전소)
+    #[serde(default)]
+    pub domain: DomainMode,
+    /// 설비 코드 체계 (없으면 KKS)
+    #[serde(default)]
+    pub code_scheme: CodeScheme,
+    /// 화면 · 글쓰기 용어 (없으면 발전소 용어)
+    #[serde(default)]
+    pub terms: Terms,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -60,6 +69,9 @@ pub struct DrawingRow {
     pub rev: String,
     pub issued: NaiveDate,
     pub signer: String,
+    /// 고정 안내문 · 범례 자리 (정규화 좌표, 개선안 1-1). 델타 판독이 이 자리를 조각에서 잘라 내고 읽지 않습니다.
+    #[serde(default)]
+    pub ignore_zones: Vec<[f32; 4]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -189,6 +201,9 @@ pub struct AopRow {
     pub steps: Vec<String>,
     pub risk_actions: Vec<String>,
     pub high_risk: bool,
+    /// 공통 절차서의 쓰임 (`flatline` 계측값 고정 · `spike` 순간 잡음)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// A0 대형 종합 도면 (기획 Part 8-4 1절). 마스터 도면들을 한 장에 앉힌 배치이고, 판독은 격자 타일로 나눠 합니다.
@@ -299,6 +314,9 @@ struct Seed {
     #[serde(default)]
     symbol_legend: Vec<SymbolLegendRow>,
     history: Vec<HistoryRow>,
+    /// 내장 물리엔진 계통 (없으면 발전소 급수 계통)
+    #[serde(default)]
+    physics: PhysicsConfig,
 }
 
 /// Lv1 ~ Lv5 공간 주소 (상단 브레드크럼)
@@ -394,9 +412,18 @@ pub struct Lattice {
 }
 
 impl Lattice {
-    /// 저장소에 들어 있는 시드를 읽습니다.
+    /// 저장소에 들어 있는 발전소 시드를 읽습니다.
     pub fn embedded() -> Result<Self> {
-        Self::from_json(EMBEDDED)
+        Self::embedded_for(DomainMode::PowerPlant)
+    }
+
+    /// 저장소에 들어 있는 도메인의 시드를 읽습니다 (추가 개선안 4.1절 3번).
+    pub fn embedded_for(mode: DomainMode) -> Result<Self> {
+        let db = Self::from_json(mode.seed_json())?;
+        if db.domain() != mode {
+            bail!("{} 시드의 도메인 표시가 {:?} 입니다", mode.label(), db.domain());
+        }
+        Ok(db)
     }
 
     pub fn from_json(text: &str) -> Result<Self> {
@@ -417,10 +444,34 @@ impl Lattice {
     /// 시드가 자기가 정의한 것만 가리키는지 봅니다. 어긋나면 진단이 엉뚱한 설비를 가리키므로 읽지 않습니다.
     fn validate(&self) -> Result<()> {
         let s = &self.seed;
+        let scheme = self.scheme();
+        for sector in &s.sectors {
+            if Sector::from_key(&sector.key).is_none() {
+                bail!("섹터 {} 가 다섯 라우팅 자리 어디에도 없습니다", sector.key);
+            }
+        }
         for e in &s.equipment {
-            if Sector::from_key(&e.sector).is_none() || self.floor(&e.floor).is_none() || self.drawing(&e.drawing).is_none() {
+            if self.sector(&e.sector).is_none() || self.floor(&e.floor).is_none() || self.drawing(&e.drawing).is_none() {
                 bail!("설비 {} 의 섹터 · 층 · 도면이 시드에 없습니다", e.kks);
             }
+            if !scheme.shape(&e.kks) {
+                bail!("설비 {} 가 {} 꼴이 아닙니다", e.kks, scheme.label());
+            }
+        }
+        for x in &s.sensors {
+            let k = scheme.kind_at();
+            if !scheme.shape(&x.tag) || x.tag.get(..k) != x.kks.get(..k) || x.tag.as_bytes()[k] != b'C' {
+                bail!("센서 {} 가 {} 태그 꼴(설비와 같은 계통 머리 + C 측정 코드)이 아닙니다", x.tag, scheme.label());
+            }
+        }
+        let ph = &s.physics;
+        for tag in [&ph.tag_valve, &ph.tag_bypass, &ph.tag_flow, &ph.tag_pump, &ph.tag_hot, &ph.drift_tag].into_iter().chain(&ph.shown) {
+            if self.sensor(tag).is_none() {
+                bail!("물리엔진 계통의 센서 {tag} 가 원장에 없습니다");
+            }
+        }
+        if self.equipment(&ph.valve).is_none() || self.equipment(&ph.bypass).is_none() {
+            bail!("물리엔진 계통의 밸브 {} · {} 가 원장에 없습니다", ph.valve, ph.bypass);
         }
         for x in &s.sensors {
             if self.equipment(&x.kks).is_none() {
@@ -499,6 +550,36 @@ impl Lattice {
 
     pub fn plant(&self) -> &PlantRow {
         &self.seed.plant
+    }
+
+    /// 관제 도메인
+    pub fn domain(&self) -> DomainMode {
+        self.seed.plant.domain
+    }
+
+    /// 설비 코드 체계 (KKS · DCIM)
+    pub fn scheme(&self) -> CodeScheme {
+        self.seed.plant.code_scheme
+    }
+
+    /// 화면 · 글쓰기 용어
+    pub fn terms(&self) -> &Terms {
+        &self.seed.plant.terms
+    }
+
+    /// 내장 물리엔진 계통
+    pub fn physics(&self) -> &PhysicsConfig {
+        &self.seed.physics
+    }
+
+    /// OCR 글자를 이 원장의 코드 체계 꼴로 고칩니다.
+    pub fn repair(&self, raw: &str) -> String {
+        repair_code(raw, self.scheme())
+    }
+
+    /// 라우팅 자리의 섹터 행 (발전소 `feedwater` 자리는 AI 데이터센터에서 `cooling`)
+    pub fn sector_for(&self, slot: Sector) -> Option<&SectorRow> {
+        self.seed.sectors.iter().find(|s| Sector::from_key(&s.key) == Some(slot))
     }
 
     /// 관계망 노드 수 (설비)
@@ -604,12 +685,27 @@ impl Lattice {
     }
 
     /// MOC 번호 오독 교정: 하이픈 · 공백을 빼고 편집 거리 1 이내인 번호가 하나뿐이면 돌려줍니다.
+    /// 번호의 영문 머리(`MOC` · `MOP`)는 원장에 있는 것을 씁니다 (숫자 자리의 `O` 만 `0` 으로 읽습니다).
     pub fn similar_moc(&self, raw: &str) -> Option<&MocRow> {
         let squeeze = |s: &str| s.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()).collect::<String>();
-        let want = squeeze(&raw.replace(['O', 'o'], "0").replace("M0C", "MOC"));
+        let mut want = squeeze(&raw.replace(['O', 'o'], "0"));
+        for p in self.change_prefixes() {
+            want = want.replace(&p.replace('O', "0"), &p);
+        }
         let mut hits = self.seed.moc.iter().filter(|m| edit_distance(&want, &squeeze(&m.moc_no)) <= 1);
         let first = hits.next()?;
         hits.next().is_none().then_some(first)
+    }
+
+    /// 변경 관리 번호의 영문 머리 (`MOC-2026-1104` → `MOC`, `MOP-2026-1104` → `MOP`)
+    pub fn change_prefixes(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.seed.moc.iter().filter_map(|m| m.moc_no.split('-').next()).filter(|p| !p.is_empty()).map(str::to_uppercase).collect();
+        out.sort();
+        out.dedup();
+        if out.is_empty() {
+            out.push("MOC".into());
+        }
+        out
     }
 
     pub fn personnel(&self) -> &[PersonRow] {
@@ -652,6 +748,11 @@ impl Lattice {
 
     pub fn aop(&self, id: &str) -> Option<&AopRow> {
         self.seed.aop.iter().find(|a| a.id == id.trim())
+    }
+
+    /// 쓰임으로 공통 절차서를 찾습니다 (`flatline` · `spike`)
+    pub fn aop_by_role(&self, role: &str) -> Option<&AopRow> {
+        self.seed.aop.iter().find(|a| a.role.as_deref() == Some(role))
     }
 
     pub fn a0_drawings(&self) -> &[A0Row] {
@@ -716,9 +817,10 @@ impl Lattice {
         let floor = self.floor(&e.floor)?;
         let drawing = self.drawing(&e.drawing)?;
         let unit = self.seed.plant.units.iter().find(|u| kks.starts_with(&u.code))?;
+        let capacity = if unit.capacity_mw >= 1000 { format!("{:.1}GW", unit.capacity_mw as f64 / 1000.0) } else { format!("{}MW", unit.capacity_mw) };
         Some(SpatialAddress {
             unit_code: unit.code.clone(),
-            unit_label: format!("{}({:.1}GW)", unit.label, unit.capacity_mw as f64 / 1000.0),
+            unit_label: format!("{}({capacity})", unit.label),
             sector: sector.key.clone(),
             building: sector.building.clone(),
             sector_label: sector.label.clone(),
@@ -733,12 +835,12 @@ impl Lattice {
         })
     }
 
-    fn match_code<'a>(raw: &str, codes: impl Iterator<Item = &'a str> + Clone) -> KksMatch {
+    fn match_code<'a>(&self, raw: &str, codes: impl Iterator<Item = &'a str> + Clone) -> KksMatch {
         let trimmed: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
         if codes.clone().any(|c| c == trimmed) {
             return KksMatch::Exact(trimmed);
         }
-        let repaired = repair_kks(raw);
+        let repaired = self.repair(raw);
         let mut best: Vec<(&str, usize)> = codes.map(|c| (c, edit_distance(&repaired, c))).filter(|(_, d)| *d <= MAX_KKS_DISTANCE).collect();
         best.sort_by_key(|(_, d)| *d);
         match best.as_slice() {
@@ -751,12 +853,12 @@ impl Lattice {
 
     /// 상호작용 ①: 설비 KKS 오독 교정. 그대로 있으면 `Exact`, 고쳐서 하나로 정해지면 `Corrected` 입니다.
     pub fn match_kks(&self, raw: &str) -> KksMatch {
-        Self::match_code(raw, self.seed.equipment.iter().map(|e| e.kks.as_str()))
+        self.match_code(raw, self.seed.equipment.iter().map(|e| e.kks.as_str()))
     }
 
     /// 센서 태그 오독 교정
     pub fn match_tag(&self, raw: &str) -> KksMatch {
-        Self::match_code(raw, self.seed.sensors.iter().map(|s| s.tag.as_str()))
+        self.match_code(raw, self.seed.sensors.iter().map(|s| s.tag.as_str()))
     }
 }
 
@@ -770,19 +872,54 @@ mod tests {
 
     #[test]
     fn the_seed_loads_and_refers_only_to_what_it_defines() {
-        let db = db();
-        assert_eq!(db.sectors().len(), 5);
-        assert_eq!(db.drawings().len(), 5);
-        assert!(db.node_count() >= 30);
-        for e in db.equipment_all() {
-            assert!(crate::plant::kks_shape(&e.kks), "{}", e.kks);
-            let [x0, y0, x1, y1] = e.bbox;
-            assert!(0.0 <= x0 && x0 < x1 && x1 <= 1.0 && 0.0 <= y0 && y0 < y1 && y1 <= 1.0, "{}", e.kks);
+        for mode in DomainMode::ALL {
+            let db = Lattice::embedded_for(mode).unwrap();
+            assert_eq!(db.domain(), mode);
+            assert_eq!(db.sectors().len(), 5);
+            assert_eq!(db.drawings().len(), 5);
+            assert!(db.node_count() >= 30);
+            // 다섯 구역이 다섯 라우팅 자리를 하나씩 씁니다.
+            for slot in Sector::ALL {
+                assert!(db.sector_for(slot).is_some(), "{mode:?} {slot:?}");
+            }
+            let k = db.scheme().kind_at();
+            for e in db.equipment_all() {
+                assert!(db.scheme().shape(&e.kks), "{}", e.kks);
+                let [x0, y0, x1, y1] = e.bbox;
+                assert!(0.0 <= x0 && x0 < x1 && x1 <= 1.0 && 0.0 <= y0 && y0 < y1 && y1 <= 1.0, "{}", e.kks);
+            }
+            for s in db.sensors() {
+                assert!(db.scheme().shape(&s.tag), "{}", s.tag);
+                assert_eq!(&s.tag[..k], &s.kks[..k], "센서 태그는 설비 코드와 계통이 같아야 합니다: {}", s.tag);
+            }
+            assert!(db.aop_by_role("flatline").is_some() && db.aop_by_role("spike").is_some(), "{mode:?} 공통 절차서");
         }
-        for s in db.sensors() {
-            assert!(crate::plant::kks_shape(&s.tag), "{}", s.tag);
-            assert_eq!(&s.tag[..7], &s.kks[..7], "센서 태그는 설비 코드와 계통이 같아야 합니다: {}", s.tag);
-        }
+        assert_eq!(db().scheme(), CodeScheme::Kks);
+        assert_eq!(Lattice::embedded_for(DomainMode::AiDataCenter).unwrap().scheme(), CodeScheme::Dcim);
+    }
+
+    #[test]
+    fn the_data_center_ledger_answers_like_the_plant() {
+        let db = Lattice::embedded_for(DomainMode::AiDataCenter).unwrap();
+        // 추가 개선안 3.3: 현장 단말이 `I` 를 `1` 로 고친 자산 코드
+        assert_eq!(db.match_kks("DC1CDUI0AP01").code(), Some("DC1CDU10AP01"));
+        assert_eq!(db.match_tag("DC1CDU2OCG02").code(), Some("DC1CDU20CG02"));
+        let a = db.address("DC1CDU20AA02").unwrap();
+        assert_eq!(a.building, "103동");
+        assert_eq!(a.breadcrumb()[0], "센터A(100MW) (DC1)");
+        assert_eq!(a.breadcrumb()[3], "MEP-103-CDU (Rev.3)");
+        assert_eq!(db.sector_for(Sector::Feedwater).unwrap().key, "cooling");
+        let mop = db.moc("MOP-2026-1104").unwrap();
+        assert!(mop.approved());
+        assert_eq!((mop.old, mop.new, mop.design_limit), (3.0, 3.5, 4.0));
+        assert_eq!(db.similar_moc("M0P-2026-11O4").map(|m| m.moc_no.as_str()), Some("MOP-2026-1104"));
+        assert_eq!(db.change_prefixes(), vec!["MOP".to_string()]);
+        assert_eq!(db.aop_for(&["DC1CDU20CG02", "DC1GPU10CT01"]).unwrap().id, "EOP-103-CDU02");
+        assert!(db.aop("EOP-104-BAT01").unwrap().high_risk);
+        assert_eq!(db.voting("DC1MNF10CP01").unwrap().channels.len(), 3);
+        assert_eq!(db.terms().code, "자산코드");
+        assert_eq!(db.physics().valve, "DC1CDU20AA02");
+        assert!(db.authorized("FE-102", "cooling") && !db.authorized("FE-102", "power"));
     }
 
     #[test]

@@ -4,9 +4,11 @@
 //!
 //! 질의마다 정답의 화면 순위와 걸린 조건(힌트로 내린 것 포함)을 찍고 MRR · Hit@1 을 냅니다. 모델은 쓰지 않습니다.
 //! 두 번 잽니다: 지금 계측 없이(질적 상태는 힌트), 그리고 시나리오 P2 를 끝까지 재생한 지금 계측으로(질적 상태가 필터).
+//! AI 데이터센터 원장(D2 재생)도 같은 방식으로 잽니다.
 
+use blueprint_core::domain::DomainMode;
 use blueprint_core::lattice::Lattice;
-use blueprint_core::search::{live_corpus, search, Corpus, EVAL_LIVE_QUERIES, EVAL_LIVE_SCENARIO, EVAL_QUERIES};
+use blueprint_core::search::{live_corpus, search, Corpus, EVAL_AIDC_LIVE_QUERIES, EVAL_AIDC_LIVE_SCENARIO, EVAL_AIDC_QUERIES, EVAL_LIVE_QUERIES, EVAL_LIVE_SCENARIO, EVAL_QUERIES};
 
 fn run(db: &Lattice, corpus: &Corpus, queries: &[(&str, &str, usize)]) {
     let (mut mrr, mut hit1) = (0.0, 0);
@@ -31,4 +33,12 @@ fn main() {
     println!("## 지금 계측 있음 (시나리오 {EVAL_LIVE_SCENARIO} 재생 끝 시각)");
     let live = live_corpus(&db, EVAL_LIVE_SCENARIO).expect("시나리오");
     run(&db, &live, &EVAL_LIVE_QUERIES);
+    println!();
+    let dc = Lattice::embedded_for(DomainMode::AiDataCenter).expect("데이터센터 원장");
+    println!("## AI 데이터센터 · 지금 계측 없음");
+    run(&dc, &Corpus::build(&dc, None, None), &EVAL_AIDC_QUERIES);
+    println!();
+    println!("## AI 데이터센터 · 지금 계측 있음 (시나리오 {EVAL_AIDC_LIVE_SCENARIO} 재생 끝 시각)");
+    let live = live_corpus(&dc, EVAL_AIDC_LIVE_SCENARIO).expect("시나리오");
+    run(&dc, &live, &EVAL_AIDC_LIVE_QUERIES);
 }

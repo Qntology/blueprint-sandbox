@@ -131,6 +131,33 @@ export const MEDIUM_COLOR: Record<string, string> = {
   air: "#88c0d0",
   gas: "#a3a3a3",
   draft: "#7fb069",
+  // AI 데이터센터: 2차 냉각수 · 1차 냉수 · 냉각탑 냉각수 · 공조 냉기 · 광 네트워크
+  coolant: "#2fb4c9",
+  chilled_water: "#4aa3df",
+  condenser_water: "#3c7dd9",
+  airflow: "#88c0d0",
+  network: "#b48ead",
+};
+
+/** 시각 t 의 SDS 신호 상태 (전이 기록에서 t 이전의 마지막 상태). 기록이 없으면 null. */
+export function sdsStateAt(transitions: [number, string][] | undefined, t: number): string | null {
+  if (!transitions?.length) return null;
+  let state: string | null = null;
+  for (const [at, code] of transitions) {
+    if (at <= t) state = code;
+    else break;
+  }
+  return state;
+}
+
+export const SDS_COLOR: Record<string, string> = {
+  STABLE: "#4fd1c5",
+  SLEW_RISE: "#ff9f43",
+  SLEW_DROP: "#ff9f43",
+  STUCK_HIGH: "#ff4d4f",
+  STUCK_LOW: "#ff4d4f",
+  FLATLINE: "#c084fc",
+  NOISY: "#f6c453",
 };
 
 export const STAGE_LABEL: Record<string, string> = {

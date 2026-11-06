@@ -1,13 +1,17 @@
-//! 경량 발전소 물리엔진과 SDS 상태 추적 (기획 Part 8-5 3 · 4절).
+//! 경량 발전소 · 데이터센터 물리엔진과 SDS 상태 추적 (기획 Part 8-5 3 · 4절, 추가 개선안 2.2절).
 //!
 //! 급수 계통 한 줄(주급수펌프 → 주 조절밸브 · 바이패스 → 수냉벽 → 과열기)을 집중 정수 모델로 100 ms 틱마다 계산합니다.
+//! AI 데이터센터는 같은 식으로 수냉 루프 한 줄(CDU 2차 순환펌프 → 2차측 유량조절밸브 · 우회밸브 → 랙 매니폴드 → GPU 콜드플레이트)을 풉니다.
+//! 계통의 태그와 상수는 원장 시드의 `physics` 에 있습니다 ([`PhysicsConfig`]).
 //! 고장을 주입하면 각본이 아니라 식으로 연쇄가 생깁니다: 밸브가 고착되면 유량이 줄고, 막힌 물 때문에 펌프 토출압이 오르고,
 //! 배관 이류 지연 τ 뒤에 과열기 냉각이 모자라 증기 온도가 오릅니다. 바이패스를 열면 같은 식으로 유량 · 온도가 돌아옵니다.
 //!
 //! - 유량: `Q* = Qd · min(1.05, (f(u) + k_b · f(b)) / f(u0))`, `f(u) = u^0.35` (빠른 열림 특성), 1차 지연 0.6 s 로 따라감
-//! - 펌프 토출압: `P = P0 + 0.9 · (1 − Q/Qd) / 0.4` (유량 40 % 감소에 +0.9 MPa)
-//! - 이류 지연: 과열기는 `Q(t − τ)`, τ = 4.2 s
-//! - 과열기 열평형: `M · dT/dt = Qd · (T0 − Tin) − Q(t − τ) · (T − Tin)` (정상 610 ℃, 유량 60 % 에서 초기 기울기 약 0.9 ℃/s)
+//! - 펌프 토출압: `P = P0 + ΔP · (1 − Q/Qd) / 0.4` (유량 40 % 감소에 발전소 +0.9 MPa, 데이터센터 +0.6 bar)
+//! - 이류 지연: 하류는 `Q(t − τ)`, τ = 4.2 s
+//! - 하류 열평형: `M · dT/dt = Qd · (T0 − Tin) − Q(t − τ) · (T − Tin)`
+//!   발전소 과열기: 정상 610 ℃, 유량 60 % 에서 초기 기울기 약 0.9 ℃/s.
+//!   데이터센터 GPU 정션: 정상 68 ℃, Tin 20 ℃ · M 14,400 → 유량 60 % 에서 초기 기울기 약 1.6 ℃/s, 그대로 두면 약 37초 뒤 셧다운 한계 95 ℃.
 //!
 //! 나머지 센서는 정상치에 작은 잡음을 얹고, 센서 바이어스 고장(전송기 드리프트)은 읽은 값에만 더합니다.
 //! 이 엔진의 제어 명령은 시뮬레이터 안에서만 효과가 있습니다. 실제 설비는 조작하지 않습니다.
@@ -16,33 +20,22 @@ use std::collections::{BTreeMap, VecDeque};
 
 use serde::Serialize;
 
+pub use crate::domain::PhysicsConfig;
 use crate::lattice::Lattice;
 use crate::timeseries::{classify_with, fault_code, onset_lag, Baseline, SignalState, BASELINE_SECS};
 use crate::tsdb::LiveRing;
 
 pub const TICK_MS: i64 = 100;
 
-const QD: f64 = 1850.0;
-const U0: f64 = 0.78;
-const KB: f64 = 0.42;
-const P0: f64 = 28.5;
 const TAU_Q_S: f64 = 0.6;
 /// 펌프 토출압은 유량 변화를 1초 늦게 따라갑니다 (원인 → 결과 순서)
 const TAU_P_S: f64 = 1.0;
-const ADVECTION_MS: i64 = 4200;
-const T0: f64 = 610.0;
-const TIN: f64 = 300.0;
-const M: f64 = 255_922.0;
 /// 바이패스 밸브 행정 속도 (초당 개도)
 const BYPASS_STROKE: f64 = 0.20;
 
+/// 발전소 급수 계통의 밸브 (원장 `physics` 의 기본값과 같음)
 pub const VALVE: &str = "10LAB20AA102";
 pub const BYPASS: &str = "10LAB20AA103";
-const TAG_VALVE: &str = "10LAB20CG102";
-const TAG_BYPASS: &str = "10LAB20CG103";
-const TAG_FLOW: &str = "10LAB20CF001";
-const TAG_PUMP: &str = "10LAB10CP001";
-const TAG_SH: &str = "10HAH10CT001";
 
 fn flow_factor(u: f64) -> f64 {
     u.max(0.0).powf(0.35)
@@ -66,9 +59,10 @@ pub enum Command {
     SetBypass { open_pct: f64 },
 }
 
-/// 급수 계통 시뮬레이터
+/// 급수 · 수냉 계통 시뮬레이터
 #[derive(Debug, Clone)]
 pub struct PlantSim {
+    cfg: PhysicsConfig,
     t_ms: i64,
     u_main: f64,
     stuck: Option<f64>,
@@ -89,16 +83,18 @@ impl PlantSim {
     /// 정상 운전 상태에서 시작합니다. `start_ms` 는 시뮬레이션 시계의 첫 시각입니다.
     pub fn new(db: &Lattice, start_ms: i64, seed: u64) -> Self {
         let normals = db.sensors().iter().map(|s| (s.tag.clone(), s.normal, s.deadband * 0.12)).collect();
+        let cfg = db.physics().clone();
         Self {
             t_ms: start_ms,
-            u_main: U0,
+            u_main: cfg.u0,
             stuck: None,
             bypass: 0.0,
             bypass_cmd: 0.0,
-            q: QD,
-            p_pump: P0,
-            history: VecDeque::from([(start_ms, QD)]),
-            t_sh: T0,
+            q: cfg.qd,
+            p_pump: cfg.p0,
+            history: VecDeque::from([(start_ms, cfg.qd)]),
+            t_sh: cfg.t0,
+            cfg,
             bias: BTreeMap::new(),
             normals,
             rng: seed.max(1),
@@ -109,6 +105,11 @@ impl PlantSim {
 
     pub fn now_ms(&self) -> i64 {
         self.t_ms
+    }
+
+    /// 이 시뮬레이터가 푸는 계통
+    pub fn config(&self) -> &PhysicsConfig {
+        &self.cfg
     }
 
     pub fn inject(&mut self, fault: Fault) {
@@ -132,13 +133,19 @@ impl PlantSim {
 
     /// 실제 공정값 (센서 잡음 · 바이어스 없이)
     pub fn true_value(&self, tag: &str) -> Option<f64> {
-        Some(match tag {
-            TAG_VALVE => self.u_main * 100.0,
-            TAG_BYPASS => self.bypass * 100.0,
-            TAG_FLOW => self.q,
-            TAG_PUMP => self.p_pump,
-            TAG_SH => self.t_sh,
-            _ => self.normals.iter().find(|n| n.0 == tag)?.1,
+        let c = &self.cfg;
+        Some(if tag == c.tag_valve {
+            self.u_main * 100.0
+        } else if tag == c.tag_bypass {
+            self.bypass * 100.0
+        } else if tag == c.tag_flow {
+            self.q
+        } else if tag == c.tag_pump {
+            self.p_pump
+        } else if tag == c.tag_hot {
+            self.t_sh
+        } else {
+            self.normals.iter().find(|n| n.0 == tag)?.1
         })
     }
 
@@ -159,21 +166,22 @@ impl PlantSim {
         let dt = TICK_MS as f64 / 1000.0;
         self.t_ms += TICK_MS;
         // 밸브: 고착이면 그 개도, 아니면 정상 개도. 바이패스는 행정 속도로 명령을 따라갑니다.
-        self.u_main = self.stuck.unwrap_or(U0);
+        let c = &self.cfg;
+        self.u_main = self.stuck.unwrap_or(c.u0);
         let step = BYPASS_STROKE * dt;
         self.bypass += (self.bypass_cmd - self.bypass).clamp(-step, step);
         // 유량: 목표로 1차 지연
-        let target = QD * ((flow_factor(self.u_main) + KB * flow_factor(self.bypass)) / flow_factor(U0)).min(1.05);
+        let target = c.qd * ((flow_factor(self.u_main) + c.kb * flow_factor(self.bypass)) / flow_factor(c.u0)).min(1.05);
         self.q += (target - self.q) * (dt / TAU_Q_S).min(1.0);
-        let p_target = P0 + 0.9 * (1.0 - self.q / QD) / 0.4;
+        let p_target = c.p0 + c.p_gain * (1.0 - self.q / c.qd) / 0.4;
         self.p_pump += (p_target - self.p_pump) * (dt / TAU_P_S).min(1.0);
         self.history.push_back((self.t_ms, self.q));
-        while self.history.len() > 2 && self.history[1].0 <= self.t_ms - ADVECTION_MS {
+        while self.history.len() > 2 && self.history[1].0 <= self.t_ms - c.advection_ms {
             self.history.pop_front();
         }
-        // 과열기: τ 전 유량으로 냉각
-        let q_late = self.history.iter().take_while(|(t, _)| *t <= self.t_ms - ADVECTION_MS).last().map(|x| x.1).unwrap_or(QD);
-        self.t_sh += (QD * (T0 - TIN) - q_late * (self.t_sh - TIN)) / M * dt;
+        // 하류(과열기 · GPU 콜드플레이트): τ 전 유량으로 냉각
+        let q_late = self.history.iter().take_while(|(t, _)| *t <= self.t_ms - c.advection_ms).last().map(|x| x.1).unwrap_or(c.qd);
+        self.t_sh += (c.qd * (c.t0 - c.tin) - q_late * (self.t_sh - c.tin)) / c.m * dt;
 
         let tags: Vec<(String, f64)> = self.normals.iter().map(|(t, _, s)| (t.clone(), *s)).collect();
         tags.into_iter()
@@ -434,9 +442,96 @@ pub fn incident_from(db: &Lattice, call: &OpenCall, ring: &LiveRing, id: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::DomainMode;
+
+    // 발전소 급수 계통 (원장 `physics` 기본값)
+    const QD: f64 = 1850.0;
+    const T0: f64 = 610.0;
+    const P0: f64 = 28.5;
+    const TAG_VALVE: &str = "10LAB20CG102";
+    const TAG_FLOW: &str = "10LAB20CF001";
+    const TAG_PUMP: &str = "10LAB10CP001";
+    const TAG_SH: &str = "10HAH10CT001";
 
     fn run(sim: &mut PlantSim, ring: &mut LiveRing, secs: f64) {
         sim.run_into(ring, (secs * 1000.0 / TICK_MS as f64) as usize);
+    }
+
+    #[test]
+    fn the_plant_seed_uses_the_default_feedwater_loop() {
+        let db = Lattice::embedded().unwrap();
+        assert_eq!(db.physics(), &PhysicsConfig::default());
+        assert_eq!((db.physics().valve.as_str(), db.physics().bypass.as_str()), (VALVE, BYPASS));
+    }
+
+    #[test]
+    fn the_data_center_loop_overheats_the_gpu_after_the_advection_delay_and_the_cdu_bypass_recovers_it() {
+        // 추가 개선안 2.2절: CDU 밸브 18% 고착 → 1,200 → 720 LPM, 토출압 3.4 bar, τ = 4.2 s 뒤 GPU 정션 온도 상승, 우회 65% 로 회복
+        let db = Lattice::embedded_for(DomainMode::AiDataCenter).unwrap();
+        let c = db.physics().clone();
+        let mut sim = PlantSim::new(&db, 0, 7);
+        let mut ring = LiveRing::default();
+        run(&mut sim, &mut ring, 25.0);
+        assert!((sim.true_value(&c.tag_hot).unwrap() - 68.0).abs() < 0.1);
+        sim.inject(Fault::ValveStuck { open_pct: 18.0 });
+        run(&mut sim, &mut ring, 4.0);
+        let q = sim.true_value(&c.tag_flow).unwrap();
+        assert!((690.0..760.0).contains(&q), "{q}");
+        let p = sim.true_value(&c.tag_pump).unwrap();
+        assert!((3.3..3.5).contains(&p), "{p}");
+        assert!((sim.true_value(&c.tag_hot).unwrap() - 68.0).abs() < 0.5, "τ 전에는 그대로");
+        run(&mut sim, &mut ring, 12.0);
+        let hot = sim.true_value(&c.tag_hot).unwrap();
+        assert!((78.0..88.0).contains(&hot), "냉각수가 모자라 GPU 온도가 오릅니다: {hot}");
+        let lag = ring.ts_inflection_lag(db.sensor(&c.tag_valve).unwrap(), db.sensor(&c.tag_hot).unwrap()).unwrap();
+        assert!((3.0..9.0).contains(&lag), "{lag}");
+        sim.command(Command::SetBypass { open_pct: 65.0 });
+        let mut peak: f64 = 0.0;
+        for _ in 0..40 {
+            run(&mut sim, &mut ring, 1.0);
+            peak = peak.max(sim.true_value(&c.tag_hot).unwrap());
+        }
+        let later = sim.true_value(&c.tag_hot).unwrap();
+        assert!(sim.true_value(&c.tag_flow).unwrap() > 1150.0, "{}", sim.true_value(&c.tag_flow).unwrap());
+        assert!(peak < 95.0 && later < peak - 8.0, "셧다운 전에 꺾입니다: 고점 {peak:.1} → {later:.1}");
+    }
+
+    #[test]
+    fn without_the_bypass_the_gpu_reaches_the_shutdown_limit() {
+        let db = Lattice::embedded_for(DomainMode::AiDataCenter).unwrap();
+        let c = db.physics().clone();
+        let mut sim = PlantSim::new(&db, 0, 7);
+        let mut ring = LiveRing::default();
+        run(&mut sim, &mut ring, 25.0);
+        sim.inject(Fault::ValveStuck { open_pct: 18.0 });
+        run(&mut sim, &mut ring, 50.0);
+        let hot = sim.true_value(&c.tag_hot).unwrap();
+        assert!(hot > 95.0, "우회 없이 50초면 셧다운 한계를 넘습니다: {hot:.1}");
+    }
+
+    #[test]
+    fn the_tracker_locks_the_cdu_valve_to_gpu_chain() {
+        let db = Lattice::embedded_for(DomainMode::AiDataCenter).unwrap();
+        let c = db.physics().clone();
+        let mut sim = PlantSim::new(&db, 1_793_769_600_123, 11);
+        let mut ring = LiveRing::default();
+        let mut tr = Tracker::new();
+        run(&mut sim, &mut ring, 25.0);
+        assert_eq!(tr.observe(&db, &ring), None, "정상 운전에서는 열지 않습니다");
+        sim.inject(Fault::ValveStuck { open_pct: 18.0 });
+        let mut call = None;
+        for _ in 0..40 {
+            run(&mut sim, &mut ring, 1.0);
+            if let Some(x) = tr.observe(&db, &ring) {
+                call = Some(x);
+                break;
+            }
+        }
+        let call = call.expect("하류 GPU 정션 온도에서 사건을 엽니다");
+        assert_eq!(call.alarm_tag, c.tag_hot, "{call:?}");
+        assert_eq!(call.upstream_tag.as_deref(), Some(c.tag_valve.as_str()), "{call:?}");
+        assert_eq!(call.fault.as_deref(), Some("VALVE_STUCK_LOW"));
+        assert!(db.interlocks().iter().any(|i| Some(i.fault.as_str()) == call.fault.as_deref()));
     }
 
     #[test]

@@ -1,6 +1,8 @@
-"""합성 P&ID 마스터 도면 · Red-line 수기 수정 도면 · 현장 계기 점검표 생성기.
+"""합성 P&ID 마스터 도면 · Red-line 수기 수정 도면 · 현장 계기 점검표 생성기 (발전소 · AI 데이터센터).
 
     python scripts/gen_pid_drawings.py [마스터 폴더] [현장 스캔 폴더] [시드]
+    python scripts/gen_pid_drawings.py --domain aidc [마스터 폴더] [현장 스캔 폴더] [시드]
+                                                 AI 데이터센터 MEP · SLD 마스터 5장, D1 점검표 · D3/D3F Red-line, MEP-100-ALL-A0
     python scripts/gen_pid_drawings.py --symbols     심볼 표본(학습 · 시험)과 명판 훼손 도면만 out/symbols 에
     python scripts/gen_pid_drawings.py --a0-dpi 300  같은 A0 종합도를 2 배 해상도로 다시 그려 out/a0/PID-100-ALL-A0@300dpi.png 에
     python scripts/gen_pid_drawings.py --a0-delta    A0 델타 실측용: 다시 스캔한 A0(바뀐 곳 없음)와 PID-103-LAB 칸에 Red-line 을 그린 A0 (out/a0)
@@ -32,6 +34,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SEED = os.path.join(ROOT, "core", "fixtures", "synthetic_db.json")
+AIDC_SEED = os.path.join(ROOT, "core", "fixtures", "aidc_db.json")
 
 FONT_DIR = r"C:\Windows\Fonts" if os.name == "nt" else "/usr/share/fonts"
 GOTHIC = os.path.join(FONT_DIR, "malgun.ttf")
@@ -72,6 +75,9 @@ MEDIUM_STYLE = {
     "draft": ("dashdot", 3),
     "oil": ("dot", 3),
     "shaft": ("solid", 2),
+    # AI 데이터센터: 냉각수 · 냉수는 실선, 공조 냉기는 일점쇄선, 광 네트워크는 짧은 점선
+    "airflow": ("dashdot", 3),
+    "network": ("dot", 2),
 }
 
 GUIDE_LINES = [
@@ -79,6 +85,47 @@ GUIDE_LINES = [
     "2. 실선은 급수 · 증기, 점선은 전력, 일점쇄선은 연소가스 · 통풍, 짧은 점선은 윤활유 계통을 나타낸다.",
     "3. 이 도면은 합성 시험용이며 실제 발전소 설비와 관계가 없다. 무단 복제를 금한다.",
 ]
+
+# 도메인마다 다른 글 (발전소 값은 처음 만든 도면과 같아야 합니다: 바꾸면 마스터 · Red-line 그림이 바뀌어 판독 실측을 다시 해야 합니다)
+DOMAINS = {
+    "plant": {
+        "seed": SEED,
+        "scenarios": "plant_scenarios.json",
+        "guide": GUIDE_LINES,
+        "code_head": "KKS",
+        "trip_head": "트립한계",
+        "card_code": "설비 KKS",
+        "card_sub": "제1발전소 1호기 · 현장 순시 기록 (합성)",
+        "card_guide": [
+            "1. 점검표는 순시 직후 작성하고 현장 단말로 주제어실에 전송한다.",
+            "2. 현장 실측치는 아날로그 게이지 바늘이 가리키는 값을 그대로 적는다.",
+            "3. 정비 작업이 있으면 안전작업허가서(PTW)와 잠금표지(LOTO)를 확인한다.",
+        ],
+        "card_memo": ["아날로그 게이지 정상", "전송기 표시와 다름"],
+        "a0_note": "마스터 계통도 5장을 한 장에 모은 종합도입니다. 각 칸의 표제란은 원 도면의 것입니다.",
+    },
+    "aidc": {
+        "seed": AIDC_SEED,
+        "scenarios": "aidc_scenarios.json",
+        "guide": [
+            "1. 모든 자산 코드는 DCIM 12자리 규격을 따른다. 센서 태그의 C 다음 글자는 측정 종류를 뜻한다.",
+            "2. 실선은 냉각수 · 냉수, 점선은 전력, 일점쇄선은 공조 냉기, 짧은 점선은 광 네트워크를 나타낸다.",
+            "3. 이 도면은 합성 시험용이며 실제 데이터센터 설비와 관계가 없다. 무단 복제를 금한다.",
+        ],
+        "code_head": "자산",
+        "trip_head": "셧다운한계",
+        "card_code": "자산 코드",
+        "card_sub": "AI 데이터센터 A캠퍼스 센터A · 현장 순시 기록 (합성)",
+        "card_guide": [
+            "1. 점검표는 순시 직후 작성하고 현장 단말로 NOC 관제실에 전송한다.",
+            "2. 현장 실측치는 매니폴드 아날로그 압력계 바늘이 가리키는 값을 그대로 적는다.",
+            "3. 정비 작업이 있으면 작업 절차서(MOP)와 수냉 밸브 잠금표지(LoTo)를 확인한다.",
+        ],
+        "card_memo": ["아날로그 압력계 정상", "BMC 표시와 다름"],
+        "a0_note": "MEP · SLD 계통도 5장을 한 장에 모은 종합도입니다. 각 칸의 표제란은 원 도면의 것입니다.",
+    },
+}
+CFG = DOMAINS["plant"]
 
 
 def font(path, size, index=0):
@@ -348,8 +395,8 @@ class Router:
 
 
 def short_tag(tag):
-    """센서 태그의 끝 다섯 글자 (예: 10LAB20CG102 → CG102)"""
-    return tag[7:]
+    """센서 태그의 측정 코드부터 끝까지 (KKS 10LAB20CG102 → CG102, DCIM DC1CDU20CG02 → CG02)"""
+    return tag[7:] if tag[:1].isdigit() else tag[8:]
 
 
 def fmt(v):
@@ -507,7 +554,7 @@ def draw_master(plant, drawing_id, rng, value_overrides=None, damage=0, scale=1)
     for e in on_sheet:
         bx0, by0, bx1, by1 = c.px(e["bbox"])
         c.d.rectangle((bx0, by0, bx1, by1), fill=(255, 255, 255), outline=INK, width=3)
-        lines = [(f"KKS: {e['kks']}", 21, BOLD), (e["name"], 21, GOTHIC), (f"위치: {plant.location(e)}", 16, GOTHIC)]
+        lines = [(f"{CFG['code_head']}: {e['kks']}", 21, BOLD), (e["name"], 21, GOTHIC), (f"위치: {plant.location(e)}", 16, GOTHIC)]
         for s in plant.sensors_of(e["kks"])[:2]:
             v = values.get(s["tag"], s["normal"])
             lines.append((f"{short_tag(s['tag'])} {s['label']} {fmt(v)} {s['unit']}", 16, GOTHIC))
@@ -625,7 +672,7 @@ def draw_master(plant, drawing_id, rng, value_overrides=None, damage=0, scale=1)
     tx0, ty0, tx1, ty1 = c.px(TABLE_BOX)
     c.text(tx0, ty0 - 2, "운전 기준치 일람표", 20, BOLD)
     head_y = ty0 + 32
-    header = ["설비코드", "센서태그", "항목", "정상치", "경보한계", "트립한계"]
+    header = ["설비코드", "센서태그", "항목", "정상치", "경보한계", CFG["trip_head"]]
     shares = [0.18, 0.18, 0.22, 0.13, 0.15, 0.14]
     rows = len(sensors) + 1
     row_h = min(34, (ty1 - head_y) / max(rows, 1))
@@ -660,10 +707,10 @@ def draw_master(plant, drawing_id, rng, value_overrides=None, damage=0, scale=1)
     gx0, gy0, gx1, gy1 = c.px(GUIDE_BOX)
     c.line([(gx0, gy0), (gx1, gy0), (gx1, gy1), (gx0, gy1), (gx0, gy0)], "dash", 1, fill=GRAY)
     gy = gy0 + 8
-    for line_text in GUIDE_LINES:
+    for line_text in CFG["guide"]:
         c.text(gx0 + 10, gy, line_text, 14, GOTHIC, fill=GRAY)
         gy += 20
-    c.add("guide", (gx0, gy0, gx1, gy1), "\n".join(GUIDE_LINES))
+    c.add("guide", (gx0, gy0, gx1, gy1), "\n".join(CFG["guide"]))
 
     # 서명란
     sx0, sy0, sx1, sy1 = c.px(SIGN_BOX)
@@ -675,11 +722,13 @@ def draw_master(plant, drawing_id, rng, value_overrides=None, damage=0, scale=1)
     return c
 
 
-def redline(plant, rng, new_value):
-    """PID-103-LAB 위에 붉은 펜으로 고친 Red-line 도면"""
-    c = draw_master(plant, "PID-103-LAB", rng)
-    moc = next(m for m in plant.db["moc"] if m["moc_no"] == "MOC-2026-1104")
+def redline(plant, rng, new_value, drawing="PID-103-LAB", moc_no="MOC-2026-1104"):
+    """마스터 도면 위에 붉은 펜으로 고친 Red-line 도면 (발전소 PID-103-LAB · MOC, 데이터센터 MEP-103-CDU · MOP)"""
+    c = draw_master(plant, drawing, rng)
+    moc = next(m for m in plant.db["moc"] if m["moc_no"] == moc_no)
     engineer = plant.people[moc["approved_by"]]
+    label = next(s["label"] for s in plant.db["sensors"] if s["tag"] == moc["tag"]).replace(" ", "")
+    unit = moc["unit"]
     # 일람표에서 토출 압력 줄의 경보한계를 긋고 새 값을 적습니다.
     table = next(g for g in c.gt if g["kind"] == "table")
     rows = table["text"].split("\n")
@@ -699,7 +748,7 @@ def redline(plant, rng, new_value):
         c.d.rounded_rectangle((bx0 - 12 - k * 3, by0 - 12 - k * 3, bx1 + 12 + k * 3, by1 + 12 + k * 3), radius=26, outline=RED, width=3)
     # 메모는 3행 왼쪽의 빈 칸 안에 씁니다. 행 사이 통로에는 배관이 지나가서 글과 선이 겹칩니다.
     nx0, ny0 = c.px((COL_X[0], ROW_Y[2] + 0.012, 0.0, 0.0))[:2]
-    note = [moc["moc_no"], f"{moc['kks']} 토출압력 경보", f"{moc['old']:.1f} MPa → {new_value:.1f} MPa", f"2026-11-04 {engineer['name']}"]
+    note = [moc["moc_no"], f"{moc['kks']} {label} 경보", f"{moc['old']:.1f} {unit} → {new_value:.1f} {unit}", f"2026-11-04 {engineer['name']}"]
     y = ny0
     x_end = nx0
     start = len(c.gt)
@@ -713,10 +762,18 @@ def redline(plant, rng, new_value):
     c.stamp(x_end + 260, ny0 + 70, engineer["name"], r=42)
     # 수기 메모 근처로 화살표
     c.line([(x_end + 10, ny0 + 20), (bx0 - 20, by1 + 16)], "solid", 3, fill=RED)
-    return c, {"moc_no": moc["moc_no"], "kks": moc["kks"], "tag": moc["tag"], "old": moc["old"], "new": new_value, "unit": moc["unit"], "worker": engineer["id"], "drawing": "PID-103-LAB", "rev": "Rev.3"}
+    return c, {"moc_no": moc["moc_no"], "kks": moc["kks"], "tag": moc["tag"], "old": moc["old"], "new": new_value, "unit": moc["unit"], "worker": engineer["id"], "drawing": drawing, "rev": plant.drawings[drawing]["rev"]}
 
 
-def gauge_card(plant, rng, scan):
+def taken_at(t0, at_s):
+    """시나리오 기준 시각(`2026-11-04T14:20:00+09:00`) + 초 → 점검표의 현지 시각 `2026-11-04 14:21:05`"""
+    import datetime
+
+    t = datetime.datetime.fromisoformat(t0) + datetime.timedelta(seconds=at_s)
+    return t.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def gauge_card(plant, rng, scan, when="2026-11-04 14:21:05"):
     """현장 계기 점검표 (손글씨 값 + 아날로그 게이지)"""
     c = Canvas(PW, PH, rng)
     worker = plant.people[scan["worker"]]
@@ -726,13 +783,13 @@ def gauge_card(plant, rng, scan):
     f = font(BOLD, 44)
     tw = c.d.textlength(title, font=f)
     c.text((PW - tw) / 2, 90, title, 44, BOLD, kind="title")
-    c.text(90, 165, "제1발전소 1호기 · 현장 순시 기록 (합성)", 20, GOTHIC, fill=GRAY, kind="label")
+    c.text(90, 165, CFG["card_sub"], 20, GOTHIC, fill=GRAY, kind="label")
     rows = [
-        ("점검 일시", "2026-11-04 14:21:05"),
+        ("점검 일시", when),
         ("점검자", worker["name"]),
         ("사번", worker["id"]),
         ("관할 섹터", f"{sector['building']} {sector['label']}"),
-        ("설비 KKS", scan["kks"]),
+        (CFG["card_code"], scan["kks"]),
         ("센서 태그", scan["tag"]),
         ("현장 실측치", f"{scan['value']:.1f}"),
         ("단위", scan["unit"]),
@@ -748,26 +805,24 @@ def gauge_card(plant, rng, scan):
     # 아날로그 게이지
     gx, gy, r = 380, 1080, 190
     c.d.ellipse((gx - r, gy - r, gx + r, gy + r), outline=INK, width=5)
-    vmax = 40.0
-    for k in range(0, 41, 5):
+    # 눈금: MPa 는 0 ~ 40 (5 간격), bar 는 0 ~ 4 (0.5 간격)
+    vmax, step = (4.0, 0.5) if scan["unit"] == "bar" else (40.0, 5)
+    for i in range(int(round(vmax / step)) + 1):
+        k = i * step
         a = math.radians(225 - 270 * k / vmax)
         c.d.line((gx + (r - 30) * math.cos(a), gy - (r - 30) * math.sin(a), gx + (r - 6) * math.cos(a), gy - (r - 6) * math.sin(a)), fill=INK, width=4)
         lx, ly = gx + (r - 58) * math.cos(a), gy - (r - 58) * math.sin(a)
-        c.text(lx - 12, ly - 12, str(k), 20, GOTHIC)
+        c.text(lx - 12, ly - 12, str(k) if isinstance(k, int) else f"{k:g}", 20, GOTHIC)
     a = math.radians(225 - 270 * scan["value"] / vmax)
     c.d.line((gx, gy, gx + (r - 40) * math.cos(a), gy - (r - 40) * math.sin(a)), fill=RED, width=6)
     c.d.ellipse((gx - 12, gy - 12, gx + 12, gy + 12), fill=INK)
-    c.text(gx - 30, gy + 60, "MPa", 24, BOLD)
+    c.text(gx - 30, gy + 60, scan["unit"], 24, BOLD)
     c.add("label", (gx - r, gy - r, gx + r, gy + r), "게이지")
     c.text(640, 930, "현장 판독 메모", 24, BOLD, kind="label")
-    c.hand(640, 980, "아날로그 게이지 정상", 30, BLUE)
-    c.hand(640, 1040, "전송기 표시와 다름", 30, BLUE)
+    c.hand(640, 980, CFG["card_memo"][0], 30, BLUE)
+    c.hand(640, 1040, CFG["card_memo"][1], 30, BLUE)
     # 안내문
-    guide = [
-        "1. 점검표는 순시 직후 작성하고 현장 단말로 주제어실에 전송한다.",
-        "2. 현장 실측치는 아날로그 게이지 바늘이 가리키는 값을 그대로 적는다.",
-        "3. 정비 작업이 있으면 안전작업허가서(PTW)와 잠금표지(LOTO)를 확인한다.",
-    ]
+    guide = CFG["card_guide"]
     gy0 = 1330
     for i, line_text in enumerate(guide):
         c.text(90, gy0 + i * 30, line_text, 18, GOTHIC, fill=GRAY)
@@ -858,7 +913,7 @@ def a0_sheet(plant, a0, masters_dir, scale=1, seed=20261104):
     c.d.rectangle((20, 20, W - 20, H - 20), outline=INK, width=6)
     c.d.rectangle((40, 40, W - 40, H - 40), outline=INK, width=2)
     c.text(160, 260, f"{a0['title']}  ·  A0 {a0['size_mm'][0]} × {a0['size_mm'][1]} mm  ·  {a0['dpi']} DPI", 64, BOLD, kind="label")
-    c.text(160, 380, "마스터 계통도 5장을 한 장에 모은 종합도입니다. 각 칸의 표제란은 원 도면의 것입니다.", 40, GOTHIC, fill=GRAY, kind="label")
+    c.text(160, 380, CFG["a0_note"], 40, GOTHIC, fill=GRAY, kind="label")
     gt = []
     for sh in a0["sheets"]:
         if scale == 1:
@@ -881,7 +936,7 @@ def a0_sheet(plant, a0, masters_dir, scale=1, seed=20261104):
     c.text(tx0 + 60, ty0 + 80, f"도면번호: {a0['id']} ({a0['rev']})", 60, BOLD, kind="title")
     c.text(tx0 + 60, ty0 + 200, a0["title"], 48, BOLD, kind="label")
     c.text(tx0 + 60, ty0 + 300, f"격자 {a0['grid']['rows']} × {a0['grid']['cols']} 타일 · 겹침 {int(a0['grid']['overlap'] * 100)}%", 40, GOTHIC, fill=GRAY, kind="label")
-    for i, line in enumerate(GUIDE_LINES):
+    for i, line in enumerate(CFG["guide"]):
         c.text(tx0 + 60, ty0 + 520 + i * 70, line, 30, GOTHIC, fill=GRAY, kind="guide")
     return c, gt
 
@@ -1032,12 +1087,17 @@ def main():
         damaged_sheets(Plant(db), out, 20261104)
         print(f"심볼 표본: 학습 {n_train} · 시험 {n_test} · 훼손 도면 3단계 × {len(db['drawings'])}장 → {out}")
         return
-    masters = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "core", "fixtures", "drawings")
-    field = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, "out", "field")
-    seed = int(sys.argv[3]) if len(sys.argv) > 3 else 20261104
+    global CFG
+    args = sys.argv[1:]
+    if len(args) >= 2 and args[0] == "--domain":
+        CFG = DOMAINS[args[1]]
+        args = args[2:]
+    masters = args[0] if len(args) > 0 else os.path.join(ROOT, "core", "fixtures", "drawings")
+    field = args[1] if len(args) > 1 else os.path.join(ROOT, "out", "field")
+    seed = int(args[2]) if len(args) > 2 else 20261104
     os.makedirs(masters, exist_ok=True)
     os.makedirs(field, exist_ok=True)
-    db = json.load(open(SEED, encoding="utf-8"))
+    db = json.load(open(CFG["seed"], encoding="utf-8"))
     plant = Plant(db)
     for d in db["drawings"]:
         c = draw_master(plant, d["id"], random.Random(f"{seed}/{d['id']}"))
@@ -1051,16 +1111,16 @@ def main():
         c, gt = a0_sheet(plant, a0, masters)
         img = c.img.convert("P", palette=Image.ADAPTIVE, colors=64)
         save(os.path.join(a0_dir, f"{a0['id']}.png"), img, c.gt, {"drawing": a0["id"], "rev": a0["rev"], "equipment": gt, "grid": a0["grid"]})
-    scenarios = json.load(open(os.path.join(ROOT, "core", "fixtures", "plant_scenarios.json"), encoding="utf-8"))["scenarios"]
+    scenarios = json.load(open(os.path.join(ROOT, "core", "fixtures", CFG["scenarios"]), encoding="utf-8"))["scenarios"]
     for s in scenarios:
         for scan in s["scans"]:
             rng = random.Random(f"{seed}/{s['id']}/{scan['kind']}")
             if scan["kind"] == "redline":
-                c, truth = redline(plant, rng, scan["new"])
+                c, truth = redline(plant, rng, scan["new"], scan["drawing"], scan["moc_no"])
                 # 스캔 잡음 · 기울기 없는 원본 (델타 판독의 정답). 난수를 쓰지 않아 스캔 그림은 그대로입니다.
                 c.img.save(os.path.join(field, os.path.splitext(scan["image"])[0] + "_clean.png"))
             else:
-                c = gauge_card(plant, rng, scan)
+                c = gauge_card(plant, rng, scan, taken_at(s["t0"], scan["at_s"]))
                 truth = {k: scan[k] for k in ("kks", "tag", "value", "unit", "worker", "sector")}
             img, gt, deg = scanned(c, rng)
             save(os.path.join(field, scan["image"]), img, gt, {"scenario": s["id"], "kind": scan["kind"], "skew": round(deg, 3), "truth": truth})

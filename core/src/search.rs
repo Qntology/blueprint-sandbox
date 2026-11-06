@@ -59,14 +59,14 @@ impl DocKind {
 const TYPE_WORDS: [(DocKind, &[&str]); 6] = [
     (DocKind::Sensor, &["센서", "계측", "태그", "전송기", "계기"]),
     (DocKind::Incident, &["사건", "알람 목록", "경보 목록", "진행 중", "inc-"]),
-    (DocKind::Archive, &["보관", "확정된", "처리 완료", "처리된", "이력", "mcr-"]),
-    (DocKind::Aop, &["절차서", "aop", "조치 절차", "대응 절차"]),
-    (DocKind::Moc, &["moc", "변경관리", "레드라인", "red-line", "변경 승인"]),
-    (DocKind::Drawing, &["도면", "p&id", "pid-", "계통도"]),
+    (DocKind::Archive, &["보관", "확정된", "처리 완료", "처리된", "이력", "mcr-", "noc-"]),
+    (DocKind::Aop, &["절차서", "aop", "eop", "조치 절차", "대응 절차"]),
+    (DocKind::Moc, &["moc", "mop", "변경관리", "레드라인", "red-line", "변경 승인"]),
+    (DocKind::Drawing, &["도면", "p&id", "pid-", "mep-", "sld-", "net-", "계통도", "결선도"]),
 ];
 
-/// 설비 종류 낱말 → 원장 `kind`
-const KIND_WORDS: [(&str, &[&str]); 18] = [
+/// 설비 종류 낱말 → 원장 `kind` (뒤 열넷은 AI 데이터센터 원장의 종류)
+const KIND_WORDS: [(&str, &[&str]); 32] = [
     ("밸브", &["valve"]),
     ("펌프", &["pump"]),
     ("팬", &["fan"]),
@@ -85,18 +85,33 @@ const KIND_WORDS: [(&str, &[&str]); 18] = [
     ("버너", &["burner"]),
     ("집진기", &["esp"]),
     ("연돌", &["stack"]),
+    ("gpu", &["gpu_rack"]),
+    ("매니폴드", &["manifold"]),
+    ("열교환기", &["exchanger"]),
+    ("칠러", &["chiller"]),
+    ("냉각탑", &["fan"]),
+    ("항온항습기", &["crah"]),
+    ("공조기", &["crah"]),
+    ("ups", &["ups"]),
+    ("배터리", &["battery"]),
+    ("pdu", &["pdu"]),
+    ("스위치", &["switch"]),
+    ("트랜시버", &["transceiver"]),
+    ("스토리지", &["storage"]),
+    ("탱크", &["tank"]),
 ];
 
 /// 계측 종류 낱말 (센서 라벨 · 단위로 맞춥니다)
-const MEASURE_WORDS: [(&str, &[&str]); 9] = [
+const MEASURE_WORDS: [(&str, &[&str]); 10] = [
     ("온도", &["℃", "°c"]),
-    ("압력", &["mpa", "kpa"]),
-    ("유량", &["t/h"]),
-    ("진동", &["μm", "um"]),
+    ("압력", &["mpa", "kpa", "bar"]),
+    ("유량", &["t/h", "lpm"]),
+    ("진동", &["μm", "um", "mm/s"]),
     ("개도", &["%"]),
     ("전류", &["a"]),
     ("수위", &["%"]),
     ("출력", &["mw"]),
+    ("전력", &["kw", "mw"]),
     ("농도", &["ppm"]),
 ];
 
@@ -574,14 +589,16 @@ fn unit_measure(unit: &str) -> Option<&'static str> {
     let u = unit.to_lowercase();
     if u.starts_with('도') || u.starts_with('℃') || u.starts_with("°c") {
         Some("온도")
-    } else if u.starts_with("mpa") || u.starts_with("kpa") {
+    } else if u.starts_with("mpa") || u.starts_with("kpa") || u.starts_with("bar") {
         Some("압력")
-    } else if u.starts_with("t/h") {
+    } else if u.starts_with("t/h") || u.starts_with("lpm") {
         Some("유량")
-    } else if u.starts_with("μm") || u.starts_with("um") {
+    } else if u.starts_with("μm") || u.starts_with("um") || u.starts_with("mm/s") {
         Some("진동")
     } else if u.starts_with("mw") {
         Some("출력")
+    } else if u.starts_with("kw") {
+        Some("전력")
     } else if u.starts_with("ppm") {
         Some("농도")
     } else {
@@ -928,6 +945,27 @@ pub const EVAL_QUERIES: [(&str, &str, usize); 17] = [
 ];
 
 /// 지금 계측이 있을 때의 평가 (시나리오 P2 재생 끝 시각: 밸브 18 % 고착 · 펌프 토출 29.4 MPa · 과열기 638 °C)
+/// AI 데이터센터 원장 평가 질의 (계측 없음) · 지금 계측(D2 재생 끝 시각)
+pub const EVAL_AIDC_QUERIES: [(&str, &str, usize); 10] = [
+    ("103동 2층 밸브", "DC1CDU20AA02", 2),
+    ("CDU 우회밸브", "DC1CDU20AA03", 1),
+    ("GPU 정션 온도 센서", "DC1GPU10CT01", 2),
+    ("Pod A 매니폴드", "DC1MNF10MV01", 1),
+    ("DC1CDUI0AP01", "DC1CDU10AP01", 1),
+    ("배터리 셀 온도", "DC1BES10CT01", 1),
+    ("냉각탑 팬", "DC1CTW10AN01", 2),
+    ("열폭주 절차서", "EOP-104-BAT01", 1),
+    ("105동 도면", "MEP-105-CHL", 1),
+    ("승인 대기 MOP", "MOP-2026-1021", 1),
+];
+pub const EVAL_AIDC_LIVE_SCENARIO: &str = "D2";
+pub const EVAL_AIDC_LIVE_QUERIES: [(&str, &str, usize); 4] = [
+    ("고착된 밸브", "DC1CDU20AA02", 1),
+    ("온도 높은 GPU 랙", "DC1GPU10RK01", 1),
+    ("103동 압력 높은 펌프", "DC1CDU10AP01", 1),
+    ("유량 낮은 냉각수", "DC1CDU20AA02", 2),
+];
+
 pub const EVAL_LIVE_SCENARIO: &str = "P2";
 pub const EVAL_LIVE_QUERIES: [(&str, &str, usize); 7] = [
     ("103동 압력 높은 급수펌프", "10LAB10AP001", 1),
@@ -941,7 +979,7 @@ pub const EVAL_LIVE_QUERIES: [(&str, &str, usize); 7] = [
 
 /// 시나리오를 끝 시각까지 재생한 지금 계측으로 검색 표를 만듭니다 (평가 · 시험용).
 pub fn live_corpus(db: &Lattice, scenario: &str) -> Option<Corpus> {
-    let set = crate::scenario::ScenarioSet::embedded().ok()?;
+    let set = crate::scenario::ScenarioSet::embedded_for(db.domain()).ok()?;
     let sc = set.get(scenario)?;
     let telemetry = sc.telemetry(&set);
     let at = sc.time(sc.now_s).timestamp_millis();

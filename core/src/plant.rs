@@ -1,13 +1,16 @@
-//! 발전소 공간 · 설비 식별 체계 (기획 Part 8 2절).
+//! 발전소 · AI 데이터센터 공간 · 설비 식별 체계 (기획 Part 8 2절, 추가 개선안 Part 1).
 //!
-//! 설비는 아파트 단지처럼 5단계 공간 뎁스로 찾습니다: Lv1 호기(단지) → Lv2 섹터 · 건물(동) → Lv3 층 · 고도(층)
-//! → Lv4 계통 도면(라인) → Lv5 개별 설비 · 센서(호수). Lv5 는 KKS(발전소 설비 식별 표준) 코드입니다.
+//! 설비는 아파트 단지처럼 5단계 공간 뎁스로 찾습니다: Lv1 호기 · 센터(단지) → Lv2 섹터 · 건물(동) → Lv3 층 · 고도(층)
+//! → Lv4 계통 도면(라인) → Lv5 개별 설비 · 센서(호수). Lv5 는 발전소에서 KKS(발전소 설비 식별 표준) 코드,
+//! AI 데이터센터에서 DCIM 자산 코드입니다 ([`CodeScheme`]).
 //!
 //! KKS 코드는 이 저장소에서 12글자로 씁니다: `10` 호기 · `LAB` 계통 · `10` 계통 번호 · `AP` 설비 종류 · `001` 설비 번호.
 //! 센서 태그도 같은 꼴이고 설비 종류 자리가 `C` 로 시작하는 측정 코드입니다 (`10LAB10CP001` = 주급수펌프 A 의 압력).
+//! DCIM 자산 코드도 12글자입니다: `DC` 사이트 · `1` 센터 · `CDU` 계통 · `20` 계통 번호 · `AA` 설비 종류 · `02` 설비 번호
+//! (`DC1CDU20CG02` = CDU 2차측 유량조절밸브의 개도).
 
 use chrono::{DateTime, FixedOffset, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// 발전소 현지 시각(KST, UTC+9). 사건 · 보관 번호의 날짜와 보존 기한은 이 시각으로 셉니다 (UTC 로 세면 자정~09시 사건이 전날 번호가 됩니다).
 pub fn kst() -> FixedOffset {
@@ -19,6 +22,9 @@ pub fn local(at: DateTime<Utc>) -> DateTime<FixedOffset> {
 }
 
 /// Lv2 섹터. Gate 0 라우터가 알람을 이 다섯 건물 중 하나로 보냅니다.
+///
+/// 다섯 자리는 도메인과 무관한 라우팅 자리입니다. AI 데이터센터 원장의 다섯 구역도 같은 자리로 갑니다
+/// (`compute` → 1, `network` → 2, `cooling` → 3, `power` → 4, `facility` → 5). 화면에 쓰는 이름은 원장의 섹터 행이 정합니다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub enum Sector {
     Boiler,
@@ -31,7 +37,7 @@ pub enum Sector {
 impl Sector {
     pub const ALL: [Sector; 5] = [Sector::Boiler, Sector::Turbine, Sector::Feedwater, Sector::Electric, Sector::EnvSafety];
 
-    /// 시드 대장의 섹터 키
+    /// 발전소 시드 대장의 섹터 키 (다른 도메인 원장의 키는 [`crate::lattice::Lattice::sector_for`] 로 찾습니다)
     pub fn key(self) -> &'static str {
         match self {
             Sector::Boiler => "boiler",
@@ -42,8 +48,27 @@ impl Sector {
         }
     }
 
+    /// 원장의 섹터 키 → 라우팅 자리. 발전소 키와 AI 데이터센터 키를 함께 받습니다.
     pub fn from_key(key: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|s| s.key() == key)
+        match key {
+            "boiler" | "compute" => Some(Sector::Boiler),
+            "turbine" | "network" => Some(Sector::Turbine),
+            "feedwater" | "cooling" => Some(Sector::Feedwater),
+            "electric" | "power" => Some(Sector::Electric),
+            "env" | "facility" => Some(Sector::EnvSafety),
+            _ => None,
+        }
+    }
+
+    /// 라우팅 자리 번호 (1 ~ 5)
+    pub fn slot(self) -> u8 {
+        match self {
+            Sector::Boiler => 1,
+            Sector::Turbine => 2,
+            Sector::Feedwater => 3,
+            Sector::Electric => 4,
+            Sector::EnvSafety => 5,
+        }
     }
 
     /// 기획안의 분류 이름 (`Category`)
@@ -58,7 +83,7 @@ impl Sector {
     }
 }
 
-/// 측정 종류. 센서 태그의 여덟째 · 아홉째 글자(`CP`, `CT` …)입니다.
+/// 측정 종류. 센서 태그의 설비 종류 자리 두 글자(`CP`, `CT` …)입니다 (KKS 는 여덟째 · 아홉째, DCIM 은 아홉째 · 열째 글자).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum Measure {
     /// CP 압력
@@ -95,9 +120,10 @@ impl Measure {
         }
     }
 
-    /// 센서 태그에서 측정 종류를 읽습니다.
+    /// 센서 태그에서 측정 종류를 읽습니다. 코드 체계는 태그 모양으로 가립니다 (첫 글자가 숫자면 KKS, 영문이면 DCIM).
     pub fn of_tag(tag: &str) -> Self {
-        tag.get(7..9).map(Self::from_code).unwrap_or(Measure::Other)
+        let at = CodeScheme::of_code(tag).unwrap_or_default().kind_at();
+        tag.get(at..at + 2).map(Self::from_code).unwrap_or(Measure::Other)
     }
 
     pub fn label(self) -> &'static str {
@@ -115,7 +141,7 @@ impl Measure {
     }
 }
 
-/// 설비 사이를 잇는 물리 매체 (마인드맵 간선의 종류)
+/// 설비 사이를 잇는 물리 매체 (마인드맵 간선의 종류). 뒤의 다섯은 AI 데이터센터의 냉각 · 네트워크 매체입니다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum Medium {
     Power,
@@ -129,10 +155,20 @@ pub enum Medium {
     Air,
     Gas,
     Draft,
+    /// CDU 2차측 냉각수 (TCS 루프, 랙 매니폴드 · 콜드플레이트로 가는 물)
+    Coolant,
+    /// 칠러 → CDU 열교환기 1차측 냉수 (FWS)
+    ChilledWater,
+    /// 냉각탑 ↔ 칠러 응축기 냉각수
+    CondenserWater,
+    /// 항온항습기(CRAH) 냉기
+    Airflow,
+    /// 광 패브릭 · 스토리지 네트워크
+    Network,
 }
 
 impl Medium {
-    pub const ALL: [Medium; 11] = [
+    pub const ALL: [Medium; 16] = [
         Medium::Power,
         Medium::Condensate,
         Medium::Feedwater,
@@ -144,6 +180,11 @@ impl Medium {
         Medium::Air,
         Medium::Gas,
         Medium::Draft,
+        Medium::Coolant,
+        Medium::ChilledWater,
+        Medium::CondenserWater,
+        Medium::Airflow,
+        Medium::Network,
     ];
 
     pub fn key(self) -> &'static str {
@@ -159,6 +200,11 @@ impl Medium {
             Medium::Air => "air",
             Medium::Gas => "gas",
             Medium::Draft => "draft",
+            Medium::Coolant => "coolant",
+            Medium::ChilledWater => "chilled_water",
+            Medium::CondenserWater => "condenser_water",
+            Medium::Airflow => "airflow",
+            Medium::Network => "network",
         }
     }
 
@@ -179,6 +225,11 @@ impl Medium {
             Medium::Air => "연소 공기",
             Medium::Gas => "연소가스",
             Medium::Draft => "통풍",
+            Medium::Coolant => "2차 냉각수",
+            Medium::ChilledWater => "1차 냉수",
+            Medium::CondenserWater => "냉각탑 냉각수",
+            Medium::Airflow => "공조 냉기",
+            Medium::Network => "광 네트워크",
         }
     }
 }
@@ -235,18 +286,78 @@ pub fn physics_consistent(medium: Medium, up: (Measure, Direction), down: (Measu
             Vibration if um == Vibration => Some(ud == dd),
             _ => None,
         },
+        // 수냉 루프: 냉각수가 줄면 (개도 · 유량 하락) 콜드플레이트 · 열교환기 하류 온도가 오르고 유량 · 압력은 내려갑니다 (급수와 같은 열수력).
+        Medium::Coolant | Medium::ChilledWater if matches!(um, Opening | Flow) => match dm {
+            Temperature => Some(ud != dd),
+            Flow | Level | Pressure => Some(ud == dd),
+            _ => None,
+        },
+        // 공급 냉수 · 냉각수 온도가 오르면 하류 온도도 오릅니다.
+        Medium::Coolant | Medium::ChilledWater | Medium::CondenserWater | Medium::Airflow if um == Temperature => match dm {
+            Temperature => Some(ud == dd),
+            _ => None,
+        },
+        // 냉각탑 팬 · 냉각수 펌프 부하(전류)가 떨어지면 열을 덜 버려 칠러 냉수 공급 온도가 오릅니다.
+        Medium::CondenserWater | Medium::Airflow if um == Electric || um == Flow => match dm {
+            Temperature => Some(ud != dd),
+            _ => None,
+        },
         _ => None,
+    }
+}
+
+/// 설비 코드 체계. 둘 다 12글자이고 자리마다 숫자 · 영문이 정해져 있어 OCR 오독(1↔I, 0↔O)을 같은 방식으로 고칩니다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeScheme {
+    /// 발전소 KKS `10LAB10AP001`: 숫자 2 · 영문 3 · 숫자 2 · 영문 2 · 숫자 3
+    #[default]
+    Kks,
+    /// AI 데이터센터 DCIM 자산 코드 `DC1CDU20AA02`: 영문 2 · 숫자 1 · 영문 3 · 숫자 2 · 영문 2 · 숫자 2
+    Dcim,
+}
+
+impl CodeScheme {
+    /// 자리마다 `9` 는 숫자, `A` 는 영문 대문자
+    pub fn mask(self) -> &'static [u8; 12] {
+        match self {
+            CodeScheme::Kks => b"99AAA99AA999",
+            CodeScheme::Dcim => b"AA9AAA99AA99",
+        }
+    }
+
+    /// 설비 종류 · 측정 코드 두 글자가 시작하는 자리. 센서 태그는 이 자리가 `C` 로 시작합니다.
+    /// 앞부분(계통 머리)은 센서 태그와 그 설비의 코드가 같습니다.
+    pub fn kind_at(self) -> usize {
+        match self {
+            CodeScheme::Kks => 7,
+            CodeScheme::Dcim => 8,
+        }
+    }
+
+    /// 이 체계의 12글자 꼴인지
+    pub fn shape(self, code: &str) -> bool {
+        let b = code.as_bytes();
+        b.len() == 12 && b.iter().zip(self.mask()).all(|(c, m)| if *m == b'9' { c.is_ascii_digit() } else { c.is_ascii_uppercase() })
+    }
+
+    /// 코드 모양으로 체계를 가립니다 (어느 꼴도 아니면 None)
+    pub fn of_code(code: &str) -> Option<Self> {
+        [CodeScheme::Kks, CodeScheme::Dcim].into_iter().find(|s| s.shape(code))
+    }
+
+    /// 화면 · 문서에 쓰는 이름
+    pub fn label(self) -> &'static str {
+        match self {
+            CodeScheme::Kks => "KKS",
+            CodeScheme::Dcim => "DCIM 자산코드",
+        }
     }
 }
 
 /// KKS 12글자 꼴인지: 숫자 2 · 영문 3 · 숫자 2 · 영문 2 · 숫자 3
 pub fn kks_shape(code: &str) -> bool {
-    let b = code.as_bytes();
-    b.len() == 12
-        && b.iter().enumerate().all(|(i, c)| match i {
-            0 | 1 | 5 | 6 | 9..=11 => c.is_ascii_digit(),
-            _ => c.is_ascii_uppercase(),
-        })
+    CodeScheme::Kks.shape(code)
 }
 
 /// 숫자 자리에 잘못 읽힌 영문 → 숫자 (OCR 이 자주 헷갈리는 글자)
@@ -283,26 +394,29 @@ fn as_letter(c: char) -> Option<char> {
 /// OCR 글자에서 KKS 후보를 만듭니다. 띄어쓰기 · 하이픈 · 점을 빼고, 자리마다 숫자 · 영문 혼동을 고칩니다.
 /// 12글자가 아니면 대문자로만 바꿔 돌려줍니다 (편집 거리로 맞춥니다).
 pub fn repair_kks(raw: &str) -> String {
+    repair_code(raw, CodeScheme::Kks)
+}
+
+/// [`repair_kks`] 를 코드 체계의 자리 꼴(`mask`)로 합니다. DCIM 은 `DC1CDUI0AP01` → `DC1CDU10AP01`.
+pub fn repair_code(raw: &str, scheme: CodeScheme) -> String {
     let squeezed: Vec<char> = raw.chars().filter(|c| !c.is_whitespace() && !matches!(c, '-' | '.' | '_' | ':' | '·')).collect();
     if squeezed.len() != 12 {
         return squeezed.iter().map(|c| c.to_ascii_uppercase()).collect();
     }
     squeezed
         .iter()
-        .enumerate()
-        .map(|(i, &c)| {
-            let fixed = match i {
-                0 | 1 | 5 | 6 | 9..=11 => as_digit(c),
-                _ => as_letter(c),
-            };
+        .zip(scheme.mask())
+        .map(|(&c, m)| {
+            let fixed = if *m == b'9' { as_digit(c) } else { as_letter(c) };
             fixed.unwrap_or(c.to_ascii_uppercase())
         })
         .collect()
 }
 
-/// 센서 태그의 끝 다섯 글자 (`10LAB20CG102` → `CG102`). 도면 상자에 적힌 짧은 이름입니다.
+/// 센서 태그의 측정 코드부터 끝까지 (`10LAB20CG102` → `CG102`, `DC1CDU20CG02` → `CG02`). 도면 상자에 적힌 짧은 이름입니다.
 pub fn short_tag(tag: &str) -> &str {
-    tag.get(7..).unwrap_or(tag)
+    let at = CodeScheme::of_code(tag).unwrap_or_default().kind_at();
+    tag.get(at..).unwrap_or(tag)
 }
 
 /// 값을 화면 · 사실 줄에 쓰는 꼴. 1000 이상은 천 단위 쉼표, 1 미만은 소수 둘째 자리까지 씁니다.
@@ -346,6 +460,9 @@ mod tests {
         }
         assert_eq!(Sector::Feedwater.category(), "Sector03Feedwater");
         assert_eq!(Sector::from_key("nope"), None);
+        // AI 데이터센터 구역은 같은 다섯 라우팅 자리로 갑니다.
+        let aidc = ["compute", "network", "cooling", "power", "facility"].map(|k| Sector::from_key(k).unwrap().slot());
+        assert_eq!(aidc, [1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -354,6 +471,12 @@ mod tests {
         assert_eq!(Measure::of_tag("10HAH10CT001"), Measure::Temperature);
         assert_eq!(Measure::of_tag("10MAD10CY001"), Measure::Vibration);
         assert_eq!(Measure::of_tag("짧음"), Measure::Other);
+        // DCIM 태그는 측정 코드가 한 자리 뒤에 있습니다.
+        assert_eq!(Measure::of_tag("DC1CDU20CG02"), Measure::Opening);
+        assert_eq!(Measure::of_tag("DC1GPU10CT01"), Measure::Temperature);
+        assert_eq!(Measure::of_tag("DC1CTW10CE01"), Measure::Electric);
+        assert_eq!(short_tag("10LAB20CG102"), "CG102");
+        assert_eq!(short_tag("DC1CDU20CG02"), "CG02");
     }
 
     #[test]
@@ -363,6 +486,22 @@ mod tests {
         assert!(!kks_shape("10LABI0AP001"));
         assert!(!kks_shape("10LAB10AP01"));
         assert!(!kks_shape("10lab10ap001"));
+        assert!(CodeScheme::Dcim.shape("DC1CDU20AA02"));
+        assert!(!CodeScheme::Dcim.shape("DC1CDUI0AP01"));
+        assert!(!kks_shape("DC1CDU20AA02"));
+        assert_eq!(CodeScheme::of_code("DC1GPU10RK01"), Some(CodeScheme::Dcim));
+        assert_eq!(CodeScheme::of_code("10LAB10AP001"), Some(CodeScheme::Kks));
+        assert_eq!(CodeScheme::of_code("10LABI0AP001"), None);
+    }
+
+    #[test]
+    fn dcim_codes_are_repaired_by_their_own_mask() {
+        // 추가 개선안 3.3 의 현장 단말 예: `I` 를 `1` 로
+        assert_eq!(repair_code("DC1CDUI0AP01", CodeScheme::Dcim), "DC1CDU10AP01");
+        assert_eq!(repair_code("DCI CDU 20 AA O2", CodeScheme::Dcim), "DC1CDU20AA02");
+        assert_eq!(repair_code("0C1GPU10RK01", CodeScheme::Dcim), "OC1GPU10RK01", "영문 자리의 0 은 O 로 (사이트 코드는 편집 거리로 맞춤)");
+        // 같은 글자를 KKS 꼴로 고치면 엉뚱해집니다: 체계를 원장이 알려 줘야 하는 까닭
+        assert_ne!(repair_code("DC1CDUI0AP01", CodeScheme::Kks), "DC1CDU10AP01");
     }
 
     #[test]
@@ -385,6 +524,11 @@ mod tests {
         assert_eq!(physics_consistent(Medium::Draft, (Measure::Electric, Direction::Down), (Measure::Pressure, Direction::Up)), Some(true));
         assert_eq!(physics_consistent(Medium::Oil, (Measure::Temperature, Direction::Up), (Measure::Vibration, Direction::Up)), Some(true));
         assert_eq!(physics_consistent(Medium::Fuel, (Measure::Flow, Direction::Down), (Measure::Temperature, Direction::Up)), None);
+        // AI 데이터센터: CDU 밸브가 닫히면 GPU 온도가 오르고, 냉각탑 팬 전류가 떨어지면 냉수 공급 온도가 오릅니다.
+        assert_eq!(physics_consistent(Medium::Coolant, down, (Measure::Temperature, Direction::Up)), Some(true));
+        assert_eq!(physics_consistent(Medium::Coolant, down, (Measure::Pressure, Direction::Up)), Some(false));
+        assert_eq!(physics_consistent(Medium::CondenserWater, (Measure::Electric, Direction::Down), (Measure::Temperature, Direction::Up)), Some(true));
+        assert_eq!(physics_consistent(Medium::Network, (Measure::Temperature, Direction::Up), (Measure::Temperature, Direction::Up)), None);
     }
 
     #[test]

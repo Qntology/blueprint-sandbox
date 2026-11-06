@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use crate::case::{FieldKind, FieldReport};
 use crate::lattice::{Lattice, MocRow};
-use crate::plant::{fmt_value, Sector};
+use crate::plant::fmt_value;
 use crate::timeseries::Telemetry;
 use crate::verdict::Verdict;
 
@@ -197,7 +197,7 @@ pub fn check_moc(db: &Lattice, report: &FieldReport) -> MocCheck {
     let text = |v: Option<f64>| v.map(|v| format!("{} {}", fmt_value(v), m.unit));
     let mut rows = vec![
         TruthRow { item: "변경번호".into(), field: moc_no.clone(), ledger: Some(m.moc_no.clone()), single: None, agree: true },
-        TruthRow { item: "설비 KKS".into(), field: report.kks.clone(), ledger: Some(m.kks.clone()), single: None, agree: report.kks.as_deref() == Some(m.kks.as_str()) },
+        TruthRow { item: format!("설비 {}", db.terms().code), field: report.kks.clone(), ledger: Some(m.kks.clone()), single: None, agree: report.kks.as_deref() == Some(m.kks.as_str()) },
         TruthRow { item: "기존 한계".into(), field: text(report.old_value), ledger: text(Some(m.old)), single: None, agree: report.old_value.is_none_or(|v| same(v, m.old)) },
         TruthRow { item: "변경 한계".into(), field: text(report.reading), ledger: text(Some(m.new)), single: None, agree: report.reading.is_some_and(|v| same(v, m.new)) },
     ];
@@ -207,7 +207,7 @@ pub fn check_moc(db: &Lattice, report: &FieldReport) -> MocCheck {
     rows.push(TruthRow {
         item: "서명자 관할 권한".into(),
         field: signer.map(crate::privacy::mask_id),
-        ledger: Sector::from_key(&sector).and_then(|s| db.sector(s.key())).map(|s| format!("{} 관할", s.building)),
+        ledger: db.sector(&sector).map(|s| format!("{} 관할", s.building)),
         single: None,
         agree: authorized,
     });

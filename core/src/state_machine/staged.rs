@@ -99,7 +99,7 @@ pub fn redraft(access: &impl EngineAccess, db: &Lattice, incident_id: &str) -> R
 pub fn propose_mitigation(access: &impl EngineAccess, db: &Lattice, incident_id: &str, now: DateTime<Utc>) -> Result<Option<Mitigation>> {
     for _ in 0..ATTEMPTS {
         let Some(job) = access.engine(|e| e.mitigation_job(db, incident_id))? else { return Ok(None) };
-        let decided = access.infer(|| mitigation::judge(&job.facts, job.model.as_deref()))?;
+        let decided = access.infer(|| mitigation::judge(&job.title, &job.facts, job.model.as_deref()))?;
         match access.engine(|e| e.commit_mitigation(db, job, decided, now))? {
             Commit::Done(m) => return Ok(Some(m)),
             Commit::Stale => continue,

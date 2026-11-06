@@ -3,6 +3,9 @@
 //   npm i --no-save playwright-core@1.55.0
 //   node scripts/e2e/console.js [--shots 폴더] [--only P2,P1,P3]
 //
+// 흐름: 발전소 P2 · P1 · P3 · P3F · P4 · A0 · SEARCH · PHYS, CCTV 관제판 CCTV, 도메인 전환 뒤 AI 데이터센터 AIDC(전환) · D2 · D1 · D3 · D3F · D4 ·
+// DPHYS, 그리고 PLANT(발전소로 되돌림). 기본은 전부 차례로 돕니다.
+//
 // 앱은 먼저 띄워 둡니다. WebView2 에 디버그 포트를 열고, 스캐너 폴더를 같은 값으로 줍니다.
 //   WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222
 //   BLUEPRINT_SCANNER_DIR=<폴더>
@@ -19,7 +22,7 @@ const flag = (name) => {
   return i >= 0 ? args[i + 1] : null;
 };
 const SHOTS = flag("--shots") || path.join(ROOT, "out", "shots");
-const ONLY = (flag("--only") || "P2,P1,P3,P3F,P4,A0,SEARCH,PHYS").split(",");
+const ONLY = (flag("--only") || "P2,P1,P3,P3F,P4,A0,SEARCH,PHYS,CCTV,AIDC,D2,D1,D3,D3F,D4,DPHYS,PLANT").split(",");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 현장 단말 화면에 나오면 안 되는 내부 정보 (core/src/privacy.rs FIELD_FORBIDDEN).
 // "원장 수치" 만 뺍니다. 기획안의 소명 화면 안내문 "(… 내부 원장 수치 및 판정 코드는 화면에 표시되지 않습니다)" 에 들어 있습니다.
@@ -48,8 +51,9 @@ async function pages(browser) {
     let fieldPage = null;
     for (const p of all) {
       const text = await p.evaluate(() => document.body.innerText).catch(() => "");
-      if (text.includes("발전소 관제 콘솔")) consolePage = p;
-      if (text.includes("현장 순시")) fieldPage = p;
+      // 콘솔 제목 · 단말 머리는 도메인마다 다릅니다 (발전소 관제 콘솔 · AI 데이터센터 자율 관제 콘솔).
+      if (text.includes("관제 콘솔") && text.includes("공간 Depth")) consolePage = p;
+      if (text.includes("Field Patrol Kiosk")) fieldPage = p;
     }
     if (consolePage && fieldPage) return { consolePage, fieldPage };
     await sleep(2000);
@@ -145,14 +149,15 @@ async function p2(c) {
   await waitText(c, "차단");
   await shot(c, "P2-8-rubber-stamp");
   // 선행 절차 인터록 (Part 8-4): Step 1 은 DCS 값으로 통과, Step 2 (바이패스 개방) 가 남아 확정이 잠깁니다.
+  // 오른쪽 통합 결재창에도 같은 신호등 게이트가 있어서 서랍 안의 것을 고릅니다.
   await c.locator(".drawer label.check", { hasText: "공동 결재" }).locator("input").check();
   await c.locator(".drawer button", { hasText: "선행 절차를 건너뛰고 확정 시도" }).click();
   await waitText(c, "Step 2");
   await shot(c, "P2-8b-interlock-blocked");
-  await c.locator(".il-step", { hasText: "Step 2" }).locator("input").fill("65");
-  await c.locator(".il-step", { hasText: "Step 2" }).locator("button", { hasText: "현장 값 확인" }).click();
+  await c.locator(".drawer .il-step", { hasText: "Step 2" }).locator("input").fill("65");
+  await c.locator(".drawer .il-step", { hasText: "Step 2" }).locator("button", { hasText: "현장 값 확인" }).click();
   await waitText(c, "남은 선행 절차: Step 3");
-  await c.locator(".il-step", { hasText: "Step 3" }).locator("button", { hasText: "무전 확인" }).click();
+  await c.locator(".drawer .il-step", { hasText: "Step 3" }).locator("button", { hasText: "무전 확인" }).click();
   await waitText(c, "모두 확인");
   await sleep(800);
   await shot(c, "P2-8c-interlock-done");
@@ -334,7 +339,7 @@ async function phys(c) {
   await c.locator("button", { hasText: "물리엔진 · 자율 대응" }).click();
   await c.locator(".drawer button", { hasText: "시뮬레이터 시작" }).click();
   await sleep(4000);
-  await c.locator(".drawer button", { hasText: "급수밸브 18% 고착 주입" }).click();
+  await c.locator(".drawer button", { hasText: "18% 고착 주입" }).click();
   await waitText(c, "인과 사슬 잠금", 90000);
   // 사건이 열리면 엔진이 판단 질문(수 초)을 돌립니다. 그동안에도 상태 줄 조회가 바로 돌아와야 합니다 (엔진 잠금은 준비 · 반영 때만).
   const status = await statusLatency(c, 5000);
@@ -374,6 +379,215 @@ async function phys(c) {
   results.push({ ...record, ok: true });
 }
 
+// ───────── 개선안: CCTV형 통합 관제판 ─────────
+
+// 가운데 위 CAM-01(도면) · 아래 CAM-02(시계열) · CAM-03(SDS) · 오른쪽 통합 결재창이 사건 하나로 함께 떠 있는지 봅니다.
+async function cctv(c) {
+  await tidy(c);
+  await inject(c, "P2");
+  await openIncident(c, "P2");
+  await c.locator(".tab", { hasText: "P&ID" }).click();
+  await sleep(1500);
+  const text = await c.evaluate(() => document.body.innerText);
+  for (const want of ["CAM-01", "CAM-02", "CAM-03", "감지된 핵심 병목", "인터록 게이트", "표준 조치 요약", "STUCK_LOW"]) {
+    assert(text.includes(want), `CCTV 관제판에 '${want}' 가 없습니다`);
+  }
+  assert((await c.locator(".sds-chip").count()) > 0, "도면 설비 상자에 SDS 상태 칩이 없습니다");
+  assert((await c.locator(".lag-label").count()) > 0, "원인 경로 배관에 Δt 라벨이 없습니다");
+  await shot(c, "CCTV-1-p2");
+  // 재생 슬라이더를 발원 직후로 옮기면 SDS 전이와 도면 칩이 그 시각으로 바뀝니다.
+  await c.locator(".scrubber button", { hasText: "발원점" }).click();
+  await sleep(800);
+  await shot(c, "CCTV-2-origin");
+  await c.locator(".tab", { hasText: "마인드맵" }).click();
+  await sleep(2500);
+  await shot(c, "CCTV-3-mindmap");
+  await c.locator(".tab", { hasText: "Mermaid" }).click();
+  await c.waitForSelector(".mermaid-host svg", { timeout: 60000 });
+  await waitText(c, "SDS:", 30000);
+  await shot(c, "CCTV-4-mermaid");
+  await c.locator(".tab", { hasText: "P&ID" }).click();
+  results.push({ id: "CCTV", ok: true });
+}
+
+// ───────── 추가 개선안: AI 데이터센터 모드 ─────────
+
+async function switchDomain(c, label, brand) {
+  await tidy(c);
+  await c.locator(".domain-switch .seg", { hasText: label }).click();
+  await waitText(c, brand, 60000);
+  await sleep(1500);
+}
+
+async function aidc(c, f) {
+  await switchDomain(c, "AI 데이터센터", "AI 데이터센터 자율 관제 콘솔");
+  await waitText(f, "AI 데이터센터 현장 엔지니어 단말", 30000);
+  const text = await c.evaluate(() => document.body.innerText);
+  assert(text.includes("MEP-103-CDU"), "데이터센터 도면 칩이 없습니다");
+  assert(!text.includes("INC-"), "도메인을 바꾸면 사건 목록이 비어야 합니다");
+  await shot(c, "AIDC-1-console");
+  await shot(f, "AIDC-2-kiosk");
+  results.push({ id: "AIDC", ok: true });
+}
+
+async function d2(c) {
+  await inject(c, "D2");
+  await openIncident(c, "D2");
+  await c.locator(".tab", { hasText: "MEP" }).click();
+  await sleep(1500);
+  const text = await c.evaluate(() => document.body.innerText);
+  for (const want of ["DC1CDU20AA02", "EOP-103-CDU02", "셧다운"]) assert(text.includes(want), `D2 화면에 '${want}' 가 없습니다`);
+  await shot(c, "D2-1-cctv");
+  await c.locator(".tab", { hasText: "Mermaid" }).click();
+  await c.waitForSelector(".mermaid-host svg", { timeout: 60000 });
+  await shot(c, "D2-2-mermaid");
+  await c.locator(".tab", { hasText: "마인드맵" }).click();
+  await sleep(2500);
+  await shot(c, "D2-3-mindmap");
+  await c.locator(".tab", { hasText: "MEP" }).click();
+  await stage(c, 4);
+  await shot(c, "D2-4-stage4");
+  await closeDrawer(c);
+  await stage(c, 5);
+  await c.locator(".drawer label.check", { hasText: "공동 결재" }).locator("input").check();
+  await c.locator(".drawer button", { hasText: "선행 절차를 건너뛰고 확정 시도" }).click();
+  await waitText(c, "Step 2");
+  await c.locator(".drawer .il-step", { hasText: "Step 2" }).locator("input").fill("65");
+  await c.locator(".drawer .il-step", { hasText: "Step 2" }).locator("button", { hasText: "현장 값 확인" }).click();
+  await waitText(c, "남은 선행 절차: Step 3");
+  await c.locator(".drawer .il-step", { hasText: "Step 3" }).locator("button", { hasText: "무전 확인" }).click();
+  await waitText(c, "모두 확인");
+  const cosign = c.locator(".drawer label.check", { hasText: "공동 결재" }).locator("input");
+  if (!(await cosign.isChecked())) await cosign.check();
+  await c.locator(".drawer button", { hasText: "조치확정" }).click();
+  await waitText(c, "확정했습니다");
+  await waitText(c, "보관 문서", 30000);
+  const archive = await c.locator(".drawer").innerText();
+  assert(archive.includes("NOC-2026-") && archive.includes("NOC 관제실 결재"), "데이터센터 보관 문서는 NOC 번호 · 관제실 결재여야 합니다");
+  await shot(c, "D2-5-approved");
+  await closeDrawer(c);
+  results.push({ id: "D2", ok: true });
+}
+
+async function d1(c, f) {
+  await inject(c, "D1");
+  await openIncident(c, "D1");
+  await waitText(c, "현장 대기");
+  placeScan("D1_gauge.png");
+  await fieldReset(f);
+  await f.locator("button", { hasText: "도면/계기 스캔" }).click();
+  await f.waitForSelector(".form-grid", { timeout: 300000 });
+  await noLeak(f, "D1 점검표 확인");
+  const crops = await f.locator(".crop").count();
+  const kks = await f.locator(".field-card", { hasText: "자산코드" }).locator("input").inputValue();
+  await shot(f, "D1-1-field-cards");
+  assert(kks === "DC1MNF10MV01", `점검표 자산 코드를 ${kks} 로 읽었습니다`);
+  assert(crops >= 2, `원터치 대조 카드의 스캔 조각이 ${crops} 개뿐입니다`);
+  // 스테퍼: +0.1 → -0.1 로 값이 돌아옵니다 (장갑 입력)
+  const reading = f.locator(".field-card", { hasText: "현장 실측치" });
+  const before = await reading.locator("input").inputValue();
+  await reading.locator("button.step", { hasText: "+0.1" }).click();
+  await reading.locator("button.step", { hasText: "-0.1" }).click();
+  assert(Number(await reading.locator("input").inputValue()) === Number(before), "스테퍼가 값을 되돌리지 못했습니다");
+  await f.locator("button", { hasText: "NOC 관제실로 전송하기" }).click();
+  await waitText(f, "편차가 있어");
+  await noLeak(f, "D1 소명");
+  await f.locator("input[value=transmitter_drift]").check();
+  await f.locator("button", { hasText: "소명 포함 전송하기" }).click();
+  await waitText(f, "접수 번호");
+  await sleep(1500);
+  await openIncident(c, "D1");
+  await stage(c, 3);
+  await shot(c, "D1-2-stage3-truth");
+  await closeDrawer(c);
+  await stage(c, 5);
+  await c.locator(".drawer button", { hasText: "조치확정" }).click();
+  await waitText(c, "확정했습니다");
+  await closeArchive(c);
+  await waitText(f, "처리가 끝났습니다", 60000);
+  await noLeak(f, "D1 확정 안내");
+  await shot(f, "D1-3-field-finished");
+  results.push({ id: "D1", ok: true, crops });
+}
+
+async function d3(c, f, forged) {
+  const id = forged ? "D3F" : "D3";
+  await inject(c, id);
+  placeScan(forged ? "D3F_redline.png" : "D3_redline.png");
+  await fieldReset(f);
+  await f.locator("button", { hasText: "도면/계기 스캔" }).click();
+  await f.waitForSelector(".form-grid", { timeout: 300000 });
+  const moc = await f.locator(".field-card", { hasText: "MOP 변경번호" }).locator("input").inputValue();
+  await shot(f, `${id}-1-field-redline`);
+  assert(moc === "MOP-2026-1104", `Red-line 변경번호를 ${moc} 로 읽었습니다`);
+  await f.locator("label.check", { hasText: "MOP/Hot-Work" }).locator("input").check();
+  await f.locator("button", { hasText: "NOC 관제실로 전송하기" }).click();
+  await waitText(f, "접수 번호");
+  await noLeak(f, `${id} 전송`);
+  await sleep(1500);
+  await c.locator(".queue-item", { hasText: "현장 보고" }).first().click();
+  await sleep(1500);
+  await stage(c, 3);
+  await shot(c, `${id}-2-stage3`);
+  await closeDrawer(c);
+  if (!forged) {
+    await stage(c, 5);
+    await c.locator(".drawer button", { hasText: "조치확정" }).click();
+    await waitText(c, "확정했습니다");
+    await closeArchive(c);
+    await waitText(f, "반영되었습니다", 60000);
+    await shot(f, `${id}-3-field-finished`);
+  }
+  results.push({ id, ok: true });
+}
+
+async function d4(c) {
+  await inject(c, "D4");
+  await openIncident(c, "D4");
+  await stage(c, 5);
+  const text = await c.locator(".drawer").innerText();
+  assert(text.includes("EPO"), "배터리 절차서의 고위험 조치(EPO)가 보이지 않습니다");
+  await c.locator(".drawer button", { hasText: "공동 결재 없이 확정 시도" }).click();
+  await waitText(c, "차단");
+  await c.locator(".drawer label.check", { hasText: "공동 결재" }).locator("input").check();
+  await c.locator(".drawer button", { hasText: "조치확정" }).click();
+  await waitText(c, "확정했습니다");
+  await waitText(c, "보관 문서", 30000);
+  await shot(c, "D4-1-approved");
+  await closeDrawer(c);
+  results.push({ id: "D4", ok: true });
+}
+
+// 데이터센터 물리엔진: CDU 밸브 고착 → GPU 정션 온도 상승 → 인과 사슬 → CDU 우회밸브 완화 → 셧다운(95 ℃) 전 회복
+async function dphys(c) {
+  await tidy(c);
+  await c.locator("button", { hasText: "물리엔진 · 자율 대응" }).click();
+  await c.locator(".drawer button", { hasText: "시뮬레이터 시작" }).click();
+  await sleep(4000);
+  await c.locator(".drawer button", { hasText: "18% 고착 주입" }).click();
+  await waitText(c, "인과 사슬 잠금", 90000);
+  await shot(c, "DPHYS-1-chain");
+  await waitText(c, "고장 코드 VALVE_STUCK_LOW", 30000);
+  await waitText(c, "Tier 1 자율 대응", 240000);
+  await shot(c, "DPHYS-2-mitigation");
+  const run = c.locator(".drawer button", { hasText: "완화 조치 실행" });
+  if (await run.count()) await run.click();
+  await waitText(c, "DC1GPU10CT01 완화 조치 → 회복 중", 180000);
+  await sleep(2000);
+  await shot(c, "DPHYS-3-recovering");
+  const text = await c.locator(".physics").innerText();
+  const peak = Number((text.match(/고점 ([0-9.]+)/) || [])[1]);
+  assert(peak > 0 && peak < 95, `GPU 정션 고점 ${peak} ℃ 가 셧다운(95) 아래여야 합니다`);
+  await c.locator(".drawer header button", { hasText: "닫기" }).click();
+  results.push({ id: "DPHYS", ok: true, peak });
+}
+
+async function plant(c, f) {
+  await switchDomain(c, "화력발전소", "1.2GW 발전소 관제 콘솔");
+  await waitText(f, "1.2GW 발전소 현장 순시", 30000);
+  results.push({ id: "PLANT", ok: true });
+}
+
 (async () => {
   const browser = await connect();
   const { consolePage: c, fieldPage: f } = await pages(browser);
@@ -389,6 +603,15 @@ async function phys(c) {
       if (id === "A0") await a0(c);
       if (id === "SEARCH") await searchFlow(c);
       if (id === "PHYS") await phys(c);
+      if (id === "CCTV") await cctv(c);
+      if (id === "AIDC") await aidc(c, f);
+      if (id === "D2") await d2(c);
+      if (id === "D1") await d1(c, f);
+      if (id === "D3") await d3(c, f, false);
+      if (id === "D3F") await d3(c, f, true);
+      if (id === "D4") await d4(c);
+      if (id === "DPHYS") await dphys(c);
+      if (id === "PLANT") await plant(c, f);
     } catch (e) {
       results.push({ id, ok: false, error: String(e) });
       await shot(c, `${id}-error-console`).catch(() => {});

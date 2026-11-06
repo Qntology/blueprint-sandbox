@@ -24,6 +24,7 @@ use super::staged::{self, Commit};
 use crate::audit::{Actor, AuditCategory, AuditEvent};
 use crate::case::{FieldReport, Incident};
 use crate::decision::{DecisionModel, Fact};
+use crate::domain::Terms;
 use crate::drafting::{AopDraft, TextWriter};
 use crate::interlock::{self, Evidence, InterlockError};
 use crate::mitigation::{self, Action, Mitigation};
@@ -110,6 +111,8 @@ pub struct RedraftJob {
 /// Tier 1 완화 조치의 계획 (모델에 물을 사실까지)
 pub struct MitigationJob {
     pub id: String,
+    /// 심사 제목 (도메인 용어)
+    pub title: String,
     pub facts: Vec<Fact>,
     pub model: Option<Arc<dyn DecisionModel>>,
     action: Action,
@@ -124,13 +127,24 @@ pub struct Engine {
     /// Zoro-1 글쓰기 (같은 백본 + 임베딩 표). 없으면 템플릿만 씁니다.
     pub writer: Option<Arc<dyn TextWriter>>,
     pub store: Store,
+    /// 결재 문서 · 현장 안내에 쓰는 도메인 용어 (관제실 이름 · 보관 번호 머리)
+    pub terms: Terms,
     salt: Vec<u8>,
     seq: u32,
 }
 
 impl Engine {
     pub fn new(salt: &[u8], policy: AutomationPolicy, model: Option<Box<dyn DecisionModel>>) -> Self {
-        Self { policy, model: model.map(Arc::from), writer: None, store: Store::default(), salt: salt.to_vec(), seq: 0 }
+        Self { policy, model: model.map(Arc::from), writer: None, store: Store::default(), terms: Terms::default(), salt: salt.to_vec(), seq: 0 }
+    }
+
+    /// 도메인을 바꿀 때 (추가 개선안 4.1절 5번): 진행 · 보관 사건 · 감사 기록 · 자동화 모드를 비우고 용어를 바꿉니다.
+    /// 모델(판단 · 글쓰기)은 두 도메인이 같아서 그대로 둡니다. 사건 번호는 이어 셉니다: 되돌리면 같은 날 앞 도메인의
+    /// 사건과 번호가 겹쳐, 번호로 기억해 둔 화면 상태(확정 뒤 보관 문서를 한 번만 여는 것 등)가 다른 사건에 걸립니다.
+    pub fn reset_for(&mut self, terms: Terms) {
+        self.store = Store::default();
+        self.policy = AutomationPolicy::default();
+        self.terms = terms;
     }
 
     pub fn with_writer(mut self, writer: Box<dyn TextWriter>) -> Self {
@@ -339,7 +353,7 @@ impl Engine {
     pub fn mitigation_job(&self, db: &Lattice, incident_id: &str) -> Result<Option<MitigationJob>> {
         let Some(s) = self.store.active(incident_id) else { bail!("진행 중인 사건이 아닙니다: {incident_id}") };
         let Some((action, gates, facts)) = mitigation::plan(db, &s.analysis) else { return Ok(None) };
-        Ok(Some(MitigationJob { id: incident_id.to_string(), facts, model: self.model.clone(), action, gates, rev: s.rev }))
+        Ok(Some(MitigationJob { id: incident_id.to_string(), title: mitigation::review_title(db), facts, model: self.model.clone(), action, gates, rev: s.rev }))
     }
 
     /// 네 기준 판단을 받아 정책을 적용하고 기록합니다 (반영 걸음). 그사이 세션이 바뀌었으면 `Stale` 입니다.
@@ -517,7 +531,7 @@ impl Engine {
             let Some(s) = self.store.active(incident_id) else { bail!("진행 중인 사건이 아닙니다: {incident_id}") };
             let a = &s.analysis;
             let has_field = !s.incident.reports.is_empty();
-            let notice = if has_field { field_notice(incident_id, &final_code) } else { String::new() };
+            let notice = if has_field { field_notice(incident_id, &final_code, &self.terms) } else { String::new() };
             // 현장 안내에는 다른 근무자 이름이 들어가면 안 됩니다.
             let others: Vec<String> = Vec::new();
             if let Err((verdict, n)) = check_field_text(&notice, &others) {
@@ -525,7 +539,8 @@ impl Engine {
             }
             let confidence = s.judgement.as_ref().and_then(|j| j.confidence).map(|c| format!("{:.1}%", c * 100.0)).unwrap_or_else(|| "없음 (규칙 · 교대감독 판단)".into());
             let mut doc = format!(
-                "주제어실 결재 · 사건 {incident_id} · 판정 {final_code} · Zoro-1 확신도 {confidence} · 처리 {actor:?}\n위치: {} · {}\n사유: {}",
+                "{} 결재 · 사건 {incident_id} · 판정 {final_code} · Zoro-1 확신도 {confidence} · 처리 {actor:?}\n위치: {} · {}\n사유: {}",
+                self.terms.control_room,
                 a.route.address.breadcrumb().join(" ▸ "),
                 a.route.address.name,
                 if s.reason.is_empty() { a.reason.as_str() } else { s.reason.as_str() }
@@ -537,7 +552,7 @@ impl Engine {
                 }
             }
             if let Some(who) = &supervisor {
-                doc.push_str(&format!("\n결재: 교대감독 {who}"));
+                doc.push_str(&format!("\n결재: {} {who}", self.terms.supervisor));
             }
             for r in &s.incident.reports {
                 if let Some(name) = &r.worker_name {
@@ -553,7 +568,7 @@ impl Engine {
             } else {
                 None
             };
-            let archive_id = format!("MCR-{}-{:04}호", crate::plant::local(now).format("%Y"), self.store.archive().len() + 1);
+            let archive_id = format!("{}-{}-{:04}호", self.terms.archive_prefix, crate::plant::local(now).format("%Y"), self.store.archive().len() + 1);
             let row = ArchiveRow {
                 archive_id,
                 incident_id: incident_id.to_string(),
