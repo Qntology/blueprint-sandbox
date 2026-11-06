@@ -326,7 +326,15 @@ impl DocumentReader {
             .iter()
             .map(|cs| cs.iter().zip(it.by_ref()).map(|(c, v)| SymbolHit { bbox: c.bbox, matched: dict.classify(v.get(dict.feature)) }).collect())
             .collect();
-        trace::record("siglip2", "심볼 그림 사전", t.elapsed().as_secs_f64() * 1e3, json!({ "pages": pages.len(), "candidates": crops.len(), "accepted": hits.iter().flatten().filter(|h| h.matched.class.is_some()).count() }));
+        if trace::enabled() {
+            // 받아들인 심볼만 좌표 · 종류 · 유사도 · 마진을 남깁니다 (시연 영상의 그림 사전 장면)
+            let accepted: Vec<_> = hits
+                .iter()
+                .enumerate()
+                .flat_map(|(i, hs)| hs.iter().filter(|h| h.matched.class.is_some()).map(move |h| json!({ "page": i, "bbox": h.bbox, "class": h.matched.class, "sim": h.matched.sim, "margin": h.matched.margin })))
+                .collect();
+            trace::record("siglip2", "심볼 그림 사전", t.elapsed().as_secs_f64() * 1e3, json!({ "pages": pages.len(), "candidates": crops.len(), "accepted": accepted.len(), "hits": accepted }));
+        }
         Ok(hits)
     }
 
@@ -392,7 +400,15 @@ impl DocumentReader {
                     json!({
                         "skew": p.skew,
                         "crops": p.plan.crops.iter().map(|c| json!({ "kind": c.kind.name(), "bbox": [c.bbox.0, c.bbox.1, c.bbox.2, c.bbox.3] })).collect::<Vec<_>>(),
-                        "delta": p.delta.as_ref().map(|d| json!({ "master": d.master, "similarity": d.similarity, "margin": d.margin, "changed": d.changed, "blocks": d.blocks, "skipped": d.skipped.len(), "clipped": d.clipped, "fallback": d.fallback })),
+                        // 버린 조각: 안내문(dropped) · 글자 없는 띠(blank). 시연 영상이 계획의 버림 규칙을 그립니다.
+                        "dropped": p.plan.dropped.iter().map(|b| [b.0, b.1, b.2, b.3]).collect::<Vec<_>>(),
+                        "blank": p.plan.blank.iter().map(|b| [b.0, b.1, b.2, b.3]).collect::<Vec<_>>(),
+                        "delta": p.delta.as_ref().map(|d| json!({
+                            "master": d.master, "similarity": d.similarity, "margin": d.margin, "changed": d.changed, "blocks": d.blocks,
+                            "skipped": d.skipped.len(), "clipped": d.clipped, "fallback": d.fallback, "trimmed": d.trimmed,
+                            "skipped_boxes": d.skipped.iter().map(|b| [b.0, b.1, b.2, b.3]).collect::<Vec<_>>(),
+                            "changed_boxes": d.changed_boxes.iter().map(|b| [b.0, b.1, b.2, b.3]).collect::<Vec<_>>(),
+                        })),
                     })
                 })
                 .collect();

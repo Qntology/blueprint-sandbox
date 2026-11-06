@@ -93,7 +93,13 @@ fn problems_of(text: &str, source: &str) -> Vec<String> {
 
 /// AOP 초안을 씁니다. 모델이 없거나 두 번 다 대조에 걸리면 `template` 요약을 씁니다.
 /// `system` 은 도메인 용어로 만든 지시문입니다 ([`crate::domain::Terms::drafting_system`]: 발전소 주제어실 · 데이터센터 NOC 관제실).
+/// 요약의 언어는 지금 화면 언어([`crate::i18n::current`])를 따릅니다.
 pub fn draft_aop(writer: Option<&dyn TextWriter>, system: &str, aop: &AopRow, facts: &[String], template: &str) -> AopDraft {
+    draft_aop_in(crate::i18n::current(), writer, system, aop, facts, template)
+}
+
+/// [`draft_aop`] 의 언어를 정해 부르는 쪽. 영어면 모델에게 영어로 쓰게 하고(사실 줄은 한국어 그대로), 숫자 · 설비 코드 대조는 같습니다.
+pub fn draft_aop_in(lang: crate::i18n::Lang, writer: Option<&dyn TextWriter>, system: &str, aop: &AopRow, facts: &[String], template: &str) -> AopDraft {
     // 표준 절차서 문장의 숫자(EL.+9.0m 등)도 원문으로 봅니다.
     let source = format!("{}\n{}\n{}", facts.join("\n"), aop.steps.join("\n"), aop.id);
     let base = AopDraft {
@@ -113,17 +119,26 @@ pub fn draft_aop(writer: Option<&dyn TextWriter>, system: &str, aop: &AopRow, fa
     };
     let Some(writer) = writer else { return base };
     let t = Instant::now();
-    let ask = format!(
-        "다음 사실로 원인 진단 요약을 두 문장 이내로 쓰세요. 숫자와 설비 코드는 사실에 적힌 그대로 옮기세요.\n\n사실:\n{}\n\n표준 절차서: {} {}",
-        facts.join("\n"),
-        aop.id,
-        aop.title
-    );
+    let english = lang == crate::i18n::Lang::En;
+    let ask = if english {
+        crate::i18n::draft_ask_en(&facts.join("\n"), &aop.id, &aop.title)
+    } else {
+        format!(
+            "다음 사실로 원인 진단 요약을 두 문장 이내로 쓰세요. 숫자와 설비 코드는 사실에 적힌 그대로 옮기세요.\n\n사실:\n{}\n\n표준 절차서: {} {}",
+            facts.join("\n"),
+            aop.id,
+            aop.title
+        )
+    };
     let mut problems = Vec::new();
     let mut attempts = 0;
     let mut tries = vec![ask.clone()];
     let known: Vec<String> = mentions(&facts.join("\n")).into_iter().map(|m| m.text).chain(codes(&facts.join("\n"))).collect();
-    tries.push(format!("{ask}\n\n주의: 숫자와 설비 코드는 사실에 있는 것만 그대로 쓰세요. 쓸 수 있는 값: {}", known.join(", ")));
+    tries.push(if english {
+        crate::i18n::draft_retry_en(&ask, &known.join(", "))
+    } else {
+        format!("{ask}\n\n주의: 숫자와 설비 코드는 사실에 있는 것만 그대로 쓰세요. 쓸 수 있는 값: {}", known.join(", "))
+    });
     for prompt in tries {
         attempts += 1;
         let text = match writer.complete(system, &prompt, AOP_TOKENS) {
@@ -238,6 +253,25 @@ mod tests {
         assert!(!d.by_model);
         assert!(d.problems.iter().any(|p| p.contains("10LAB20AA103")));
         assert!(d.problems.iter().any(|p| p.contains("내부 판정 코드")));
+    }
+
+    #[test]
+    fn an_english_screen_asks_for_an_english_summary_and_checks_the_same_numbers() {
+        // 사실 줄은 한국어 그대로 주고 영어로 쓰게 합니다. 숫자 · 설비 코드 대조는 언어와 상관없이 같습니다.
+        let good = "The superheater outlet temperature rose to 638.0 °C because the main feedwater flow control valve (10LAB20AA102) stuck at 18.0 %, cutting feedwater flow to 1,120 t/h.";
+        let w = script(&[good]);
+        let d = draft_aop_in(crate::i18n::Lang::En, Some(&w), SYS, &aop(), &facts(), TEMPLATE);
+        assert!(d.by_model && d.verified, "{:?}", d.problems);
+        let asked = w.asked.lock().unwrap();
+        assert!(asked[0].starts_with("Write a root-cause diagnosis summary in English"), "{}", asked[0]);
+        assert!(asked[0].contains("10LAB20AA102"), "사실 줄은 그대로 갑니다");
+        drop(asked);
+        // 지어낸 숫자는 영어 글이어도 걸리고, 다시 물을 때 쓸 수 있는 값을 영어로 알려 줍니다
+        let bad = "The valve stuck at 15.0 %.";
+        let w = script(&[bad, bad]);
+        let d = draft_aop_in(crate::i18n::Lang::En, Some(&w), SYS, &aop(), &facts(), TEMPLATE);
+        assert!(!d.by_model && d.problems.iter().any(|p| p.contains("15.0")), "{:?}", d.problems);
+        assert!(w.asked.lock().unwrap()[1].contains("Values you may use: "));
     }
 
     #[test]

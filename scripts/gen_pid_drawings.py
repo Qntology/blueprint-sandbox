@@ -6,6 +6,8 @@
     python scripts/gen_pid_drawings.py --symbols     심볼 표본(학습 · 시험)과 명판 훼손 도면만 out/symbols 에
     python scripts/gen_pid_drawings.py --a0-dpi 300  같은 A0 종합도를 2 배 해상도로 다시 그려 out/a0/PID-100-ALL-A0@300dpi.png 에
     python scripts/gen_pid_drawings.py --a0-delta    A0 델타 실측용: 다시 스캔한 A0(바뀐 곳 없음)와 PID-103-LAB 칸에 Red-line 을 그린 A0 (out/a0)
+    python scripts/gen_pid_drawings.py --lang en [--domain aidc]
+                                                 영어 화면용 마스터 도면만 core/fixtures/drawings/en 에 (같은 배치 · 같은 좌표, 글만 영어)
 
 기본값은 core/fixtures/drawings (마스터 도면, 저장소에 들어갑니다) 와 out/field (현장 스캔, 저장소 밖) 입니다.
 설비 상자의 위치는 시드 대장(core/fixtures/synthetic_db.json)의 `bbox`(정규화 좌표)를 그대로 씁니다. 그래서 대장이 곧 정답 좌표입니다.
@@ -27,6 +29,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 
 import numpy as np
@@ -103,6 +106,15 @@ DOMAINS = {
         ],
         "card_memo": ["아날로그 게이지 정상", "전송기 표시와 다름"],
         "a0_note": "마스터 계통도 5장을 한 장에 모은 종합도입니다. 각 칸의 표제란은 원 도면의 것입니다.",
+        "en": {
+            "guide": [
+                "1. All equipment codes follow the KKS standard. The letter after C in a sensor tag is the measured quantity.",
+                "2. Solid: feedwater · steam, dashed: power, dash-dot: flue gas · draft, short dots: lube oil.",
+                "3. Synthetic test drawing, unrelated to any real power plant equipment. Do not copy.",
+            ],
+            "code_head": "KKS",
+            "trip_head": "Trip limit",
+        },
     },
     "aidc": {
         "seed": AIDC_SEED,
@@ -123,9 +135,67 @@ DOMAINS = {
         ],
         "card_memo": ["아날로그 압력계 정상", "BMC 표시와 다름"],
         "a0_note": "MEP · SLD 계통도 5장을 한 장에 모은 종합도입니다. 각 칸의 표제란은 원 도면의 것입니다.",
+        "en": {
+            "guide": [
+                "1. All asset codes follow the 12-character DCIM format. The letter after C in a sensor tag is the measured quantity.",
+                "2. Solid: condenser · chilled water, dashed: power, dash-dot: cooling air, short dots: optical network.",
+                "3. Synthetic test drawing, unrelated to any real data center equipment. Do not copy.",
+            ],
+            "code_head": "Asset",
+            "trip_head": "Shutdown limit",
+        },
     },
 }
 CFG = DOMAINS["plant"]
+
+# 화면 언어. "en" 이면 마스터 도면의 글을 영어로 씁니다 (앱 영어 화면의 번역 표 app/src/i18n/en.json 을 그대로 씀).
+# 한국어 도면은 이 값이 "ko" 일 때의 그림 그대로입니다 (글을 바꾸는 곳은 Canvas 의 글 쓰기 함수 넷뿐).
+LANG = "ko"
+EN_TABLE = os.path.join(ROOT, "app", "src", "i18n", "en.json")
+_HANGUL = re.compile("[가-힣]")
+_tr_cache = {}
+
+
+def L(ko, en):
+    """생성기 자체 글 (표제란 머리 · 일람표 머리 · 서명란)"""
+    return en if LANG == "en" else ko
+
+
+def cfg(key):
+    return CFG["en"][key] if LANG == "en" and key in CFG.get("en", {}) else CFG[key]
+
+
+def _load_table():
+    t = json.load(open(EN_TABLE, encoding="utf-8"))
+    phrases = {**t.get("names", {}), **t.get("phrases", {})}
+    keys = sorted(phrases, key=len, reverse=True)
+    # 자바스크립트 바꾸기 글($1 · $& · $$)을 파이썬 글(\g<1> · \g<0> · $)로
+    js = lambda r: re.sub(r"\$(\$|&|\d+)", lambda m: "$" if m.group(1) == "$" else "\\g<0>" if m.group(1) == "&" else f"\\g<{m.group(1)}>", r.replace("\\", "\\\\"))
+    pats = [(re.compile(p), js(r)) for p, r in t["patterns"]]
+    spans = t.get("spans", {})
+    span_re = re.compile("|".join(re.escape(k) for k in sorted(spans, key=len, reverse=True))) if spans else None
+    return t["exact"], pats, phrases, re.compile("|".join(re.escape(k) for k in keys)), spans, span_re
+
+
+def tr(s):
+    """원장 글(설비 · 센서 · 배관 이름, 동 · 층)을 영어로. translate.ts 와 같은 순서: 통째 → 이름 · 긴 글 → 틀 → 낱말."""
+    if LANG != "en" or not _HANGUL.search(s):
+        return s
+    if s in _tr_cache:
+        return _tr_cache[s]
+    if "table" not in _tr_cache:
+        _tr_cache["table"] = _load_table()
+    exact, pats, phrases, phrase_re, spans, span_re = _tr_cache["table"]
+    out = exact.get(s.strip())
+    if out is None:
+        out = span_re.sub(lambda m: spans[m.group(0)], s) if span_re else s
+        for p, rep in pats:
+            out = p.sub(rep, out)
+        out = exact.get(out.strip()) or re.sub(" {2,}", " ", phrase_re.sub(lambda m: phrases[m.group(0)], out))
+    if _HANGUL.search(out):
+        print(f"  번역 없음: {s} → {out}")
+    _tr_cache[s] = out
+    return out
 
 
 def font(path, size, index=0):
@@ -207,6 +277,7 @@ class Canvas:
         self.gt.append({"kind": kind, "box": [int(round(v)) for v in box], "text": text})
 
     def text(self, x, y, s, size=20, path=GOTHIC, fill=INK, kind=None):
+        s = tr(s)
         f = font(path, size)
         self.d.text((x, y), s, font=f, fill=fill)
         l, t, r, b = self.d.textbbox((x, y), s, font=f)
@@ -215,7 +286,7 @@ class Canvas:
         return r, b
 
     def width(self, s, size, path=GOTHIC):
-        return self.d.textlength(s, font=font(path, size))
+        return self.d.textlength(tr(s), font=font(path, size))
 
     def hand(self, x, y, s, size=30, color=BLUE, kind="value"):
         """글자마다 크기 · 기울기 · 위치를 흔들어 찍는 손글씨"""
@@ -302,6 +373,7 @@ class Canvas:
 
     def tag(self, cx, cy, s, size=15, path=GOTHIC, fill=GRAY, kind=None):
         """배관 이름. 흰 바탕을 깔아 그 자리의 선을 끊고 씁니다 (P&ID 의 선 위 이름표). (cx, cy) 가 글 가운데입니다."""
+        s = tr(s)
         f = font(path, size)
         l, t, r, b = self.d.textbbox((0, 0), s, font=f)
         x, y = cx - (r - l) / 2 - l, cy - (b - t) / 2 - t
@@ -312,6 +384,7 @@ class Canvas:
 
     def vtext(self, cx, cy, s, size=13, path=GOTHIC, fill=GRAY, kind=None):
         """세로 통로에 90도 돌려 쓰는 이름표 (아래에서 위로 읽음, 흰 바탕). (cx, cy) 가 글 가운데입니다."""
+        s = tr(s)
         f = font(path, size)
         l, t, r, b = self.d.textbbox((0, 0), s, font=f)
         tile = Image.new("RGBA", (r - l + 4, b - t + 4), (255, 255, 255, 255))
@@ -536,7 +609,7 @@ def draw_master(plant, drawing_id, rng, value_overrides=None, damage=0, scale=1)
     # 표제란
     x0, y0, x1, y1 = c.px(TITLE_BOX)
     c.d.rectangle((x0, y0, x1, y1), outline=INK, width=3)
-    cells = [f"도면번호: {d['id']} ({d['rev']})", d["title"], f"{sector['building']} {sector['label']} ({sector['kks']})"]
+    cells = [f"{L('도면번호', 'Drawing No.')}: {d['id']} ({d['rev']})", d["title"], f"{sector['building']} {sector['label']} ({sector['kks']})"]
     widths = [0.30, 0.42, 0.28]
     cx = x0
     for text, share in zip(cells, widths):
@@ -554,7 +627,7 @@ def draw_master(plant, drawing_id, rng, value_overrides=None, damage=0, scale=1)
     for e in on_sheet:
         bx0, by0, bx1, by1 = c.px(e["bbox"])
         c.d.rectangle((bx0, by0, bx1, by1), fill=(255, 255, 255), outline=INK, width=3)
-        lines = [(f"{CFG['code_head']}: {e['kks']}", 21, BOLD), (e["name"], 21, GOTHIC), (f"위치: {plant.location(e)}", 16, GOTHIC)]
+        lines = [(f"{cfg('code_head')}: {e['kks']}", 21, BOLD), (e["name"], 21, GOTHIC), (f"{L('위치', 'Location')}: {plant.location(e)}", 16, GOTHIC)]
         for s in plant.sensors_of(e["kks"])[:2]:
             v = values.get(s["tag"], s["normal"])
             lines.append((f"{short_tag(s['tag'])} {s['label']} {fmt(v)} {s['unit']}", 16, GOTHIC))
@@ -648,10 +721,10 @@ def draw_master(plant, drawing_id, rng, value_overrides=None, damage=0, scale=1)
         notch = 22
         if kind == "out":
             shape = [(ox0, oy0), (ox1 - notch, oy0), (ox1, (oy0 + oy1) / 2), (ox1 - notch, oy1), (ox0, oy1)]
-            head = f"점프 → {other['drawing']}"
+            head = f"{L('점프', 'Jump')} → {other['drawing']}"
         else:
             shape = [(ox0 + notch, oy0), (ox1, oy0), (ox1, oy1), (ox0 + notch, oy1), (ox0, (oy0 + oy1) / 2)]
-            head = f"{other['drawing']} → 인입"
+            head = f"{other['drawing']} → {L('인입', 'In')}"
         c.d.polygon(shape, fill=SHADE, outline=INK)
         lines = [(head, 15, BOLD), (plant.sectors[other["sector"]]["building"] + " " + other["name"], 14, GOTHIC), (f"({edge['label']})", 13, GOTHIC)]
         ty = oy0 + 8
@@ -670,9 +743,9 @@ def draw_master(plant, drawing_id, rng, value_overrides=None, damage=0, scale=1)
     # 운전 기준치 일람표
     sensors = [s for s in plant.db["sensors"] if plant.eq[s["kks"]]["drawing"] == drawing_id]
     tx0, ty0, tx1, ty1 = c.px(TABLE_BOX)
-    c.text(tx0, ty0 - 2, "운전 기준치 일람표", 20, BOLD)
+    c.text(tx0, ty0 - 2, L("운전 기준치 일람표", "Operating Reference Values"), 20, BOLD)
     head_y = ty0 + 32
-    header = ["설비코드", "센서태그", "항목", "정상치", "경보한계", CFG["trip_head"]]
+    header = [L("설비코드", "Code"), L("센서태그", "Sensor tag"), L("항목", "Item"), L("정상치", "Normal"), L("경보한계", "Alarm limit"), cfg("trip_head")]
     shares = [0.18, 0.18, 0.22, 0.13, 0.15, 0.14]
     rows = len(sensors) + 1
     row_h = min(34, (ty1 - head_y) / max(rows, 1))
@@ -707,17 +780,17 @@ def draw_master(plant, drawing_id, rng, value_overrides=None, damage=0, scale=1)
     gx0, gy0, gx1, gy1 = c.px(GUIDE_BOX)
     c.line([(gx0, gy0), (gx1, gy0), (gx1, gy1), (gx0, gy1), (gx0, gy0)], "dash", 1, fill=GRAY)
     gy = gy0 + 8
-    for line_text in CFG["guide"]:
+    for line_text in cfg("guide"):
         c.text(gx0 + 10, gy, line_text, 14, GOTHIC, fill=GRAY)
         gy += 20
-    c.add("guide", (gx0, gy0, gx1, gy1), "\n".join(CFG["guide"]))
+    c.add("guide", (gx0, gy0, gx1, gy1), "\n".join(cfg("guide")))
 
     # 서명란
     sx0, sy0, sx1, sy1 = c.px(SIGN_BOX)
     signer = plant.people[d["signer"]]
     c.d.rectangle((sx0, sy0, sx1, sy1), outline=INK, width=2)
-    c.text(sx0 + 12, sy0 + 10, f"기술책임자: {signer['name']} ({signer['id']})", 18, BOLD, kind="label")
-    c.text(sx0 + 12, sy1 - 34, f"검토일 {d['issued']}", 16, GOTHIC, kind="label")
+    c.text(sx0 + 12, sy0 + 10, f"{L('기술책임자', 'Technical lead')}: {signer['name']} ({signer['id']})", 18, BOLD, kind="label")
+    c.text(sx0 + 12, sy1 - 34, f"{L('검토일', 'Reviewed')} {d['issued']}", 16, GOTHIC, kind="label")
     c.scribble(sx0 + 250, sy0 + 40, 170, 60, text=signer["name"])
     return c
 
@@ -1087,11 +1160,26 @@ def main():
         damaged_sheets(Plant(db), out, 20261104)
         print(f"심볼 표본: 학습 {n_train} · 시험 {n_test} · 훼손 도면 3단계 × {len(db['drawings'])}장 → {out}")
         return
-    global CFG
+    global CFG, LANG
     args = sys.argv[1:]
+    if len(args) >= 2 and args[0] == "--lang":
+        LANG = args[1]
+        args = args[2:]
     if len(args) >= 2 and args[0] == "--domain":
         CFG = DOMAINS[args[1]]
         args = args[2:]
+    if LANG == "en":
+        # 영어 화면용 마스터만 (그림만: 배관 · 심볼 좌표와 판독 정답은 한국어 마스터의 JSON 이 그대로 맞습니다)
+        masters = args[0] if len(args) > 0 else os.path.join(ROOT, "core", "fixtures", "drawings", "en")
+        seed = int(args[1]) if len(args) > 1 else 20261104
+        os.makedirs(masters, exist_ok=True)
+        db = json.load(open(CFG["seed"], encoding="utf-8"))
+        plant = Plant(db)
+        for d in db["drawings"]:
+            c = draw_master(plant, d["id"], random.Random(f"{seed}/{d['id']}"))
+            c.img.convert("P", palette=Image.ADAPTIVE, colors=64).save(os.path.join(masters, f"{d['id']}.png"))
+        print(f"영어 마스터 도면 {len(db['drawings'])}장: {masters}")
+        return
     masters = args[0] if len(args) > 0 else os.path.join(ROOT, "core", "fixtures", "drawings")
     field = args[1] if len(args) > 1 else os.path.join(ROOT, "out", "field")
     seed = int(args[2]) if len(args) > 2 else 20261104

@@ -42,6 +42,26 @@ export const PLANT_TERMS: Terms = {
   kiosk_title: "1.2GW 발전소 현장 순시 · 정비 단말",
 };
 
+/** 영어 화면의 기본 용어 (원장을 받기 전 첫 화면). 원장을 받으면 번역 표가 바꾼 원장 용어를 씁니다. */
+export const PLANT_TERMS_EN: Terms = {
+  code: "KKS",
+  procedure: "AOP",
+  procedure_long: "Abnormal Operating Procedure (AOP)",
+  change: "MOC",
+  telemetry: "DCS",
+  control_room: "Main Control Room",
+  drawing: "P&ID",
+  site: "power plant",
+  field_worker: "field operator",
+  trip: "trip",
+  supervisor: "shift supervisor",
+  archive_prefix: "MCR",
+  permit: "PTW · LOTO",
+  bypass: "feedwater bypass",
+  console_title: "1.2GW Power Plant Control Console",
+  kiosk_title: "1.2GW Power Plant Field Patrol & Maintenance Terminal",
+};
+
 export interface DomainInfo {
   mode: DomainMode;
   label: string;

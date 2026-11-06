@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { shortTag } from "../domain";
+import { useT } from "../i18n";
 import type { Context } from "../PlantTopologyView";
 import { equipmentLevel, fmt, hopDepths, MEDIUM_COLOR, sdsStateAt, sensorsOf, signedSecs, valueAt, type Level } from "../plant";
 
@@ -74,6 +75,7 @@ function drawLabels(g: CanvasRenderingContext2D, labels: Label[], obstacles: Rec
  *  변곡을 지난 노드 옆에는 유리 핀(`t=0 발원` · `Δt +4.3s` · 지금 값)이 붙고, CCTV 말풍선은 노드 좌표에서 지시선을 긋습니다. */
 export function MindMapView({ ctx }: { ctx: Context }) {
   const canvas = useRef<HTMLCanvasElement>(null);
+  const say = useT();
   const nodes = useRef<Node[]>([]);
   const live = useRef(ctx);
   live.current = ctx;
@@ -330,7 +332,7 @@ export function MindMapView({ ctx }: { ctx: Context }) {
     const s = ctx.tracks.get(kks)?.[0] ? ctx.plant.sensors.find((x) => x.tag === ctx.tracks.get(kks)![0].tag) : sensorsOf(ctx.plant, kks)[0];
     const v = s && ctx.detail ? valueAt(ctx.detail.timeline, s.tag, ctx.t) : null;
     const value = s ? ` · ${shortTag(s.tag)} ${fmt(v)} ${s.unit}` : "";
-    return kks === ctx.rootKks ? `🔴 t=0 발원${value}` : `🟡 Δt ${signedSecs(at, ctx.origin)}${value}`;
+    return kks === ctx.rootKks ? say(`🔴 t=0 발원${value}`, `🔴 t=0 origin${value}`) : `🟡 Δt ${signedSecs(at, ctx.origin)}${value}`;
   };
 
   return (
@@ -379,8 +381,8 @@ export function MindMapView({ ctx }: { ctx: Context }) {
       {ctx.bar &&
         createPortal(
           <div className="view-bar ov-bar mm-legend">
-            <span className="bar-label">🕸️ 마인드맵</span>
-            <span>(◎) 선택 중심 Depth 0 · (○) 1홉 ±1 · (.) 2홉 이상 흐림 · 🔴 이중 링 최초 변곡 발원지(t=0) · 🟡 링 시차 매칭 파급 · 🔥 근본원인 · ⚠️ 경보 · 드래그로 이동</span>
+            <span className="bar-label">{say("🕸️ 마인드맵", "🕸️ Mind map")}</span>
+            <span>{say("(◎) 선택 중심 Depth 0 · (○) 1홉 ±1 · (.) 2홉 이상 흐림 · 🔴 이중 링 최초 변곡 발원지(t=0) · 🟡 링 시차 매칭 파급 · 🔥 근본원인 · ⚠️ 경보 · 드래그로 이동", "(◎) selected center Depth 0 · (○) 1 hop ±1 · (.) 2+ hops dimmed · 🔴 double ring = first inflection origin (t=0) · 🟡 ring = lag-matched propagation · 🔥 root cause · ⚠️ alarm · drag to move")}</span>
           </div>,
           ctx.bar,
         )}

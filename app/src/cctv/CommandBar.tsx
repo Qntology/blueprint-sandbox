@@ -1,6 +1,8 @@
 // 자연어 질의 커맨드 바 (2차 개선안 2: logis-center 방식 검색을 noto-sandbox 하단 허브의 `.command-bar` · `.dropup` · `.cmd-toast` 로).
 // 백엔드 `search` 명령은 그대로 쓰고(Rust 변경 없음), 화면만 하단 허브로 옮겼습니다.
 import { useRef, useState, type KeyboardEvent, type RefObject } from "react";
+import { useT, type T } from "../i18n";
+import { tr } from "../i18n/lang";
 import type { Plant } from "../types";
 import type { SearchMark } from "./CctvOverlay";
 
@@ -28,18 +30,22 @@ export interface SearchResult {
   hits: SearchHit[];
 }
 
-/** 한 번의 질의: 입력한 글 · 실제로 보낸 글(선택 설비 문맥을 붙였으면 다름) · 결과 */
+/** 한 번의 질의: 입력한 글 · 문맥을 붙인 글 · 엔진에 보낸 글(영어 화면이면 한국어 낱말로 옮긴 것) · 결과 */
 export interface SearchRun {
   typed: string;
   sent: string;
+  engine: string;
   context: string | null;
   result: SearchResult;
 }
 
-export const KIND_LABEL: Record<SearchDoc["kind"], string> = { equipment: "설비", sensor: "계측", incident: "사건", archive: "보관", aop: "절차서", moc: "MOC", drawing: "도면" };
+const KIND_KO: Record<SearchDoc["kind"], string> = { equipment: "설비", sensor: "계측", incident: "사건", archive: "보관", aop: "절차서", moc: "MOC", drawing: "도면" };
+const KIND_EN: Record<SearchDoc["kind"], string> = { equipment: "Equipment", sensor: "Sensor", incident: "Incident", archive: "Archive", aop: "Procedure", moc: "MOC", drawing: "Drawing" };
+/** 결과 종류 이름 (화면 언어) */
+export const kindLabel = (k: SearchDoc["kind"]) => tr(KIND_KO[k], KIND_EN[k]);
 
 const HISTORY_KEY = "blueprint.search-history";
-const RELATIVE = ["상류", "하류", "주변", "연결", "관련", "이 설비", "여기"];
+const RELATIVE = ["상류", "하류", "주변", "연결", "관련", "이 설비", "여기", "upstream", "downstream", "around", "near", "connected", "related", "this"];
 
 const bigrams = (text: string) => {
   const chars = [...text.toLowerCase()].filter((c) => !/\s/.test(c) && !"·()[],.".includes(c));
@@ -55,12 +61,23 @@ export function contextual(query: string, kks: string, plant: Plant): string {
   const q = query.trim();
   const words = q.split(/\s+/).filter(Boolean);
   const ownId = words.some((w) => /^[0-9A-Z][0-9A-Z-]{7,}$/i.test(w.replace(/[^0-9A-Za-z-]/g, "")) && /[0-9]/.test(w));
-  const building = plant.sectors.some((s) => q.includes(s.building)) || /\d+동/.test(q);
+  const building = plant.sectors.some((s) => q.includes(s.building)) || /\d+동/.test(q) || /\b(?:bldg\.?|building)\s*\d+/i.test(q);
   const qg = bigrams(q);
-  const named = plant.equipment.some((e) => [...bigrams(e.name)].filter((g) => qg.has(g)).length >= 2);
+  // 한글 이름은 두 글자 조각 둘 이상이 겹치면 이름을 부른 것으로 봅니다. 영어는 글자 조각이 너무 흔해("upstream" ↔ "Main Steam")
+  // 이름 전체가 들어 있거나 이름의 세 글자 이상 낱말이 둘 이상 들어 있을 때만 봅니다.
+  const latin = !/[가-힣]/.test(q);
+  const lower = q.toLowerCase();
+  const named = plant.equipment.some((e) => {
+    if (!latin) return [...bigrams(e.name)].filter((g) => qg.has(g)).length >= 2;
+    const name = e.name.toLowerCase();
+    const words = name.split(/[^a-z0-9]+/).filter((w) => w.length >= 3);
+    return lower.includes(name) || words.filter((w) => new RegExp(`\\b${w}\\b`).test(lower)).length >= 2;
+  });
   if (ownId || building || named) return q;
-  const relative = RELATIVE.some((w) => q.includes(w));
-  return relative || words.length <= 2 ? `${kks} ${q}` : q;
+  const relative = RELATIVE.some((w) => q.toLowerCase().includes(w));
+  // 짧은 질의: 한국어 "관련 MOC" · "절차서" 처럼 두 낱말까지. 영어는 관계 낱말(related · upstream …)을 따로 쓰므로 한 낱말만
+  // ("pending MOC" 는 상태로 거른 유형 질의라 선택 설비 문맥을 붙이지 않습니다)
+  return relative || words.length <= (latin ? 1 : 2) ? `${kks} ${q}` : q;
 }
 
 /** 결과에서 도면 위 Top-3 표시 (설비 코드가 있는 조건 통과 항목, 같은 설비는 한 번) */
@@ -69,22 +86,22 @@ export function searchMarks(run: SearchRun | null): Map<string, SearchMark> {
   for (const h of run?.result.hits ?? []) {
     if (m.size >= 3) break;
     if (!h.passed || !h.doc.kks || m.has(h.doc.kks)) continue;
-    m.set(h.doc.kks, { rank: m.size + 1, why: h.why, kind: KIND_LABEL[h.doc.kind], id: h.doc.id });
+    m.set(h.doc.kks, { rank: m.size + 1, why: h.why, kind: kindLabel(h.doc.kind), id: h.doc.id });
   }
   return m;
 }
 
 /** 입력줄 위 한 줄 요약 (noto-sandbox `.cmd-toast`): 유형 · 적중 수 · 1위 · 힌트로 내린 조건 · 문맥 */
-export function searchSummary(run: SearchRun): { kind: "ok" | "info" | "err"; text: string } {
+export function searchSummary(run: SearchRun, t: T): { kind: "ok" | "info" | "err"; text: string } {
   const r = run.result;
   const passed = r.hits.filter((h) => h.passed);
   const top = r.hits[0];
   const demoted = r.conditions.filter((c) => !c.applied).map((c) => `'${c.text}'`);
-  const parts = [`[${r.types.map((k) => KIND_LABEL[k]).join("·")}] ${passed.length}건 적중`];
-  if (top) parts.push(`1위: ${top.doc.id} ${top.doc.title}${top.passed ? "" : " (조건 밖)"}`);
-  if (demoted.length) parts.push(`${demoted.join(" · ")} 조건 힌트로 내림`);
-  if (run.context) parts.push(`문맥 ${run.context} + '${run.typed}'`);
-  if (!r.hits.length) return { kind: "err", text: `⚪ 찾은 것이 없습니다${run.context ? ` (문맥 ${run.context})` : ""}` };
+  const parts = [`[${r.types.map(kindLabel).join("·")}] ${t(`${passed.length}건 적중`, `${passed.length} hits`)}`];
+  if (top) parts.push(`${t("1위", "Top")}: ${top.doc.id} ${top.doc.title}${top.passed ? "" : t(" (조건 밖)", " (outside conditions)")}`);
+  if (demoted.length) parts.push(t(`${demoted.join(" · ")} 조건 힌트로 내림`, `${demoted.join(" · ")} demoted to hints`));
+  if (run.context) parts.push(t(`문맥 ${run.context} + '${run.typed}'`, `context ${run.context} + '${run.typed}'`));
+  if (!r.hits.length) return { kind: "err", text: t(`⚪ 찾은 것이 없습니다${run.context ? ` (문맥 ${run.context})` : ""}`, `⚪ Nothing found${run.context ? ` (context ${run.context})` : ""}`) };
   return { kind: top?.passed ? "ok" : "info", text: `${top?.passed ? "🟢" : "🟡"} ${parts.join(" · ")}` };
 }
 
@@ -111,6 +128,7 @@ export function CommandBar(props: {
   onSubmit: (text: string) => Promise<boolean>;
 }) {
   const { inputRef, selected, context, onContext, run, open, onToggle, onSubmit } = props;
+  const t = useT();
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
   // 기록은 처음 한 번만 읽습니다 (렌더마다 저장소를 읽지 않게)
@@ -181,25 +199,29 @@ export function CommandBar(props: {
     >
       {selected &&
         (context ? (
-          <button type="button" className="unit-tag on" onClick={() => onContext(false)} title="선택 설비 문맥으로 묻는 중 (누르면 문맥 없이)">
+          <button type="button" className="unit-tag on" onClick={() => onContext(false)} title={t("선택 설비 문맥으로 묻는 중 (누르면 문맥 없이)", "Querying in the selected equipment context (click to query without it)")}>
             🛠 {selected} ✕
           </button>
         ) : (
-          <button type="button" className="unit-tag" onClick={() => onContext(true)} title={`${selected} 기준으로 묻기 ("상류 1홉" · "관련 MOC" · "절차서")`}>
-            🛠 문맥 ＋
+          <button type="button" className="unit-tag" onClick={() => onContext(true)} title={t(`${selected} 기준으로 묻기 ("상류 1홉" · "관련 MOC" · "절차서")`, `Query relative to ${selected} ("1 hop upstream" · "related MOC" · "procedure")`)}>
+            {t("🛠 문맥 ＋", "🛠 Context ＋")}
           </button>
         ))}
       <span className="cmd-prompt" aria-hidden="true">
         ›
       </span>
       <label className="sr-only" htmlFor="command-input">
-        자연어 질의
+        {t("자연어 질의", "Natural-language query")}
       </label>
       <input
         id="command-input"
         ref={inputRef}
         className="search-input"
-        placeholder={selected && context ? `${selected} 기준: 상류 1홉 · 관련 MOC · 절차서 …  (다른 설비는 이름 · 동으로)` : "자연어 질의 (Enter · /): 103동 2층 밸브 · 과열기 온도 600도 이상 · 급수조절밸브 상류 2홉 · 승인 대기 MOC"}
+        placeholder={
+          selected && context
+            ? t(`${selected} 기준: 상류 1홉 · 관련 MOC · 절차서 …  (다른 설비는 이름 · 동으로)`, `Relative to ${selected}: 1 hop upstream · related MOC · procedure …  (other equipment: by name or building)`)
+            : t("자연어 질의 (Enter · /): 103동 2층 밸브 · 과열기 온도 600도 이상 · 급수조절밸브 상류 2홉 · 승인 대기 MOC", "Natural-language query (Enter · /): valves on floor 2 of building 103 · superheater temperature above 600 °C · 2 hops upstream of feedwater control valve · pending MOC")
+        }
         value={value}
         maxLength={200}
         spellCheck={false}
@@ -207,10 +229,10 @@ export function CommandBar(props: {
         onKeyDown={onKeyDown}
       />
       <button type="submit" className="teal" disabled={busy || !value.trim()}>
-        {busy ? "찾는 중" : "🔍 질의"}
+        {busy ? t("찾는 중", "Searching") : t("🔍 질의", "🔍 Query")}
       </button>
       <button type="button" className={`plain results-toggle ${open ? "active" : ""}`} disabled={!run} onClick={onToggle} aria-expanded={open}>
-        결과 {count}건 {open ? "▼" : "▲"}
+        {t(`결과 ${count}건`, `${count} results`)} {open ? "▼" : "▲"}
       </button>
     </form>
   );
@@ -219,22 +241,24 @@ export function CommandBar(props: {
 /** 입력줄 위로 펼치는 반투명 판 (noto-sandbox `#quest-dropup`): 유형 · 적용 조건(초록) · 힌트로 내린 조건(노란 점선) · 안내 · 결과 목록 */
 export function SearchDropup({ run, onClose, onSelect, onPick, onInterlock, interlockKks }: { run: SearchRun; onClose: () => void; onSelect: (kks: string) => void; onPick: (id: string) => void; onInterlock: () => void; interlockKks: Set<string> }) {
   const r = run.result;
+  const t = useT();
   return (
-    <section className="search-results dropup vp-glass ov-avoid" aria-label="질의 분석 · 검색 결과">
+    <section className="search-results dropup vp-glass ov-avoid" aria-label={t("질의 분석 · 검색 결과", "Query analysis · results")}>
       <div className="search-head">
-        <b>🔍 질의 분석</b>
+        <b>{t("🔍 질의 분석", "🔍 Query Analysis")}</b>
         <span>
-          유형 <b>{r.types.map((t) => KIND_LABEL[t]).join(" · ")}</b>
+          {t("유형", "Type")} <b>{r.types.map(kindLabel).join(" · ")}</b>
         </span>
         {r.conditions.map((c, i) => (
           <span key={i} className={c.applied ? "cond on" : "cond hint"} title={c.note}>
             {c.applied ? "🟢" : "🟡"} {c.kind} {c.text}
-            {c.applied ? "" : " (힌트)"}
+            {c.applied ? "" : t(" (힌트)", " (hint)")}
           </span>
         ))}
-        {run.context && <span className="cond ctx">🛠 문맥 {run.context}</span>}
+        {run.context && <span className="cond ctx">{t(`🛠 문맥 ${run.context}`, `🛠 Context ${run.context}`)}</span>}
+        {run.engine !== run.sent && <span className="cond ctx" title={run.engine}>{t("엔진 질의", "Engine query")}: {run.engine}</span>}
         <span className="grow" />
-        <button className="ov-close" onClick={onClose} aria-label="닫기" title="닫기 (ESC)">
+        <button className="ov-close" onClick={onClose} aria-label={t("닫기", "Close")} title={t("닫기 (ESC)", "Close (ESC)")}>
           ✕
         </button>
       </div>
@@ -243,7 +267,7 @@ export function SearchDropup({ run, onClose, onSelect, onPick, onInterlock, inte
           {n}
         </div>
       ))}
-      {r.hits.length === 0 && <p className="muted">찾은 것이 없습니다.</p>}
+      {r.hits.length === 0 && <p className="muted">{t("찾은 것이 없습니다.", "Nothing found.")}</p>}
       <div className="search-list">
         {r.hits.map((h, i) => (
           <div key={`${h.doc.kind}:${h.doc.id}`} className={`search-hit ${h.passed ? "" : "weak"}`}>
@@ -255,17 +279,17 @@ export function SearchDropup({ run, onClose, onSelect, onPick, onInterlock, inte
               }}
             >
               <span className="hit-line">
-                <span className="rank">{i + 1 <= 3 ? ["🥇", "🥈", "🥉"][i] : `${i + 1}.`}</span> <span className={`kind ${h.doc.kind}`}>{KIND_LABEL[h.doc.kind]}</span> <b>{h.doc.title}</b> <span className="mono">{h.doc.id}</span>
-                {h.rescued && <em> · 전체 표에서 구제</em>}
-                {!h.passed && <em> · 조건 밖 (전체 순위)</em>}
+                <span className="rank">{i + 1 <= 3 ? ["🥇", "🥈", "🥉"][i] : `${i + 1}.`}</span> <span className={`kind ${h.doc.kind}`}>{kindLabel(h.doc.kind)}</span> <b>{h.doc.title}</b> <span className="mono">{h.doc.id}</span>
+                {h.rescued && <em>{t(" · 전체 표에서 구제", " · rescued from the full table")}</em>}
+                {!h.passed && <em>{t(" · 조건 밖 (전체 순위)", " · outside conditions (overall rank)")}</em>}
               </span>
               <span className="muted">{h.doc.subtitle}</span>
-              {h.why.length > 0 && <span className="why">왜: {h.why.slice(0, 6).join(" · ")}</span>}
+              {h.why.length > 0 && <span className="why">{t("왜", "Why")}: {h.why.slice(0, 6).join(" · ")}</span>}
             </button>
             <span className="hit-actions">
               {h.doc.kks && (
-                <button className="vt-btn" onClick={() => onSelect(h.doc.kks!)} title="도면에서 이 설비를 비춥니다">
-                  📍 도면 핀
+                <button className="vt-btn" onClick={() => onSelect(h.doc.kks!)} title={t("도면에서 이 설비를 비춥니다", "Show this equipment on the drawing")}>
+                  {t("📍 도면 핀", "📍 Pin on drawing")}
                 </button>
               )}
               {h.doc.kks && interlockKks.has(h.doc.kks) && (
@@ -276,12 +300,12 @@ export function SearchDropup({ run, onClose, onSelect, onPick, onInterlock, inte
                     onInterlock();
                   }}
                 >
-                  📋 인터록 보기
+                  {t("📋 인터록 보기", "📋 View interlock")}
                 </button>
               )}
               {(h.doc.kind === "incident" || h.doc.kind === "archive") && (
                 <button className="vt-btn" onClick={() => onPick(h.doc.id)}>
-                  📂 열기
+                  {t("📂 열기", "📂 Open")}
                 </button>
               )}
             </span>

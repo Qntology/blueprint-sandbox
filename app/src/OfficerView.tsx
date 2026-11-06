@@ -1,14 +1,15 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AlarmQueue } from "./AlarmQueue";
+import { chooseLang, useLang, useLanguageSync, useT, type Lang } from "./i18n";
+import { invoke, listen } from "./ipc";
 import { CctvZoom } from "./cctv/CctvZoom";
 import { CommandBar, contextual, SearchDropup, searchMarks, searchSummary, type SearchResult, type SearchRun } from "./cctv/CommandBar";
 import { SdsDock, TimeSeriesDock } from "./cctv/Docks";
 import { RightRail } from "./cctv/RightRail";
 import { HUD_W, TOP_INSET, useElementSize, type Insets } from "./cctv/stage";
 import { causalTraces } from "./cctv/traces";
-import { DEFAULT_SUPERVISOR, DOMAIN_ICON, PLANT_TERMS, TermsContext, type DomainInfo, type DomainMode } from "./domain";
+import { DEFAULT_SUPERVISOR, DOMAIN_ICON, PLANT_TERMS, PLANT_TERMS_EN, TermsContext, type DomainInfo, type DomainMode } from "./domain";
+import { queryToKo } from "./i18n/query";
 import { ModelSettings } from "./ModelSettings";
 import { PhysicsPanel } from "./PhysicsPanel";
 import { fmt, mmss } from "./plant";
@@ -73,7 +74,11 @@ export function OfficerView() {
   const hubCard = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const stage = useElementSize(stageRef);
-  const terms = plant?.terms ?? domain?.terms ?? PLANT_TERMS;
+  const lang = useLang();
+  const say = useT();
+  const terms = plant?.terms ?? domain?.terms ?? (lang === "en" ? PLANT_TERMS_EN : PLANT_TERMS);
+  // 창 제목도 화면 언어를 따릅니다 (용어는 백엔드 원장의 것을 번역 표가 바꿈)
+  useLanguageSync(useCallback(() => `blueprint ${terms.console_title} (${terms.control_room})`, [terms]));
 
   const refresh = useCallback(() => {
     invoke<ConsoleStatus>("console_status").then(setStatus).catch((e) => setError(String(e)));
@@ -173,6 +178,20 @@ export function OfficerView() {
   // 새 설비를 고르면 질의 문맥을 다시 켭니다 (문맥 칩 ✕ 는 그 설비에서만 끕니다)
   useEffect(() => setContext(true), [selectedKks]);
 
+  // 화면 언어를 바꾸면 받아 둔 글을 그 언어로 다시 받습니다 (번역은 invoke 감싸기가 함)
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) {
+      first.current = false;
+      return;
+    }
+    refresh();
+    loadDomain();
+    if (incident) loadDetail(incident, true);
+    setSearch(null);
+    setSearchOpen(false);
+  }, [lang]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // 하단 허브 높이: 서랍 · 차트 Drop-up 이 허브 위에서 멈춥니다
   useLayoutEffect(() => {
     const card = hubCard.current;
@@ -193,12 +212,15 @@ export function OfficerView() {
   }
 
   async function inject(id: string) {
-    setBusy(`시나리오 ${id} 주입 중 (Zoro-1 판단 · 글쓰기)`);
+    setBusy(say(`시나리오 ${id} 주입 중 (Zoro-1 판단 · 글쓰기)`, `Injecting scenario ${id} (Zoro-1 judgment · drafting)`));
     setError(null);
     try {
       const created = await invoke<string | null>("inject_scenario", { id });
       if (created) pick(created);
-      else setMessage(`${id}: 알람 없이 계측만 바뀌었습니다. 현장 단말에서 Red-line 을 스캔해 보내세요 (스캐너 폴더에 ${scenarios.find((s) => s.id === id)?.scans.join(", ")}).`);
+      else {
+        const scans = scenarios.find((s) => s.id === id)?.scans.join(", ");
+        setMessage(say(`${id}: 알람 없이 계측만 바뀌었습니다. 현장 단말에서 Red-line 을 스캔해 보내세요 (스캐너 폴더에 ${scans}).`, `${id}: measurements changed without an alarm. Scan the Red-line on the field terminal and send it (scanner folder: ${scans}).`));
+      }
       refresh();
     } catch (e) {
       setError(String(e));
@@ -209,7 +231,12 @@ export function OfficerView() {
 
   async function switchDomain(mode: DomainMode) {
     if (mode === domain?.mode) return;
-    setBusy(`${mode === "aidc" ? "AI 데이터센터" : "화력발전소"} 모드로 바꾸는 중 (원장 · 시나리오 · 도면 색인)`);
+    setBusy(
+      say(
+        `${mode === "aidc" ? "AI 데이터센터" : "화력발전소"} 모드로 바꾸는 중 (원장 · 시나리오 · 도면 색인)`,
+        `Switching to ${mode === "aidc" ? "AI Data Center" : "Thermal Power Plant"} mode (ledger · scenarios · drawing index)`,
+      ),
+    );
     setError(null);
     try {
       const d = await invoke<DomainInfo>("switch_domain_mode", { mode });
@@ -244,8 +271,10 @@ export function OfficerView() {
       const kks = context ? selectedKks : null;
       const sent = kks ? contextual(text, kks, plant) : text;
       try {
-        const result = await invoke<SearchResult>("search", { query: sent });
-        setSearch({ typed: text, sent, context: sent !== text ? kks : null, result });
+        // 엔진의 질의 파서는 한국어입니다. 영어 화면이면 영어 질의를 한국어 낱말로 옮겨 보냅니다 (i18n/query.ts).
+        const engine = lang === "en" ? queryToKo(sent) : sent;
+        const result = await invoke<SearchResult>("search", { query: engine });
+        setSearch({ typed: text, sent, engine, context: sent !== text ? kks : null, result });
         setSearchOpen(true);
         setChartsOpen(false);
         const top = result.hits[0];
@@ -256,7 +285,7 @@ export function OfficerView() {
         return false;
       }
     },
-    [plant, context, selectedKks],
+    [plant, context, selectedKks, lang],
   );
 
   // ESC 는 맨 위 판부터 하나씩 닫고(noto-sandbox overlays.js 의 STACK), 닫을 판이 없으면 검색 표시 → 설비 선택을 풉니다.
@@ -311,11 +340,11 @@ export function OfficerView() {
         setHudFocus((n) => n + 1);
       }
     : null;
-  const toast = search ? searchSummary(search) : null;
+  const toast = search ? searchSummary(search, say) : null;
   const TABS: [Tab, string][] = [
-    ["drawing", `① ${terms.drawing} 도면`],
-    ["mermaid", "② Mermaid 계통"],
-    ["mindmap", "③ 마인드맵"],
+    ["drawing", say(`① ${terms.drawing} 도면`, `① ${terms.drawing} Drawing`)],
+    ["mermaid", say("② Mermaid 계통", "② Mermaid Diagram")],
+    ["mindmap", say("③ 마인드맵", "③ Mind Map")],
   ];
 
   return (
@@ -350,30 +379,30 @@ export function OfficerView() {
               onInterlock={onInterlock}
             />
           ) : (
-            <div className="world-empty">계통을 읽는 중입니다</div>
+            <div className="world-empty">{say("계통을 읽는 중입니다", "Loading the plant topology")}</div>
           )}
 
           {/* 좌상단: 브랜드 · 도메인 · 사건 대기열, 뷰 도구줄(도면 선택 · 전체 계통 · A0), 공간 Depth */}
           <header className="corner-tl">
             <div className="corner-row ov-avoid">
               <span className="brand-mark ov-pill">
-                ⚡ blueprint <span className="brand-title">{terms.console_title}</span>
+                ⚡ blueprint <span className="brand-title" title={terms.console_title}>{terms.console_title}</span>
               </span>
-              <div className="domain-switch ov-pill" role="group" aria-label="도메인 모드">
+              <div className="domain-switch ov-pill" role="group" aria-label={say("도메인 모드", "Domain mode")}>
                 {(domain?.modes ?? []).map((m) => (
-                  <button key={m.mode} className={m.mode === domain?.mode ? "seg active" : "seg"} disabled={!!busy} onClick={() => void switchDomain(m.mode)} title={`${m.label} 모드`}>
+                  <button key={m.mode} className={m.mode === domain?.mode ? "seg active" : "seg"} disabled={!!busy} onClick={() => void switchDomain(m.mode)} title={say(`${m.label} 모드`, `${m.label} mode`)}>
                     {DOMAIN_ICON[m.mode]} {m.label}
                   </button>
                 ))}
               </div>
               <button className={`ov-pill queue-pill ${waiting ? "hot" : ""}`} aria-expanded={queueOpen} aria-controls="incident-popover" onClick={() => setQueueOpen((o) => !o)}>
-                🚨 사건 대기열 · 대기 {waiting}건 {queueOpen ? "▴" : "▾"}
+                {say(`🚨 사건 대기열 · 대기 ${waiting}건`, `🚨 Incident Queue · ${waiting} pending`)} {queueOpen ? "▴" : "▾"}
               </button>
             </div>
             <div className="corner-slot ov-avoid" ref={setBarSlot} />
-            <nav className="breadcrumb ov-bar ov-avoid" aria-label="공간 Depth">
-              <span className="crumb-title">공간 Depth</span>
-              {(crumb.length ? crumb : [plant?.domain === "aidc" ? "Lv1 센터" : "Lv1 호기", "Lv2 섹터", "Lv3 층", `Lv4 ${terms.drawing} 도면`, `Lv5 ${terms.code}`]).map((c, i) => (
+            <nav className="breadcrumb ov-bar ov-avoid" aria-label={say("공간 Depth", "Spatial Depth")}>
+              <span className="crumb-title">{say("공간 Depth", "Spatial Depth")}</span>
+              {(crumb.length ? crumb : [plant?.domain === "aidc" ? say("Lv1 센터", "Lv1 Center") : say("Lv1 호기", "Lv1 Unit"), say("Lv2 섹터", "Lv2 Sector"), say("Lv3 층", "Lv3 Floor"), say(`Lv4 ${terms.drawing} 도면`, `Lv4 ${terms.drawing} drawing`), `Lv5 ${terms.code}`]).map((c, i) => (
                 <span key={i} className="crumb">
                   <em>Lv{i + 1}.</em> {c}
                   {i < 4 && <b>▸</b>}
@@ -385,33 +414,34 @@ export function OfficerView() {
           {/* 우상단: 3-Way 뷰 · 흐름 오버레이 · 물리엔진 · 설정 */}
           <div className="corner-tr">
             <div className="corner-row ov-avoid">
-              <div className="view-pill ov-pill" role="tablist" aria-label="3-Way 도면 뷰">
+              <div className="view-pill ov-pill" role="tablist" aria-label={say("3-Way 도면 뷰", "3-Way drawing views")}>
                 {TABS.map(([key, label]) => (
                   <button key={key} role="tab" aria-selected={tab === key} className={tab === key ? "tab active" : "tab"} onClick={() => setTab(key)}>
                     {label}
                   </button>
                 ))}
               </div>
-              <label className={`mining-toggle ov-pill ${mining ? "on" : ""}`} title="배관 흐름 · 병목 · 근본 원인 물결을 도면 · 마인드맵 위에 겹칩니다">
-                <input type="checkbox" checked={mining} onChange={(e) => setMining(e.target.checked)} />⚡ 흐름 · 병목 {mining ? "ON" : "OFF"}
+              <label className={`mining-toggle ov-pill ${mining ? "on" : ""}`} title={say("배관 흐름 · 병목 · 근본 원인 물결을 도면 · 마인드맵 위에 겹칩니다", "Overlay pipe flow, bottlenecks and root-cause ripples on the drawing and mind map")}>
+                <input type="checkbox" checked={mining} onChange={(e) => setMining(e.target.checked)} />{say("⚡ 흐름 · 병목", "⚡ Flow · Bottleneck")} {mining ? "ON" : "OFF"}
               </label>
-              <button className="ov-pill physics-open" onClick={() => setDrawer("physics")}>
-                ⚡ 물리엔진 · 자율 대응
+              {/* 영어 이름은 길어 머리줄 왼쪽(사건 대기열 알약)을 덮으므로 짧게 쓰고 전체 이름은 풍선 도움말 · 서랍 제목으로 */}
+              <button className="ov-pill physics-open" onClick={() => setDrawer("physics")} title={say("물리엔진 · 자율 대응", "Physics Engine · Autonomous Response")}>
+                {say("⚡ 물리엔진 · 자율 대응", "⚡ Physics Engine")}
               </button>
               <button className={`ov-pill settings-pill ${status?.automation ? "auto" : ""}`} aria-expanded={settingsOpen} onClick={() => setSettingsOpen((o) => !o)}>
-                ⚙️ {supervisor} · {status?.automation ? "자동화 모드" : "보조 모드"} ▾
+                ⚙️ {supervisor} · {status?.automation ? say("자동화 모드", "Automation Mode") : say("보조 모드", "Assist Mode")} ▾
               </button>
             </div>
           </div>
 
           {/* 사건 대기열 팝오버: 시뮬레이터 · 마이닝 레인 · 확인 대기 · 처리 완료 */}
-          <section className="incident-popover ov-panel vp-glass ov-avoid" id="incident-popover" hidden={!queueOpen} aria-label="사건 대기열">
+          <section className="incident-popover ov-panel vp-glass ov-avoid" id="incident-popover" hidden={!queueOpen} aria-label={say("사건 대기열", "Incident Queue")}>
             <div className="ov-head">
-              <b>🚨 사건 대기열</b>
+              <b>{say("🚨 사건 대기열", "🚨 Incident Queue")}</b>
               <span className="muted">
-                대기 {waiting} · 처리 완료 {rows.length - waiting}
+                {say(`대기 ${waiting} · 처리 완료 ${rows.length - waiting}`, `${waiting} pending · ${rows.length - waiting} closed`)}
               </span>
-              <button className="ov-close" onClick={() => setQueueOpen(false)} aria-label="닫기">
+              <button className="ov-close" onClick={() => setQueueOpen(false)} aria-label={say("닫기", "Close")}>
                 ✕
               </button>
             </div>
@@ -423,7 +453,7 @@ export function OfficerView() {
                 if (e.target.value) void inject(e.target.value);
               }}
             >
-              <option value="">{terms.telemetry} 시뮬레이터 · 시나리오 주입</option>
+              <option value="">{say(`${terms.telemetry} 시뮬레이터 · 시나리오 주입`, `${terms.telemetry} simulator · inject scenario`)}</option>
               {scenarios.map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.id} · {s.title}
@@ -431,7 +461,7 @@ export function OfficerView() {
               ))}
             </select>
             {lanes.length > 0 && (
-              <div className="lane-line" title="프로세스 마이닝 레인 (Stage 1 ~ 5 대기)">
+              <div className="lane-line" title={say("프로세스 마이닝 레인 (Stage 1 ~ 5 대기)", "Process mining lanes (Stage 1 ~ 5 waiting)")}>
                 {lanes.map((l) => (
                   <span key={l.key} className={`lane-chip ${l.count > 0 && l.max_wait_secs > 0 && l.key !== "done" ? "hold" : ""}`}>
                     {l.label} <b>{l.count}</b>
@@ -444,40 +474,50 @@ export function OfficerView() {
           </section>
 
           {/* 설정 팝오버: 교대감독 사번 · 자동화 모드 · 모델 관리 (모델 관리는 늘 붙어 있어야 시작 때 모델을 확인합니다) */}
-          <section className="settings-popover ov-panel vp-glass" hidden={!settingsOpen} aria-label="관제 설정">
+          <section className="settings-popover ov-panel vp-glass" hidden={!settingsOpen} aria-label={say("관제 설정", "Console settings")}>
             <div className="ov-head">
-              <b>⚙️ 관제 설정</b>
-              <button className="ov-close" onClick={() => setSettingsOpen(false)} aria-label="닫기">
+              <b>{say("⚙️ 관제 설정", "⚙️ Console Settings")}</b>
+              <button className="ov-close" onClick={() => setSettingsOpen(false)} aria-label={say("닫기", "Close")}>
                 ✕
               </button>
             </div>
+            <div className="lang-row" role="group" aria-label="언어 · Language">
+              <span>{say("화면 언어", "Display language")} · Language</span>
+              <div className="domain-switch ov-pill">
+                {(["ko", "en"] as Lang[]).map((l) => (
+                  <button key={l} className={lang === l ? "seg active" : "seg"} data-lang={l} onClick={() => void chooseLang(l).catch((e) => setError(String(e)))}>
+                    {l === "ko" ? "🇰🇷 한국어" : "🇺🇸 English"}
+                  </button>
+                ))}
+              </div>
+            </div>
             <label className="inline">
-              {terms.supervisor} 사번
-              <input value={supervisor} onChange={(e) => setSupervisor(e.target.value)} placeholder={`예: ${DEFAULT_SUPERVISOR[domain?.mode ?? "power_plant"]}`} />
+              {say(`${terms.supervisor} 사번`, `${terms.supervisor} ID`)}
+              <input value={supervisor} onChange={(e) => setSupervisor(e.target.value)} placeholder={say(`예: ${DEFAULT_SUPERVISOR[domain?.mode ?? "power_plant"]}`, `e.g. ${DEFAULT_SUPERVISOR[domain?.mode ?? "power_plant"]}`)} />
             </label>
             <div className="auto-row">
               {status?.automation ? (
                 <button className="danger" onClick={() => toggleAuto(false)}>
-                  자동화 모드 끄기
+                  {say("자동화 모드 끄기", "Turn off Automation Mode")}
                 </button>
               ) : (
                 <button className="plain" disabled={!supervisor.trim()} onClick={() => setOpening((o) => !o)}>
-                  자동화 모드 켜기
+                  {say("자동화 모드 켜기", "Turn on Automation Mode")}
                 </button>
               )}
-              <em className={`tag ${status?.automation ? "auto" : ""}`}>{status?.automation ? "자동화 모드" : "보조 모드"}</em>
+              <em className={`tag ${status?.automation ? "auto" : ""}`}>{status?.automation ? say("자동화 모드", "Automation Mode") : say("보조 모드", "Assist Mode")}</em>
             </div>
             {opening && (
               <div className="auto-form">
                 <label className="inline wide">
-                  근거 규정
-                  <input value={basis} placeholder={`자동 확정의 근거 (예: ${terms.site} 운영 지침 제12조)`} onChange={(e) => setBasis(e.target.value)} />
+                  {say("근거 규정", "Legal basis")}
+                  <input value={basis} placeholder={say(`자동 확정의 근거 (예: ${terms.site} 운영 지침 제12조)`, `Basis for auto-confirmation (e.g. ${terms.site} operating guideline Art. 12)`)} onChange={(e) => setBasis(e.target.value)} />
                 </label>
                 <span className="muted">
-                  정상 유지 · 승인된 {terms.change} 반영만 자동 확정됩니다. 계통 이상 · 고위험은 언제나 {terms.supervisor}이 확정합니다.
+                  {say(`정상 유지 · 승인된 ${terms.change} 반영만 자동 확정됩니다. 계통 이상 · 고위험은 언제나 ${terms.supervisor}이 확정합니다.`, `Only normal-hold and approved ${terms.change} updates are auto-confirmed. System faults and high-risk actions are always confirmed by the ${terms.supervisor}.`)}
                 </span>
                 <button className="green" disabled={!basis.trim()} onClick={() => toggleAuto(true)}>
-                  켜기
+                  {say("켜기", "Turn on")}
                 </button>
               </div>
             )}
@@ -502,11 +542,11 @@ export function OfficerView() {
             folded={hudFolded}
             onFold={setHudFolded}
             focus={hudFocus}
-            ttf={ttf !== null ? `⏱ ${terms.trip} ${ttf.toFixed(0)}초` : null}
+            ttf={ttf !== null ? say(`⏱ ${terms.trip} ${ttf.toFixed(0)}초`, `⏱ ${terms.trip} ${ttf.toFixed(0)} s`) : null}
           />
 
           {/* 하단 가운데 허브: [Drop-up] · 알림 · 파이프라인 · 타임머신 · 자연어 질의 */}
-          <section className="hub ov-avoid" aria-label="관제 허브">
+          <section className="hub ov-avoid" aria-label={say("관제 허브", "Control hub")}>
             {searchOpen && search && (
               <SearchDropup
                 run={search}
@@ -518,11 +558,11 @@ export function OfficerView() {
               />
             )}
             {chartsOpen && detail && plant && (
-              <section className="telemetry-dropup dropup vp-glass ov-avoid" aria-label="시계열 · SDS 로직 차트">
+              <section className="telemetry-dropup dropup vp-glass ov-avoid" aria-label={say("시계열 · SDS 로직 차트", "Time-series · SDS logic charts")}>
                 <div className="ov-head">
-                  <b>📈 CAM-02 시계열 · 🧠 CAM-03 SDS 로직 차트</b>
-                  <span className="muted">재생 시각 t 와 선택 설비에 맞물려 움직입니다</span>
-                  <button className="ov-close" onClick={() => setChartsOpen(false)} aria-label="닫기">
+                  <b>{say("📈 CAM-02 시계열 · 🧠 CAM-03 SDS 로직 차트", "📈 CAM-02 Time Series · 🧠 CAM-03 SDS Logic Chart")}</b>
+                  <span className="muted">{say("재생 시각 t 와 선택 설비에 맞물려 움직입니다", "Follows the replay time t and the selected equipment")}</span>
+                  <button className="ov-close" onClick={() => setChartsOpen(false)} aria-label={say("닫기", "Close")}>
                     ✕
                   </button>
                 </div>
@@ -543,7 +583,7 @@ export function OfficerView() {
                       setError(null);
                       setMessage(null);
                     }}
-                    aria-label="알림 닫기"
+                    aria-label={say("알림 닫기", "Dismiss notice")}
                   >
                     ✕
                   </button>
@@ -561,7 +601,7 @@ export function OfficerView() {
                     setSearch(null);
                     setSearchOpen(false);
                   }}
-                  aria-label="검색 표시 지우기"
+                  aria-label={say("검색 표시 지우기", "Clear search highlights")}
                 >
                   ✕
                 </button>
@@ -573,7 +613,7 @@ export function OfficerView() {
                 onOpen={(k) => setDrawer(k)}
                 lanes={lanes}
                 tail={
-                  <button className={`plain charts-toggle ${chartsOpen ? "active" : ""}`} disabled={!detail} aria-expanded={chartsOpen} onClick={() => setChartsOpen((o) => !o)} title="CAM-02 시계열 · CAM-03 SDS 로직 차트를 허브 위로 펼칩니다">
+                  <button className={`plain charts-toggle ${chartsOpen ? "active" : ""}`} disabled={!detail} aria-expanded={chartsOpen} onClick={() => setChartsOpen((o) => !o)} title={say("CAM-02 시계열 · CAM-03 SDS 로직 차트를 허브 위로 펼칩니다", "Open the CAM-02 time-series and CAM-03 SDS logic charts above the hub")}>
                     📈 CAM-02·03 {chartsOpen ? "▼" : "▲"}
                   </button>
                 }
@@ -587,8 +627,9 @@ export function OfficerView() {
                   traces={traces}
                   lead={
                     ttf !== null && (
-                      <span className={`ttf-badge ${ttf <= 30 ? "hot" : ""}`} title="경보 센서가 지금 기울기로 보호 정지 한계에 닿기까지 남은 시간">
-                        🚨 {terms.trip} 잔여(TTF) {ttf.toFixed(0)}초{tripLimit !== null && alarmSensor ? ` (${fmt(tripLimit)}${alarmSensor.unit} 한계)` : ""}
+                      <span className={`ttf-badge ${ttf <= 30 ? "hot" : ""}`} title={say("경보 센서가 지금 기울기로 보호 정지 한계에 닿기까지 남은 시간", "Time until the alarm sensor reaches its protective trip limit at the current slope")}>
+                        {say(`🚨 ${terms.trip} 잔여(TTF) ${ttf.toFixed(0)}초`, `🚨 Time to ${terms.trip} (TTF) ${ttf.toFixed(0)} s`)}
+                        {tripLimit !== null && alarmSensor ? say(` (${fmt(tripLimit)}${alarmSensor.unit} 한계)`, ` (limit ${fmt(tripLimit)}${alarmSensor.unit})`) : ""}
                       </span>
                     )
                   }
@@ -613,10 +654,10 @@ export function OfficerView() {
           {drawer === "physics" && plant && (
             <div className="drawer">
               <header>
-                <strong>⚡ [물리엔진 이벤트 시뮬레이터 & Zoro-1 자율 대응 (Part 8-5)] 명령은 시뮬레이터에만 들어갑니다</strong>
+                <strong>{say("⚡ [물리엔진 이벤트 시뮬레이터 & Zoro-1 자율 대응 (Part 8-5)] 명령은 시뮬레이터에만 들어갑니다", "⚡ [Physics Engine Event Simulator & Zoro-1 Autonomous Response (Part 8-5)] Commands go to the simulator only")}</strong>
                 <span className="grow" />
                 <button className="plain" onClick={() => setDrawer(null)}>
-                  [X 닫기]
+                  {say("[X 닫기]", "[X Close]")}
                 </button>
               </header>
               <div className="drawer-body">
@@ -650,18 +691,18 @@ export function OfficerView() {
           {zoomKks && plant && <CctvZoom kks={zoomKks} plant={plant} detail={detail} t={at} onClose={() => setZoomKks(null)} onT={setT} />}
         </div>
         <footer className="status-bar">
-          <span>엔진: {status?.engine ?? "-"}</span>
+          <span>{say("엔진", "Engine")}: {status?.engine ?? "-"}</span>
           <span>
-            도메인: {domain ? `${DOMAIN_ICON[domain.mode]} ${domain.label}` : "-"} · {plant?.kind}
+            {say("도메인", "Domain")}: {domain ? `${DOMAIN_ICON[domain.mode]} ${domain.label}` : "-"} · {plant?.kind}
           </span>
-          <span>확인 대기 {status?.pending ?? 0}건</span>
-          <span>보관 {status?.archived ?? 0}건</span>
-          <span>설비 관계망 {status?.graph_nodes ?? 0}노드</span>
+          <span>{say(`확인 대기 ${status?.pending ?? 0}건`, `${status?.pending ?? 0} pending`)}</span>
+          <span>{say(`보관 ${status?.archived ?? 0}건`, `${status?.archived ?? 0} archived`)}</span>
+          <span>{say(`설비 관계망 ${status?.graph_nodes ?? 0}노드`, `Equipment graph ${status?.graph_nodes ?? 0} nodes`)}</span>
           <span>
-            {terms.change} 오버레이 {status?.overlays.length ?? 0}건
+            {say(`${terms.change} 오버레이 ${status?.overlays.length ?? 0}건`, `${terms.change} overlays ${status?.overlays.length ?? 0}`)}
           </span>
-          <span>감사 기록 {status?.audit_count ?? 0}건</span>
-          <span className="sb-keys">Enter · / 질의 · ESC 판 닫기</span>
+          <span>{say(`감사 기록 ${status?.audit_count ?? 0}건`, `Audit log ${status?.audit_count ?? 0}`)}</span>
+          <span className="sb-keys">{say("Enter · / 질의 · ESC 판 닫기", "Enter · / query · ESC close panels")}</span>
           {status?.audit_last[0] && <span className="audit-tail">{status.audit_last[0]}</span>}
         </footer>
       </main>

@@ -78,7 +78,7 @@ button.ov-pill:hover, .ov-pill[aria-expanded="true"] { background: var(--glass-s
 .corner-slot > * { pointer-events: auto; }
 .corner-tr { position: absolute; right: 12px; top: 10px; z-index: 8; display: flex; justify-content: flex-end; pointer-events: none; }
 .brand-mark { font-weight: 700; font-size: 13px; letter-spacing: 0.02em; color: #fff; }
-.brand-title { font-weight: 600; }
+.brand-title { font-weight: 600; display: inline-block; max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 .domain-switch { padding: 0; overflow: hidden; }
 .domain-switch .seg { height: 100%; border-radius: 0; color: var(--muted); background: transparent; padding: 0 12px; }
 .domain-switch .seg.active { color: #0b1220; background: var(--teal); font-weight: bold; }
@@ -109,6 +109,9 @@ button.ov-pill:hover, .ov-pill[aria-expanded="true"] { background: var(--glass-s
 /* 사건 대기열 · 설정 팝오버 */
 .incident-popover { position: absolute; left: 12px; top: 48px; z-index: 25; width: 360px; max-height: calc(100% - 60px); display: flex; flex-direction: column; gap: 8px; }
 .settings-popover { position: absolute; right: 12px; top: 48px; z-index: 25; width: 460px; max-height: calc(100% - 60px); display: flex; flex-direction: column; gap: 8px; }
+/* 화면 언어 (한국어 · English): 백엔드 설정 파일에 남고 두 창이 함께 바뀝니다 */
+.lang-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); }
+.lang-row .domain-switch { height: 28px; }
 .sim { padding: 5px 6px; color: var(--text); background: #2a2210; border: 1px solid var(--amber); border-radius: 4px; }
 .lane-line { display: flex; flex-wrap: wrap; gap: 4px; font-size: 11px; }
 .lane-chip { padding: 1px 7px; color: #c9d1e3; background: #1b2130; border: 1px solid var(--glass-line); border-radius: 10px; }

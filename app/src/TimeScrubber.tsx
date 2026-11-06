@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { CausalTrace } from "./cctv/traces";
+import { useT } from "./i18n";
 import { clock, signedSecs } from "./plant";
 import type { Detail } from "./types";
 
@@ -15,6 +16,7 @@ export function TimeScrubber({ detail, t, onT, onSds, traces, lead }: { detail: 
   const start = tl.t0_ms;
   const end = tl.t0_ms + (length - 1) * tl.period_ms;
   const origin = detail.analysis.substantive?.causal?.root?.at_ms ?? detail.analysis.chain[0]?.at_ms ?? detail.analysis.sds.center_ms;
+  const say = useT();
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const tRef = useRef(t);
@@ -68,18 +70,18 @@ export function TimeScrubber({ detail, t, onT, onSds, traces, lead }: { detail: 
           setPlaying((p) => !p);
         }}
       >
-        {playing ? "⏸ 멈춤" : "▶ 재생"}
+        {playing ? say("⏸ 멈춤", "⏸ Pause") : say("▶ 재생", "▶ Play")}
       </button>
-      <select value={speed} onChange={(e) => setSpeed(Number(e.target.value))} aria-label="재생 속도">
+      <select value={speed} onChange={(e) => setSpeed(Number(e.target.value))} aria-label={say("재생 속도", "Playback speed")}>
         <option value={1}>1x</option>
         <option value={4}>4x</option>
         <option value={0.25}>0.25x</option>
       </select>
       <button className="plain" onClick={() => onT(origin)}>
-        발원점
+        {say("발원점", "Origin")}
       </button>
       <button className="plain" onClick={() => onT(tl.now_ms)}>
-        분석 시각
+        {say("분석 시각", "Analysis time")}
       </button>
       <div className="scrub-track" title={bands.map((b) => b.tr.title).join("\n")}>
         <svg className="scrub-waves" viewBox={`0 0 1000 ${STRIP_ROWS * 12}`} preserveAspectRatio="none" aria-hidden="true">
@@ -90,18 +92,18 @@ export function TimeScrubber({ detail, t, onT, onSds, traces, lead }: { detail: 
             {b.tr.short}
           </span>
         ))}
-        <input type="range" min={start} max={end} step={100} value={t} onChange={(e) => onT(Number(e.target.value))} aria-label="재생 시각" />
+        <input type="range" min={start} max={end} step={100} value={t} onChange={(e) => onT(Number(e.target.value))} aria-label={say("재생 시각", "Replay time")} />
         {detail.analysis.chain.map((ev, i) => (
           <span key={i} className={`scrub-mark ${ev.kind}`} style={{ left: pos(ev.at_ms) }} title={`${signedSecs(ev.at_ms, origin)} ${ev.tag} ${ev.label}`} />
         ))}
-        <span className="scrub-origin" style={{ left: pos(origin) }} title="t = 0 발원" />
-        <span className="scrub-now" style={{ left: pos(tl.now_ms) }} title="분석 시각" />
+        <span className="scrub-origin" style={{ left: pos(origin) }} title={say("t = 0 발원", "t = 0 origin")} />
+        <span className="scrub-now" style={{ left: pos(tl.now_ms) }} title={say("분석 시각", "Analysis time")} />
       </div>
       <span className="mono scrub-time">
         {clock(t)} ({signedSecs(t, origin)})
       </span>
       <button className="teal" onClick={onSds}>
-        ⏱️ 시계열 · SDS 분석기
+        {say("⏱️ 시계열 · SDS 분석기", "⏱️ Time-series · SDS Analyzer")}
       </button>
     </div>
   );

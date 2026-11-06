@@ -511,3 +511,40 @@ E2E 가 찾은 것 (첫 실행 15/17):
 - 질의 결과판이 화면 높이의 대부분을 덮고 말풍선이 결과판을 피하지 않음 → 42 vh 로 묶고 피할 판에 넣음.
 
 E2E 뒤에 바꾼 것: ESC 순서를 화면에 겹친 순서로 맞췄습니다 (확대 창 → 팝오버 → 허브 Drop-up → 서랍 → 검색 표시 → 설비 선택). 질의 결과판은 열리면 서랍 위로 올라오는데 ESC 가 서랍부터 닫았습니다. 앱에서 결과판 + 물리엔진 서랍을 열고 ESC 를 네 번 눌러 결과판 → 서랍 → 검색 표시 → 선택 순서로 닫히는 것을 확인했습니다 (E2E 는 판이 하나일 때만 ESC 를 눌러 영향 없음).
+
+## 12. 화면 언어 English · 한/영 시연 영상 (2026-11-06 ~ 07)
+
+설정 팝오버에 화면 언어(한국어 · English)를 넣고, 같은 앱을 한국어 화면 · 영어 화면으로 각각 찍어 편집했습니다 ([i18n.md](i18n.md) · [video.md](video.md)).
+
+### 12.1 시험 (CPU, 모델 없음)
+
+- `cargo test -p blueprint-core --no-default-features`: 단위 368 (+3: `i18n::tests::codes_round_trip` · `location_and_unit_words_become_english_but_numbers_stay`, `drafting::tests::an_english_screen_asks_for_an_english_summary_and_checks_the_same_numbers`), 시나리오 E2E 발전소 14 · 데이터센터 8, 엔진 잠금 4 모두 통과.
+- `npx tsc --noEmit` 통과.
+- 도면: 생성기를 `--lang` 없이 다시 돌려 한국어 마스터 10장 · 현장 스캔(P1 · P3 · P3F · D1 · D3 · D3F, clean 포함) · A0 가 바이트까지 같음을 해시로 확인 (마스터 JSON 은 git 체크아웃의 CRLF 만 다름). 영어 마스터 10장은 `core/fixtures/drawings/en` (같은 배치 · 같은 좌표).
+- 번역 표: 한국어 E2E 감사(백엔드가 보낸 한글 1,193줄)와 한국어 촬영 감사(1,663줄)를 `scripts/i18n/build_en.py` 로 바꿔 보면 한글이 남는 것은 한국어 화면에서 모델이 쓴 초안(영어 화면에서는 영어로 씀), 촬영 때 직접 친 한국어 메모, gocr 가 서명란에서 읽은 이름(`김래현`)뿐입니다.
+
+### 12.2 앱 E2E (실제 앱 두 창 · ROCm · 실제 모델)
+
+| 실행 | 결과 | 기록 |
+| --- | --- | --- |
+| 한국어 `console.js --audit` (언어 기능을 넣은 뒤 회귀) | **17/17** | `out/shots_ko` · `i18n_seen.json` |
+| 영어 `console.js --lang en` 첫 실행 | 11/17 | 아래 네 가지를 찾음 |
+| 영어, 고친 뒤 새 앱에서 한 번에 | **17/17** | PHYS 사슬 잠금 19.3 s · 완화 제안 29.7 s · 네 기준 최솟값 0.858 · 과열기 고점 632.5 ℃ (트립 645 아래), 분석 중 상태 줄 48번 중앙값 2.1 ms · 최대 3.7 ms. DPHYS GPU 정션 고점 86.9 ℃. 문맥 질의 `1 hop upstream` → `context 10LAB10AP001 + '1 hop upstream'` · 4 hits |
+
+영어 E2E 가 찾은 것:
+
+- **현장 단말 점검자 이름이 번역되어 접수 실패 (P1 · P3 · D1 · D3)**: 스캔이 읽은 `이승민` 을 화면 번역이 `Lee Seung-min` 으로 바꾸고, 그 값이 그대로 백엔드로 돌아가 `점검자 이름과 사번이 맞지 않습니다`. 현장 서류를 읽은 값은 데이터라 `scan_field_documents` 응답의 `prefill` · `raw` 는 번역하지 않습니다 (`app/src/ipc.ts` 의 `KEEP`).
+- **영어 문맥 질의에 선택 설비가 붙지 않음 (SEARCH)**: 설비 이름을 부른 질의인지 보는 규칙이 한국어용(두 글자 조각 둘 이상 겹침)이라 `1 hop upstream` 이 `Main Steam Valve` 와 `st · ea · am` 이 겹쳐 이름을 부른 것으로 판단. 영어는 이름 전체나 세 글자 이상 낱말 둘 이상이 들어 있을 때만 이름으로 봅니다. 영어 질의 변환도 원장 이름 · 여러 낱말 용어 → 비교어 · 동 · 층 · 상태 규칙 → 한 낱말 용어 차례로 바꿨습니다 (`floor 2` 가 `층 2` 가 되던 것 → `2층`, `pending` → `승인 대기`).
+- **데이터센터 흐름이 사건 대기열을 못 엶 (D2 ~ D4)**: 영어 머리줄이 길어 오른쪽 `① MEP·SLD Drawing` 탭이 왼쪽 `Incident Queue` 알약을 덮음 (Playwright: 탭이 포인터를 가로챔). 영어 물리엔진 단추를 `⚡ Physics Engine` 으로 줄이고(전체 이름은 도움말 · 서랍 제목) 브랜드 제목은 최대 폭에서 말줄임.
+- **Zoro-1 영어 초안에 `103동 2F` · `CDU 2차侧`**: 모델이 한국어 사실 줄의 위치 · 단위 낱말을 베낌(`2차측` 은 한자 `侧` 로까지). 영어 요청문에서는 사실 줄의 `103동` · `2층` · `2차측` · `4.3초` · `2홉` 을 미리 영어로 바꿔 줍니다 (`i18n::english_tokens`, 숫자는 그대로라 대조는 같음).
+
+E2E 를 고친 것: 영어 화면은 콘솔 머리를 `Control Console` · `Spatial Depth` 로 찾고, 설정 팝오버의 언어 단추로 언어를 고른 뒤 같은 흐름을 영어 문구로 돕니다. 검색은 영어 질의(`valves on floor 2 of building 103`, `building 105 valve ID fan`, `pending MOC` …), 고장 중 검색은 `stuck valve` · `feedwater pump in building 103 with high pressure` 입니다. 스크린샷마다 화면에 남은 한글 줄을 `i18n_visible.json` 에 남깁니다. 마지막 영어 실행에서 남은 것은 gocr 원문(`As scanned: 김래현`), 영어 질의를 옮긴 엔진 질의 칩(일부러 보임), P4 초안 대조 메시지 두 줄(그 뒤 표에 넣음)입니다.
+
+### 12.3 시연 영상 (record.js · edit_video.py)
+
+- 한국어 촬영 `out/rec/master_ko` (2026-11-06 23:02 ~ 23:19 KST): 장면 묶음 15개 중 14개. P1 은 서명 패드가 단말 화면 아래에 있어 펜 획이 닿지 않아 실패 → 스크롤 후 다시 찍음 (`master_ko_p1`). 두 번째 시도에서 한 획 직선 서명은 소명까지 마친 마지막 전송에서 `서명 획수나 면적이 기준에 못 미칩니다. 성함을 다시 적어 주세요` (G1_SIGN_INVALID_RETRY) 로 돌아오고, 스캔한 점검표의 서명으로 접수됨. 실명 열람은 P1 위험도 84.3 % 라 허용 · 감사 기록.
+- 영어 촬영 `out/rec/master_en` (2026-11-07 03:24 ~ 03:42 KST, 위 영어 E2E 수정 뒤 새 앱): 장면 묶음 15개 모두 첫 번에 성공. 촬영 내내 영어로 안 바뀐 백엔드 글은 gocr 가 서명란에서 읽은 `김래현` 하나(스캔 원문이라 그대로 둠). Zoro-1 영어 초안 예: D2 EOP-103-CDU02 `Root cause: CDU secondary-side flow control valve (DC1CDU20AA02) in Bldg 103 2F is open at 18.0% instead of 78.0%, causing a 39.5% flow deficit (726.0 LPM vs. 1,200.0 LPM) …` 숫자 13/13 일치 · 15.1 s · 140 토큰.
+- 첫 촬영의 record.js 는 장면 표시 값에 사건 번호(`id`)가 있으면 장면 표시 이름을 덮었습니다 (16개). 로그의 장면 표시 순서로 이름을 되돌렸고 record.js 는 값을 `incident` 로 남깁니다.
+- 판단 확신도는 기획 수치와 같은 모양: P2 0.754 (시간 0.887 · 물리 0.838 · 센서 0.754), D2 0.734, P3 0.984, P4 · D4 확신도 없음(모델 이견). 초안 P2 AOP-103-FW02 숫자 3/3 일치 · 모델 글 채택 · 12.2 s · 86 토큰 (토큰당 142 ms).
+- 전처리 Off · On 숫자는 측정 파일에서: P3 델타 11.1 → 8.6 s (전부 읽기 36.6 s), D3 14.6 → 9.9 s (39.0 s), 밀린 스캔 맞춤 없음 36.3 s(전부 읽기로 물러남) → 맞춤 9.1 s, 심볼 사전 기준 0.944 / 0.015 · 마스터 31/32.
+- 영상: 한국어 `out/video/blueprint_master_e2e_ko.mp4` · 영어 `out/video/blueprint_master_e2e_en.mp4`, 둘 다 약 13분 40초 · 137 구간 · 1920 × 1080 · 30 fps · 50 MB 안팎 (H.264). 같은 편집 대본에 자막 · 모델 장면 글만 언어별입니다.

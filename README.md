@@ -59,6 +59,8 @@ cargo run -p blueprint-core --release --example sds_eval
 
 실제 모델 측정 결과(판정 8/8 · AOP 초안 6/6 모델 글 · 도면 KKS 35/35 · 도면번호 5/5 · 현장 스캔 3/3)와 앱 E2E 는 [docs/verification.md](docs/verification.md) 에 있습니다. 합성 데이터에서 잰 값이라 제품 성능으로 말하지 않습니다.
 
+앱 E2E 는 한국어 · 영어 화면 모두 돕니다: `node scripts/e2e/console.js` · `node scripts/e2e/console.js --lang en`. 시연 영상(한국어 · 영어)을 찍고 편집하는 방법은 [docs/video.md](docs/video.md) 에 있습니다 (`scripts/e2e/record.js` · `edit_video.py`).
+
 ## 실행
 
 | OS | 앱 | 예제 (기본 `plant_probe`) |
@@ -71,6 +73,7 @@ cargo run -p blueprint-core --release --example sds_eval
 - 콘솔 머리의 **도메인 스위치**(`🏭 1.2GW 화력발전소 | 🖥️ 100MW AI 데이터센터`)로 도메인을 바꿉니다. 바꾸면 사건 · 감사 기록 · 자동화 모드 · 물리엔진을 비우고 모델은 그대로 둡니다. `BLUEPRINT_DOMAIN=aidc` 면 데이터센터로 시작합니다.
 - 콘솔 머리의 **시뮬레이터**(발전소 DCS · 데이터센터 BMC)로 시나리오(P1 ~ P7 · D1 ~ D7)를 넣습니다. Red-line 시나리오(P3 · P3F · D3 · D3F)는 계측만 바꾸고, 현장 단말에서 Red-line 을 스캔해 보내면 사건이 열립니다.
 - 스캐너는 `BLUEPRINT_SCANNER_DIR` 폴더(기본 `%LOCALAPPDATA%\blueprint\scanner`)의 이미지로 대신합니다. `out/field/P1_gauge.png`, `P3_redline.png` 를 넣고 단말에서 스캔하세요.
+- **화면 언어**: 설정 팝오버(`[⚙️ 사번 · 모드]`)의 `화면 언어 · Language` 에서 `🇰🇷 한국어` / `🇺🇸 English` 를 고릅니다. 두 창이 함께 바뀌고 다음 실행에도 남습니다 (`settings.json`, 시작 때 `BLUEPRINT_LANG=en` 으로 정할 수도 있음). 영어 화면에서는 도면 그림 · 원장 이름 · 판정 · 결재 · 검색 글이 영어이고, Zoro-1 이 절차서 원인 요약을 영어로 씁니다. 자연어 질의도 영어로 칩니다. 엔진 · 판정 · 현장 서류는 그대로입니다 ([docs/i18n.md](docs/i18n.md)).
 - `BLUEPRINT_ENGINE=rules` 면 모델 없이 규칙만으로 돕니다. `BLUEPRINT_TRACE=<파일>` 이면 모델 사용 기록을 남깁니다.
 - 장치는 `BLUEPRINT_DEVICE=auto|cuda|rocm|metal|vulkan|cpu` (기본 CUDA → ROCm → Metal → Vulkan → CPU).
 
@@ -125,12 +128,13 @@ blueprint-sandbox/
 │   ├── src/field.rs        현장 단말 접수 (편차 소명 · 대기 사건 연결)
 │   ├── src/mining.rs       간선 흐름 · 병목 · 의사결정 레인
 │   ├── src/mermaid.rs      Mermaid 원본
-│   ├── fixtures/           synthetic_db.json · plant_scenarios.json · aidc_db.json · aidc_scenarios.json · drawings/ (PID · MEP · NET · SLD)
+│   ├── src/i18n.rs         화면 언어 (한국어 · English) · 영어 절차서 글쓰기 지시문
+│   ├── fixtures/           synthetic_db.json · plant_scenarios.json · aidc_db.json · aidc_scenarios.json · drawings/ (PID · MEP · NET · SLD, en/ 영어 그림)
 │   ├── examples/           실제 모델 측정 (plant_probe · symbol_probe · a0_probe), 모델 없는 평가 (search_eval · sds_eval)
 │   └── tests/plant_scenarios.rs P1 ~ P7 E2E
 ├── tools/model-settings/   blueprint-models: 모델 폴더 · zoro-gravity 가져오기 · 다운로드
-├── app/                    Tauri + React: 관제 콘솔 · 현장 단말
-├── scripts/                생성기 · ROCm/CUDA 환경 · 실행 공용 · e2e/console.js
+├── app/                    Tauri + React: 관제 콘솔 · 현장 단말 (src/i18n: 화면 언어 · 영어 번역 표 · 영어 질의 변환)
+├── scripts/                생성기 · ROCm/CUDA 환경 · 실행 공용 · e2e/ (console.js E2E · record.js 촬영 · edit_video.py 편집) · i18n/ (번역 표 만들기)
 ├── run/                    백엔드별 실행 스크립트
 └── docs/                   기획 · 합성 데이터 · 엔진 · 검증
 ```

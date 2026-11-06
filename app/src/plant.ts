@@ -1,4 +1,5 @@
 // 계통 계산 도우미. 코어의 graph.rs (홉 뎁스) · timeseries.rs (시각 값) 과 같은 규칙입니다.
+import { locale, tr } from "./i18n/lang";
 import type { Edge, Plant, Sensor, Timeline } from "./types";
 
 /** 소수 자리 고정. 반올림하면 0 이 되는 음수를 "-0.0" 으로 쓰지 않습니다. */
@@ -105,7 +106,7 @@ export function sensorsOf(plant: Plant, kks: string): Sensor[] {
 
 export function clock(ms: number): string {
   const d = new Date(ms);
-  return d.toLocaleTimeString("ko-KR", { hour12: false });
+  return d.toLocaleTimeString(locale(), { hour12: false });
 }
 
 export function signedSecs(ms: number, base: number): string {
@@ -160,11 +161,13 @@ export const SDS_COLOR: Record<string, string> = {
   NOISY: "#f6c453",
 };
 
-export const STAGE_LABEL: Record<string, string> = {
-  Done: "정상완료",
-  Skipped: "건너뜀",
-  Corrected: "교정완료",
-  Alert: "경보발령",
-  Waiting: "대기",
-  Blocked: "차단",
-};
+const STAGE_KO: Record<string, string> = { Done: "정상완료", Skipped: "건너뜀", Corrected: "교정완료", Alert: "경보발령", Waiting: "대기", Blocked: "차단" };
+const STAGE_EN: Record<string, string> = { Done: "Done", Skipped: "Skipped", Corrected: "Corrected", Alert: "Alert", Waiting: "Waiting", Blocked: "Blocked" };
+
+/** 단계 상태 이름 (화면 언어) */
+export function stageLabel(status: string): string {
+  return tr(STAGE_KO[status] ?? status, STAGE_EN[status] ?? status);
+}
+
+/** 단계 상태 이름 표 (예전 이름). 읽을 때마다 화면 언어로 돌려줍니다. */
+export const STAGE_LABEL: Record<string, string> = new Proxy({} as Record<string, string>, { get: (_, k) => (typeof k === "string" ? stageLabel(k) : undefined) });

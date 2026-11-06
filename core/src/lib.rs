@@ -22,6 +22,7 @@ pub mod extract;
 pub mod factcheck;
 pub mod field;
 pub mod graph;
+pub mod i18n;
 pub mod identify;
 pub mod interlock;
 pub mod issues;

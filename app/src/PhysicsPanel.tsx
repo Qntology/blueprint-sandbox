@@ -1,7 +1,9 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke } from "./ipc";
+import { listen } from "./ipc";
 import { useEffect, useMemo, useState } from "react";
 import { shortTag, useTerms } from "./domain";
+import { useT } from "./i18n";
+import { tr } from "./i18n/lang";
 import { fmt } from "./plant";
 import type { Plant, Timeline } from "./types";
 import { WaveChart, type Trace } from "./WaveChart";
@@ -47,18 +49,20 @@ interface PhysicsStatus {
 
 const TRACE_COLORS = ["#ff6b3d", "#9ae66e", "#4fd1c5", "#7aa2ff", "#f6c453"];
 
-const STATE_LABEL: Record<string, string> = {
+/** 추적 상태 이름 (그릴 때의 화면 언어로) */
+const stateLabels = (): Record<string, string> => ({
   STABLE: "STABLE",
-  INFLECTION_DETECTED: "SLEW (변곡)",
-  CAUSAL_CHAIN_LOCKED: "인과 사슬 잠금",
-  MITIGATING: "완화 조치",
-  RECOVERING: "회복 중",
-};
+  INFLECTION_DETECTED: tr("SLEW (변곡)", "SLEW (inflection)"),
+  CAUSAL_CHAIN_LOCKED: tr("인과 사슬 잠금", "Causal chain locked"),
+  MITIGATING: tr("완화 조치", "Mitigating"),
+  RECOVERING: tr("회복 중", "Recovering"),
+});
 
 /** 물리엔진 이벤트 시뮬레이터 & Zoro-1 자율 대응 (Part 8-5). 고장을 주입하면 식으로 연쇄가 생기고, SDS 추적기가 사건을 열고,
  *  정책이 허락하면 Tier 1 우회 개방을 자동 실행합니다. 명령은 시뮬레이터에만 들어갑니다. */
 export function PhysicsPanel({ plant, supervisor, automation, onOpenIncident }: { plant: Plant; supervisor: string; automation: boolean; onOpenIncident: (id: string) => void }) {
   const terms = useTerms();
+  const t = useT();
   const [st, setSt] = useState<PhysicsStatus | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
 
@@ -105,35 +109,38 @@ export function PhysicsPanel({ plant, supervisor, automation, onOpenIncident }: 
   const hotEq = plant.equipment.find((e) => e.kks === hot?.kks);
   const valve = plant.equipment.find((e) => e.kks === plant.sensors.find((s) => s.tag === st?.shown[0])?.kks);
   const trip = hot?.trip_high ?? 0;
+  const stateLabel = stateLabels();
 
   return (
     <div className="physics">
       <div className="physics-controls">
-        <span className={`tag ${automation ? "auto" : ""}`}>{automation ? "🟢 자동화 모드" : `보조 모드 (${terms.supervisor} 실행)`}</span>
+        <span className={`tag ${automation ? "auto" : ""}`}>
+          {automation ? t("🟢 자동화 모드", "🟢 Automation Mode") : t(`보조 모드 (${terms.supervisor} 실행)`, `Assist Mode (run by ${terms.supervisor})`)}
+        </span>
         <button className="plain" onClick={() => call("physics_start")}>
-          {st?.running ? "↺ 정상 운전으로 리셋" : "▶ 시뮬레이터 시작"}
+          {st?.running ? t("↺ 정상 운전으로 리셋", "↺ Reset to normal operation") : t("▶ 시뮬레이터 시작", "▶ Start simulator")}
         </button>
         <button className="danger-fill" disabled={!st?.running} onClick={() => call("physics_inject", { kind: "valve_stuck" })}>
-          🔥 {valve?.name ?? "조절밸브"} 18% 고착 주입
+          🔥 {t(`${valve?.name ?? "조절밸브"} 18% 고착 주입`, `Inject ${valve?.name ?? "control valve"} stuck at 18%`)}
         </button>
         <button className="plain" disabled={!st?.running} onClick={() => call("physics_inject", { kind: "sensor_drift" })}>
-          📉 압력 전송기 A 드리프트
+          {t("📉 압력 전송기 A 드리프트", "📉 Pressure transmitter A drift")}
         </button>
         <button className="plain" disabled={!st?.running} onClick={() => call("physics_stop")}>
-          ■ 정지
+          {t("■ 정지", "■ Stop")}
         </button>
         <span className="muted">
-          물리 틱 100 ms · t = {st ? st.t_secs.toFixed(1) : "-"}s · {hotEq?.name ?? "하류"} 고점 {st ? fmt(st.peak_sh) : "-"} ℃ ({terms.trip} {fmt(trip)} ℃)
+          {t("물리 틱", "Physics tick")} 100 ms · t = {st ? st.t_secs.toFixed(1) : "-"}s · {hotEq?.name ?? t("하류", "downstream")} {t("고점", "peak")} {st ? fmt(st.peak_sh) : "-"} ℃ ({terms.trip} {fmt(trip)} ℃)
         </span>
       </div>
       {msg && <p className="note">{msg}</p>}
       <div className="two-col">
         <section>
-          <h4>[실시간 물리엔진 → 시계열 · SDS 트래킹 → 자율 복구 파형] (최근 60초)</h4>
+          <h4>{t("[실시간 물리엔진 → 시계열 · SDS 트래킹 → 자율 복구 파형] (최근 60초)", "[Live physics engine → time series · SDS tracking → autonomous recovery waveform] (last 60 s)")}</h4>
           {timeline ? (
-            <WaveChart timeline={timeline} traces={traces} sensors={plant.sensors} from={timeline.t0_ms} to={timeline.now_ms} markers={[{ at_ms: timeline.now_ms, label: "지금", color: "#ffffff" }]} height={96} />
+            <WaveChart timeline={timeline} traces={traces} sensors={plant.sensors} from={timeline.t0_ms} to={timeline.now_ms} markers={[{ at_ms: timeline.now_ms, label: t("지금", "Now"), color: "#ffffff" }]} height={96} />
           ) : (
-            <p className="muted">시뮬레이터를 시작하세요. 처음 25초는 정상 운전 기준 구간입니다.</p>
+            <p className="muted">{t("시뮬레이터를 시작하세요. 처음 25초는 정상 운전 기준 구간입니다.", "Start the simulator. The first 25 s are the normal-operation baseline.")}</p>
           )}
           <div className="physics-latest">
             {st?.latest.map(([tag, v]) => (
@@ -144,27 +151,27 @@ export function PhysicsPanel({ plant, supervisor, automation, onOpenIncident }: 
           </div>
         </section>
         <section>
-          <h4>[SDS 속성 트래킹 로그]</h4>
+          <h4>{t("[SDS 속성 트래킹 로그]", "[SDS attribute tracking log]")}</h4>
           <ul className="facts physics-log">
             {st?.events.map((e, i) => (
               <li key={i}>
-                ⏱ t = {e.t.toFixed(1)}s · <span className="mono">{e.tag}</span> {STATE_LABEL[e.from] ?? e.from} → <b>{STATE_LABEL[e.to] ?? e.to}</b> · {e.note}
+                ⏱ t = {e.t.toFixed(1)}s · <span className="mono">{e.tag}</span> {stateLabel[e.from] ?? e.from} → <b>{stateLabel[e.to] ?? e.to}</b> · {e.note}
               </li>
             ))}
             {st?.commands.map((c, i) => (
               <li key={`c${i}`} className="good">
-                ⚡ t = {c.t.toFixed(1)}s · 시뮬레이터 명령: 바이패스 {fmt(c.command.open_pct)}% 개방
+                ⚡ t = {c.t.toFixed(1)}s · {t(`시뮬레이터 명령: 바이패스 ${fmt(c.command.open_pct)}% 개방`, `Simulator command: open bypass ${fmt(c.command.open_pct)}%`)}
               </li>
             ))}
           </ul>
           {st?.call && (
             <p className="callout">
-              🔒 t = {st.call.t.toFixed(1)}s 사건 열림 · {st.call.trigger} · 고장 코드 <b className="mono">{st.call.fault ?? "-"}</b>
-              {st.call.lag_secs != null && <> · 변곡 시차 {st.call.lag_secs.toFixed(1)}s</>}
-              {st.call.onset_lag_secs != null && <> · 변화 시작(CUSUM) 시차 {st.call.onset_lag_secs.toFixed(1)}s</>}
+              🔒 t = {st.call.t.toFixed(1)}s {t("사건 열림", "Incident opened")} · {st.call.trigger} · {t("고장 코드", "fault code")} <b className="mono">{st.call.fault ?? "-"}</b>
+              {st.call.lag_secs != null && <> · {t("변곡 시차", "inflection lag")} {st.call.lag_secs.toFixed(1)}s</>}
+              {st.call.onset_lag_secs != null && <> · {t("변화 시작(CUSUM) 시차", "onset (CUSUM) lag")} {st.call.onset_lag_secs.toFixed(1)}s</>}
             </p>
           )}
-          <h4>[센서 신호 모양 (SDS 상태 코드)]</h4>
+          <h4>{t("[센서 신호 모양 (SDS 상태 코드)]", "[Sensor signal shape (SDS state codes)]")}</h4>
           <ul className="facts physics-log physics-signals">
             {st?.signals.map((e, i) => (
               <li key={`s${i}`}>
@@ -172,17 +179,17 @@ export function PhysicsPanel({ plant, supervisor, automation, onOpenIncident }: 
               </li>
             ))}
           </ul>
-          {st?.busy && <p className="note">🧠 Zoro-1 판단 중 (공정은 계속 움직입니다)</p>}
+          {st?.busy && <p className="note">{t("🧠 Zoro-1 판단 중 (공정은 계속 움직입니다)", "🧠 Zoro-1 is deciding (the process keeps running)")}</p>}
           {st?.note && <p className="callout">{st.note}</p>}
           {st?.incident && (
             <button className="plain" onClick={() => onOpenIncident(st.incident!)}>
-              사건 {st.incident} 열기 (판정 · 인터록 · 결재)
+              {t(`사건 ${st.incident} 열기 (판정 · 인터록 · 결재)`, `Open incident ${st.incident} (verdict · interlock · approval)`)}
             </button>
           )}
           {m && (
             <div className={`mitigation ${m.executed_at ? "done" : ""}`}>
               <h4>
-                [Tier 1 자율 대응] {m.label} {st?.proposed_t != null && <span className="muted">· 제안 t = {st.proposed_t.toFixed(1)}s</span>} {m.post_audit && <span className="tag">사후 샘플 감사 대상</span>}
+                {t("[Tier 1 자율 대응]", "[Tier 1 Autonomous Response]")} {m.label} {st?.proposed_t != null && <span className="muted">· {t("제안", "proposed")} t = {st.proposed_t.toFixed(1)}s</span>} {m.post_audit && <span className="tag">{t("사후 샘플 감사 대상", "Post-hoc sample audit")}</span>}
               </h4>
               <ul className="facts">
                 {m.gates.map(([g, ok], i) => (
@@ -201,15 +208,15 @@ export function PhysicsPanel({ plant, supervisor, automation, onOpenIncident }: 
                 </div>
               ))}
               <p>
-                최솟값(확신도) <b>{m.decided.judgement.confidence != null ? m.decided.judgement.confidence.toFixed(3) : "없음"}</b> · {m.auto ? "자동 실행" : `${terms.supervisor} 확인: ${m.reason}`}
+                {t("최솟값(확신도)", "min (confidence)")} <b>{m.decided.judgement.confidence != null ? m.decided.judgement.confidence.toFixed(3) : t("없음", "none")}</b> · {m.auto ? t("자동 실행", "Auto-run") : t(`${terms.supervisor} 확인: ${m.reason}`, `${terms.supervisor} check: ${m.reason}`)}
               </p>
               {m.executed_at ? (
                 <p className="good">
-                  ✓ 실행 · {m.executed_by}
+                  ✓ {t("실행", "Executed")} · {m.executed_by}
                 </p>
               ) : (
                 <button className="danger-fill" disabled={!supervisor.trim()} onClick={() => call("physics_execute", { supervisorId: supervisor })}>
-                  ⚡ 완화 조치 실행 ({terms.supervisor} {supervisor || "사번 필요"})
+                  ⚡ {t("완화 조치 실행", "Run mitigation")} ({terms.supervisor} {supervisor || t("사번 필요", "ID required")})
                 </button>
               )}
             </div>

@@ -1,7 +1,9 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke } from "./ipc";
+import { listen } from "./ipc";
 import { useEffect, useRef, useState } from "react";
-import { PLANT_TERMS, type DomainInfo, type Terms } from "./domain";
+import { PLANT_TERMS, PLANT_TERMS_EN, type DomainInfo, type Terms } from "./domain";
+import { useLanguageSync, useT, type Lang } from "./i18n";
+import { tr } from "./i18n/lang";
 import { SignaturePad, type SignatureStats } from "./SignaturePad";
 
 const RESET_SECONDS = 40;
@@ -36,14 +38,15 @@ interface ScanReply {
 
 /** 스캔 그림에서 그 항목을 읽은 조각만 잘라 보여 줍니다 (값과 1:1 눈대조). 아주 긴 띠는 왼쪽부터 잘라 보입니다. */
 function Crop({ src, size, box, raw }: { src: string; size: [number, number]; box: [number, number, number, number]; raw?: string }) {
+  const t = useT();
   const [x0, y0, x1, y1] = box;
   const ratio = Math.min(((x1 - x0) * size[0]) / Math.max((y1 - y0) * size[1], 1), 9);
   return (
-    <div className="crop" title={raw ? `스캔 원문: ${raw}` : undefined}>
+    <div className="crop" title={raw ? t(`스캔 원문: ${raw}`, `As scanned: ${raw}`) : undefined}>
       <div className="crop-view" style={{ aspectRatio: `${ratio}` }}>
         <img src={src} alt="" draggable={false} style={{ width: `${100 / (x1 - x0)}%`, transform: `translate(${-x0 * 100}%, ${-y0 * 100}%)` }} />
       </div>
-      {raw && <em className="mono">스캔 원문 {raw}</em>}
+      {raw && <em className="mono">{t(`스캔 원문 ${raw}`, `As scanned: ${raw}`)}</em>}
     </div>
   );
 }
@@ -53,19 +56,23 @@ function steps(unit: string | undefined): [number, number] {
   return unit?.trim().toLowerCase() === "bar" ? [0.1, 0.5] : [0.1, 1.0];
 }
 
-const PLANT_EXCUSES: [string, string][] = [
-  ["transmitter_drift", "현장 아날로그 게이지는 정상이나 전자식 전송기(Transmitter) 영점 흔들림 의심"],
-  ["moc_change", "계획예방정비 · 부품 교체(MOC)로 운전 압력 사양이 변경됨 (Red-line 도면 첨부)"],
-  ["manual_bypass", "현장 수동 바이패스(Bypass) 밸브 조작 중으로 일시적 유량 · 압력 편차 발생"],
-  ["free_text", "기타 현장 특이사항 직접 입력 (자유 서술 → Zoro-1이 표준 코드로 자동 분류)"],
+// 소명 고르기 [백엔드로 가는 코드, 화면 글]. 글은 그릴 때의 화면 언어로 만듭니다.
+const plantExcuses = (): [string, string][] => [
+  ["transmitter_drift", tr("현장 아날로그 게이지는 정상이나 전자식 전송기(Transmitter) 영점 흔들림 의심", "Local analog gauge reads normal; suspect zero drift in the electronic transmitter")],
+  ["moc_change", tr("계획예방정비 · 부품 교체(MOC)로 운전 압력 사양이 변경됨 (Red-line 도면 첨부)", "Operating pressure spec changed by planned maintenance / part replacement (MOC) (Red-line drawing attached)")],
+  ["manual_bypass", tr("현장 수동 바이패스(Bypass) 밸브 조작 중으로 일시적 유량 · 압력 편차 발생", "Temporary flow/pressure deviation while the bypass valve is operated by hand on site")],
+  ["free_text", tr("기타 현장 특이사항 직접 입력 (자유 서술 → Zoro-1이 표준 코드로 자동 분류)", "Other field condition (type it in → Zoro-1 sorts it into a standard code)")],
 ];
 
-const AIDC_EXCUSES: [string, string][] = [
-  ["transmitter_drift", "현장 아날로그 압력계 · 유량계는 정상이나 BMC 텔레메트리(전송기) 값 흔들림 의심"],
-  ["moc_change", "MOP(변경 작업)로 CDU · 랙 운전 사양이 변경됨 (Red-line 변경도 첨부)"],
-  ["manual_bypass", "현장 CDU 우회밸브 수동 조작 중으로 일시적 유량 · 압력 편차 발생"],
-  ["free_text", "기타 현장 특이사항 직접 입력 (자유 서술 → Zoro-1이 표준 코드로 자동 분류)"],
+const aidcExcuses = (): [string, string][] => [
+  ["transmitter_drift", tr("현장 아날로그 압력계 · 유량계는 정상이나 BMC 텔레메트리(전송기) 값 흔들림 의심", "Local analog pressure/flow gauges read normal; suspect unstable BMC telemetry (transmitter) values")],
+  ["moc_change", tr("MOP(변경 작업)로 CDU · 랙 운전 사양이 변경됨 (Red-line 변경도 첨부)", "CDU/rack operating spec changed by MOP (change work) (Red-line change drawing attached)")],
+  ["manual_bypass", tr("현장 CDU 우회밸브 수동 조작 중으로 일시적 유량 · 압력 편차 발생", "Temporary flow/pressure deviation while the CDU bypass valve is operated by hand on site")],
+  ["free_text", tr("기타 현장 특이사항 직접 입력 (자유 서술 → Zoro-1이 표준 코드로 자동 분류)", "Other field condition (type it in → Zoro-1 sorts it into a standard code)")],
 ];
+
+/** 창 제목 (한국어는 tauri.conf 의 제목 그대로) */
+const kioskTitle = (l: Lang) => (l === "en" ? "blueprint Field Patrol & Maintenance Terminal" : "blueprint 현장 순시 · 정비 단말");
 
 interface FieldReply {
   state: "sent" | "finished" | "hold" | "invalid" | "sign_again" | "excuse";
@@ -78,13 +85,24 @@ const STEP_OF: Record<Phase, number> = { start: 0, scanning: 0, pick: 1, form: 2
 
 /** 현장 순시 · 정비 운전원 단말 (기획 Part 8-2 2절). 내부 판정 코드 · 확신도 · 마인드맵은 이 화면에 오지 않습니다. */
 export function KioskView() {
+  const t = useT();
+  // 콘솔 설정에서 언어를 바꾸면 이 창도 따라가고 창 제목을 그 언어로 맞춥니다.
+  const lang = useLanguageSync(kioskTitle);
   const [domain, setDomain] = useState<DomainInfo | null>(null);
-  const terms: Terms = domain?.terms ?? PLANT_TERMS;
+  const terms: Terms = domain?.terms ?? (lang === "en" ? PLANT_TERMS_EN : PLANT_TERMS);
   const aidc = domain?.mode === "aidc";
-  const EXCUSES = aidc ? AIDC_EXCUSES : PLANT_EXCUSES;
-  // "대상 KKS 코드" · "대상 자산코드" (용어가 이미 "코드" 로 끝나면 덧붙이지 않습니다)
-  const codeLabel = terms.code.endsWith("코드") ? `대상 ${terms.code}` : `대상 ${terms.code} 코드`;
-  const STEPS = ["도면/계기 스캔", "관할 섹터 선택", `판독값 · ${aidc ? "LoTo" : "LOTO"} 서명`, `${terms.control_room} 전송`];
+  const EXCUSES = aidc ? aidcExcuses() : plantExcuses();
+  // "대상 KKS 코드" · "대상 자산코드" (용어가 이미 "코드" 로 끝나면 덧붙이지 않습니다). 영어는 "KKS Code" · "Asset Code".
+  const codeLabel = t(
+    terms.code.endsWith("코드") ? `대상 ${terms.code}` : `대상 ${terms.code} 코드`,
+    /(code|코드)$/i.test(terms.code) ? terms.code.charAt(0).toUpperCase() + terms.code.slice(1) : `${terms.code} Code`,
+  );
+  const STEPS = [
+    t("도면/계기 스캔", "Scan Drawing/Gauge"),
+    t("관할 섹터 선택", "Choose Sector"),
+    t(`판독값 · ${aidc ? "LoTo" : "LOTO"} 서명`, `Readings · ${aidc ? "LoTo" : "LOTO"} Sign-off`),
+    t(`${terms.control_room} 전송`, `Send to ${terms.control_room}`),
+  ];
   const [scanImage, setScanImage] = useState<string | null>(null);
   const [scanSize, setScanSize] = useState<[number, number] | null>(null);
   const [boxes, setBoxes] = useState<Record<string, [number, number, number, number]>>({});
@@ -114,10 +132,14 @@ export function KioskView() {
   const [hold, setHold] = useState(false);
   const receiptRef = useRef<string | null>(null);
 
+  // 구역 이름 · 용어는 백엔드 글이라 받을 때의 화면 언어로 옵니다 (번역은 invoke 감싸기). 언어가 바뀌면 다시 받습니다.
   useEffect(() => {
-    invoke<boolean>("field_ready").then(setReady);
     invoke<SectorChoice[]>("field_sectors").then(setSectors);
     invoke<DomainInfo>("domain_info").then(setDomain);
+  }, [lang]);
+
+  useEffect(() => {
+    invoke<boolean>("field_ready").then(setReady);
     // 관제 콘솔이 도메인을 바꾸면 처음 화면으로 돌아가 구역 · 용어를 다시 받습니다.
     const stopDomain = listen("domain_changed", () => {
       reset();
@@ -281,21 +303,21 @@ export function KioskView() {
 
   const sector = sectors.find((s) => s.key === values.sector);
   const missing = !values.worker_name?.trim()
-    ? "점검자 성함"
+    ? t("점검자 성함", "Inspector Name")
     : !values.worker_id?.trim()
-      ? "사번"
+      ? t("사번", "Employee ID")
       : !values.kks?.trim()
         ? codeLabel
         : kind === "redline"
           ? !values.moc_no?.trim()
-            ? `${terms.change} 변경번호`
+            ? t(`${terms.change} 변경번호`, `${terms.change} No.`)
             : !values.reading?.trim()
-              ? "변경 한계"
+              ? t("변경 한계", "New Limit")
               : !permit
-                ? `${terms.permit} 확인`
+                ? t(`${terms.permit} 확인`, `${terms.permit} Confirmation`)
                 : null
           : !values.reading?.trim()
-            ? "현장 실측치"
+            ? t("현장 실측치", "Field Reading")
             : null;
   const signMissing = !usePaper && !sig;
 
@@ -313,7 +335,7 @@ export function KioskView() {
       <div className={`field-card ${box ? "with-crop" : ""}`}>
         <span className="field-label">
           {label}
-          {corrected.includes(key) ? <em className="from-scan fixed">교정됨</em> : scanned.includes(key) ? <em className="from-scan">스캔됨</em> : null}
+          {corrected.includes(key) ? <em className="from-scan fixed">{t("교정됨", "Corrected")}</em> : scanned.includes(key) ? <em className="from-scan">{t("스캔됨", "Scanned")}</em> : null}
         </span>
         {box && scanImage && scanSize && <Crop src={scanImage} size={scanSize} box={box} raw={raw[key] !== values[key] ? raw[key] : undefined} />}
         <div className="value-row">
@@ -343,8 +365,9 @@ export function KioskView() {
     );
   };
   const eg = aidc
-    ? { id: "FE-205", kks: "DC1MNF10MV01", tag: "DC1MNF10CP01 (모르면 비워 두세요)", moc: "MOP-2026-1104", old: "3.0", now: "3.5", unit: "bar" }
-    : { id: "E205", kks: "10MAA10ST001", tag: "10MAA10CP001 (모르면 비워 두세요)", moc: "MOC-2026-1104", old: "29.0", now: "31.0", unit: "MPa" };
+    ? { id: "FE-205", kks: "DC1MNF10MV01", tag: t("DC1MNF10CP01 (모르면 비워 두세요)", "DC1MNF10CP01 (leave blank if unknown)"), moc: "MOP-2026-1104", old: "3.0", now: "3.5", unit: "bar" }
+    : { id: "E205", kks: "10MAA10ST001", tag: t("10MAA10CP001 (모르면 비워 두세요)", "10MAA10CP001 (leave blank if unknown)"), moc: "MOC-2026-1104", old: "29.0", now: "31.0", unit: "MPa" };
+  const example = (s: string) => t(`예: ${s}`, `e.g. ${s}`);
 
   return (
     <main className="kiosk">
@@ -361,17 +384,17 @@ export function KioskView() {
       </ol>
       {ready !== true ? (
         <section className="bot-card">
-          <h1>안내</h1>
-          <p>단말을 준비하고 있습니다. 잠시만 기다려 주세요.</p>
+          <h1>{t("안내", "Notice")}</h1>
+          <p>{t("단말을 준비하고 있습니다. 잠시만 기다려 주세요.", "Getting the terminal ready. Please wait a moment.")}</p>
         </section>
       ) : phase === "start" ? (
         <section className="kiosk-card start">
-          <h2>{aidc ? "현장 점검표, 매니폴드 압력계 사진, 또는 Red-line 변경도(MEP · MOP)를 스캐너에 넣어 주세요" : "현장 점검표, 아날로그 게이지 사진, 또는 수기 수정 도면(Red-line P&ID)을 스캐너에 넣어 주세요"}</h2>
-          <p className="lead">도면과 계기판 수치를 자동으로 읽어 칸을 채워 드립니다. 스캔할 도면이 없어도 현장 수치를 입력할 수 있습니다.</p>
+          <h2>{aidc ? t("현장 점검표, 매니폴드 압력계 사진, 또는 Red-line 변경도(MEP · MOP)를 스캐너에 넣어 주세요", "Place a field inspection sheet, a manifold pressure gauge photo, or a Red-line change drawing (MEP · MOP) in the scanner") : t("현장 점검표, 아날로그 게이지 사진, 또는 수기 수정 도면(Red-line P&ID)을 스캐너에 넣어 주세요", "Place a field inspection sheet, an analog gauge photo, or a hand-marked drawing (Red-line P&ID) in the scanner")}</h2>
+          <p className="lead">{t("도면과 계기판 수치를 자동으로 읽어 칸을 채워 드립니다. 스캔할 도면이 없어도 현장 수치를 입력할 수 있습니다.", "We read the drawing and gauge values and fill in the form for you. No drawing to scan? You can still enter field values.")}</p>
           {error && <p className="error">{error}</p>}
           <div className="start-actions">
             <button className="big green" onClick={scan}>
-              📷 도면/계기 스캔
+              📷 {t("도면/계기 스캔", "Scan Drawing/Gauge")}
             </button>
             <button
               className="big plain"
@@ -380,19 +403,19 @@ export function KioskView() {
                 setPhase("pick");
               }}
             >
-              스캔 없이 수치입력
+              {t("스캔 없이 수치입력", "Enter Values Without Scanning")}
             </button>
           </div>
         </section>
       ) : phase === "scanning" ? (
         <section className="bot-card">
           <div className="spinner" />
-          <p>도면 · 점검표를 읽고 있습니다</p>
-          <h1>SigLIP2 로 읽을 곳을 고르고 gocr 로 글자를 읽습니다</h1>
+          <p>{t("도면 · 점검표를 읽고 있습니다", "Reading the drawing and inspection sheet")}</p>
+          <h1>{t("SigLIP2 로 읽을 곳을 고르고 gocr 로 글자를 읽습니다", "SigLIP2 picks where to read, then gocr reads the text")}</h1>
         </section>
       ) : phase === "pick" ? (
         <section className="kiosk-card">
-          <h2>어느 섹터(건물)의 설비 점검인가요?</h2>
+          <h2>{t("어느 섹터(건물)의 설비 점검인가요?", "Which sector (building) is this equipment check for?")}</h2>
           <div className="choices">
             {sectors.map((s) => (
               <button
@@ -412,14 +435,17 @@ export function KioskView() {
           </div>
           <div className="actions">
             <button className="plain" onClick={reset}>
-              처음으로
+              {t("처음으로", "Start Over")}
             </button>
           </div>
         </section>
       ) : phase === "form" ? (
         <section className="kiosk-card">
           <h2>
-            {sector ? `${sector.building} ${sector.label}` : ""} {kind === "redline" ? "설비 변경(Red-line) 내용" : "점검 내용"}을 확인해 주세요
+            {t(
+              `${sector ? `${sector.building} ${sector.label}` : ""} ${kind === "redline" ? "설비 변경(Red-line) 내용" : "점검 내용"}을 확인해 주세요`,
+              `Please check the ${kind === "redline" ? "equipment change (Red-line)" : "inspection details"}${sector ? ` for ${sector.building} ${sector.label}` : ""}`,
+            )}
           </h2>
           {docs.length > 0 && (
             <div className="chips">
@@ -433,60 +459,69 @@ export function KioskView() {
           <div className="kind-switch">
             {(["gauge_card", "redline", "manual"] as Kind[]).map((k) => (
               <button key={k} className={kind === k ? "chip active" : "chip"} onClick={() => setKind(k)}>
-                {k === "gauge_card" ? "현장계기점검표" : k === "redline" ? "설비변경 Red-line" : "현장 수치 직접 입력"}
+                {k === "gauge_card" ? t("현장계기점검표", "Gauge Inspection Sheet") : k === "redline" ? t("설비변경 Red-line", "Equipment Change Red-line") : t("현장 수치 직접 입력", "Manual Field Entry")}
               </button>
             ))}
           </div>
           <div className="form-grid">
-            {field("worker_name", "점검자 성함", "예: 이승민")}
-            {field("worker_id", "사번", `예: ${eg.id}`)}
-            {field("kks", codeLabel, `예: ${eg.kks}`)}
-            {field("tag", "센서 태그", `예: ${eg.tag}`)}
+            {field("worker_name", t("점검자 성함", "Inspector Name"), t("예: 이승민", "e.g. Lee Seung-min"))}
+            {field("worker_id", t("사번", "Employee ID"), example(eg.id))}
+            {field("kks", codeLabel, example(eg.kks))}
+            {field("tag", t("센서 태그", "Sensor Tag"), example(eg.tag))}
             {kind === "redline" ? (
               <>
-                {field("moc_no", `${terms.change} 변경번호`, `예: ${eg.moc}`)}
-                {field("old_value", "기존 한계", `예: ${eg.old}`, true)}
-                {field("reading", "변경 한계", `예: ${eg.now}`, true)}
+                {field("moc_no", t(`${terms.change} 변경번호`, `${terms.change} No.`), example(eg.moc))}
+                {field("old_value", t("기존 한계", "Old Limit"), example(eg.old), true)}
+                {field("reading", t("변경 한계", "New Limit"), example(eg.now), true)}
               </>
             ) : (
-              field("reading", "현장 실측치", "숫자만", true)
+              field("reading", t("현장 실측치", "Field Reading"), t("숫자만", "Numbers only"), true)
             )}
-            {field("unit", "단위", `예: ${eg.unit}`)}
+            {field("unit", t("단위", "Unit"), example(eg.unit))}
           </div>
           <label className="check">
             <input type="checkbox" checked={permit} onChange={(e) => setPermit(e.target.checked)} />
-            {aidc ? "현장 작업허가(MOP/Hot-Work) 및 수냉 밸브 잠금표지(LoTo) 체결을 확인합니다" : "현장 안전작업허가(PTW) 및 잠금표지(LOTO) 절차를 준수했음을 확인합니다"} {kind === "redline" ? "(설비 변경은 필수)" : ""}
+            {aidc
+              ? t("현장 작업허가(MOP/Hot-Work) 및 수냉 밸브 잠금표지(LoTo) 체결을 확인합니다", "I confirm the field work permit (MOP/Hot-Work) and the coolant valve lockout/tagout (LoTo) are in place")
+              : t("현장 안전작업허가(PTW) 및 잠금표지(LOTO) 절차를 준수했음을 확인합니다", "I confirm I followed the field safe work permit (PTW) and lockout/tagout (LOTO) procedures")}{" "}
+            {kind === "redline" ? t("(설비 변경은 필수)", "(required for equipment changes)") : ""}
           </label>
           {paperSigned && (
             <label className="check">
               <input type="checkbox" checked={usePaper} onChange={(e) => setUsePaper(e.target.checked)} />
-              스캔한 문서의 서명 · 직인을 씁니다
+              {t("스캔한 문서의 서명 · 직인을 씁니다", "Use the signature/seal on the scanned document")}
             </label>
           )}
           {!usePaper && (
             <div className="signature-field">
-              <span className="field-label">작업자 서명 (획수 2회 이상 · 면적 15% 이상 · 직선 아님)</span>
+              <span className="field-label">{t("작업자 서명 (획수 2회 이상 · 면적 15% 이상 · 직선 아님)", "Worker Signature (2+ strokes · 15%+ of the pad · not a straight line)")}</span>
               <SignaturePad key={padKey} onChange={setSig} />
             </div>
           )}
-          {signFails >= 2 && <p className="muted">장갑 착용 등으로 서명이 어려우면 무전으로 {terms.control_room}에 사번 확인을 요청하세요.</p>}
+          {signFails >= 2 && <p className="muted">{t(`장갑 착용 등으로 서명이 어려우면 무전으로 ${terms.control_room}에 사번 확인을 요청하세요.`, `If gloves make signing hard, radio the ${terms.control_room} to confirm your employee ID.`)}</p>}
           {error && <p className="error">{error}</p>}
           <div className="actions">
             <button className="plain" disabled={busy} onClick={reset}>
-              처음으로
+              {t("처음으로", "Start Over")}
             </button>
             <button className="plain" disabled={busy} onClick={scan}>
-              도면/사진 더 넣기
+              {t("도면/사진 더 넣기", "Add Drawing/Photo")}
             </button>
             <button className="green" disabled={busy || missing !== null || signMissing} onClick={() => submit(null)}>
-              {busy ? "전송 중입니다" : missing ? `${missing} 칸을 채워 주세요` : signMissing ? "서명해 주세요" : `${terms.control_room}로 전송하기`}
+              {busy
+                ? t("전송 중입니다", "Sending…")
+                : missing
+                  ? t(`${missing} 칸을 채워 주세요`, `Required: ${missing}`)
+                  : signMissing
+                    ? t("서명해 주세요", "Please sign")
+                    : t(`${terms.control_room}로 전송하기`, `Send to ${terms.control_room}`)}
             </button>
           </div>
         </section>
       ) : phase === "excuse" ? (
         <section className="kiosk-card">
           <h2>⚠️ {excuseMessage}</h2>
-          <p className="lead">(보안 원칙에 따라 중앙 제어실 내부 원장 수치 및 판정 코드는 화면에 표시되지 않습니다)</p>
+          <p className="lead">{t("(보안 원칙에 따라 중앙 제어실 내부 원장 수치 및 판정 코드는 화면에 표시되지 않습니다)", "(For security, internal control room data is not shown on this screen)")}</p>
           <div className="excuses">
             {EXCUSES.map(([value, label]) => (
               <label key={value} className="check">
@@ -495,43 +530,51 @@ export function KioskView() {
               </label>
             ))}
           </div>
-          {excuse === "free_text" && <textarea rows={3} maxLength={300} value={excuseText} placeholder={aidc ? "예: 2층 매니폴드 퀵커플러 교체 뒤 누수 점검 중" : "예: 1층 윤활유 냉각기 스트레이너 차압 청소 중"} onChange={(e) => setExcuseText(e.target.value)} />}
+          {excuse === "free_text" && (
+            <textarea
+              rows={3}
+              maxLength={300}
+              value={excuseText}
+              placeholder={aidc ? t("예: 2층 매니폴드 퀵커플러 교체 뒤 누수 점검 중", "e.g. Leak check after replacing a 2F manifold quick coupler") : t("예: 1층 윤활유 냉각기 스트레이너 차압 청소 중", "e.g. Cleaning the 1F lube oil cooler strainer (differential pressure)")}
+              onChange={(e) => setExcuseText(e.target.value)}
+            />
+          )}
           {error && <p className="error">{error}</p>}
           <div className="actions">
             <button className="plain" disabled={busy} onClick={() => setPhase("form")}>
-              이전 화면
+              {t("이전 화면", "Back")}
             </button>
             <button className="green" disabled={busy || !excuse || (excuse === "free_text" && !excuseText.trim())} onClick={() => submit(excuse)}>
-              {busy ? "전송 중입니다" : "소명 포함 전송하기"}
+              {busy ? t("전송 중입니다", "Sending…") : t("소명 포함 전송하기", "Send with Justification")}
             </button>
           </div>
         </section>
       ) : phase === "sent" ? (
         <section className="kiosk-card done">
-          <h2>{terms.control_room}로 전송했습니다</h2>
+          <h2>{t(`${terms.control_room}로 전송했습니다`, `Sent to the ${terms.control_room}`)}</h2>
           <p className="receipt">
-            접수 번호 <strong>{receipt}</strong>
+            {t("접수 번호", "Receipt No.")} <strong>{receipt}</strong>
           </p>
-          <p className="lead">{terms.supervisor}이 확인하고 있습니다. 결과나 재점검 요청이 오면 이 화면에 나옵니다.</p>
+          <p className="lead">{t(`${terms.supervisor}이 확인하고 있습니다. 결과나 재점검 요청이 오면 이 화면에 나옵니다.`, `The ${terms.supervisor} is reviewing it. Any result or recheck request will show up on this screen.`)}</p>
           {notice && <pre className="notice-doc">{notice}</pre>}
           <div className="spinner" />
           <div className="actions">
             <button className="plain" onClick={reset}>
-              처음으로
+              {t("처음으로", "Start Over")}
             </button>
           </div>
         </section>
       ) : (
         <section className={`kiosk-card done ${hold ? "hold" : ""}`}>
-          <h2>{hold ? "확인이 필요합니다" : "처리가 끝났습니다"}</h2>
+          <h2>{hold ? t("확인이 필요합니다", "Further check needed") : t("처리가 끝났습니다", "Processing complete")}</h2>
           <p className="receipt">
-            접수 번호 <strong>{receipt}</strong>
+            {t("접수 번호", "Receipt No.")} <strong>{receipt}</strong>
           </p>
           <pre className="notice-doc">{notice}</pre>
-          <p className="muted">{RESET_SECONDS}초 뒤 처음 화면으로 돌아갑니다.</p>
+          <p className="muted">{t(`${RESET_SECONDS}초 뒤 처음 화면으로 돌아갑니다.`, `Returning to the start screen in ${RESET_SECONDS} seconds.`)}</p>
           <div className="actions">
             <button className="green" onClick={reset}>
-              처음으로
+              {t("처음으로", "Start Over")}
             </button>
           </div>
         </section>
