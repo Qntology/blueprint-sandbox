@@ -76,14 +76,42 @@ async function waitText(page, text, timeout = 240000) {
   await page.waitForFunction((t) => document.body.innerText.includes(t), text, { timeout });
 }
 
+// 2차 개선안(풀스크린 오버레이): 사건 대기열 · 시뮬레이터는 좌상단 [🚨 사건 대기열] 알약의 팝오버 안에 있습니다.
+async function openQueue(page) {
+  if (await page.locator("#incident-popover").isHidden()) await page.locator(".queue-pill").click();
+  await page.locator("#incident-popover").waitFor({ state: "visible", timeout: 10000 });
+}
+
+async function closeQueue(page) {
+  if (await page.locator("#incident-popover").isVisible()) await page.locator("#incident-popover .ov-close").click();
+}
+
 async function inject(page, id) {
+  await openQueue(page);
   await page.selectOption("select.sim", id);
 }
 
+// 시나리오 주입은 끝나면 새 사건을 스스로 고르고 팝오버를 닫습니다. 그 전에 목록에 뜨면 E2E 가 누릅니다 (어느 쪽이 먼저든 같은 사건).
 async function openIncident(page, scenario) {
-  const item = page.locator(".queue-item", { hasText: `${scenario} · ` }).first();
+  const end = Date.now() + 240000;
+  while (Date.now() < end) {
+    if ((await page.locator(`main.console[data-scenario="${scenario}"]`).count()) > 0) break;
+    await openQueue(page).catch(() => {});
+    const item = page.locator(".queue-item", { hasText: `${scenario} · ` }).first();
+    if (await item.isVisible().catch(() => false)) await item.click({ timeout: 3000 }).catch(() => {});
+    await sleep(1500);
+  }
+  assert((await page.locator(`main.console[data-scenario="${scenario}"]`).count()) > 0, `${scenario} 사건을 열지 못했습니다`);
+  await closeQueue(page);
+  await sleep(1500);
+}
+
+async function clickQueueItem(page, text) {
+  await openQueue(page);
+  const item = page.locator(".queue-item", { hasText: text }).first();
   await item.waitFor({ timeout: 240000 });
   await item.click();
+  await closeQueue(page);
   await sleep(1500);
 }
 
@@ -220,9 +248,7 @@ async function p3(c, f, forged) {
   await noLeak(f, "Red-line 전송");
   await shot(f, `${id}-2-field-sent`);
   await sleep(1500);
-  const item = c.locator(".queue-item", { hasText: "현장 보고" }).first();
-  await item.click();
-  await sleep(1500);
+  await clickQueueItem(c, "현장 보고");
   await stage(c, 3);
   await shot(c, `${id}-3-stage3`);
   await closeDrawer(c);
@@ -256,16 +282,30 @@ async function p4(c) {
 }
 
 // A0 종합 도면 (Part 8-4): 4×4 타일 격자, 선택 설비 타일 강조, 타일 확대
-// 앞 흐름이 남긴 검색 목록 · 서랍을 닫습니다.
+// 앞 흐름이 남긴 확대 창 · 서랍 · 팝오버 · 검색 결과를 닫습니다.
 async function tidy(c) {
-  if (await c.locator(".search-results").count()) await c.locator(".search-input").press("Escape");
+  if (await c.locator(".cz-card").count()) await c.locator(".cz-card .ov-close").click();
   const close = c.locator(".drawer header button", { hasText: "닫기" });
   if (await close.count()) await close.first().click();
+  await closeQueue(c);
+  if (await c.locator(".settings-popover").isVisible()) await c.locator(".settings-popover .ov-close").click();
+  if (await c.locator(".search-results").count()) await c.locator(".search-results .ov-close").click();
+  if (await c.locator(".telemetry-dropup").count()) await c.locator(".telemetry-dropup .ov-close").click();
   await sleep(300);
 }
 
-async function a0(c) {
+/** 판이 모두 닫힌 뒤 ESC 를 누르면 검색 표시 → 설비 선택이 풀립니다 (말풍선이 타일 · 상자를 가리지 않게). */
+async function deselect(c) {
   await tidy(c);
+  await c.evaluate(() => document.activeElement && document.activeElement.blur && document.activeElement.blur());
+  for (let i = 0; i < 4 && (await c.locator(".cctv").count()) > 0; i++) {
+    await c.keyboard.press("Escape");
+    await sleep(300);
+  }
+}
+
+async function a0(c) {
+  await deselect(c);
   await c.locator(".tab", { hasText: "P&ID" }).click();
   await c.locator(".chip", { hasText: "A0 종합" }).click();
   await c.waitForSelector(".a0-sheet img", { timeout: 30000 });
@@ -279,7 +319,7 @@ async function a0(c) {
   results.push({ id: "A0", ok: true });
 }
 
-// 자연어 검색 (logis-center 방식)
+// 자연어 검색 (logis-center 방식, 2차 개선안: 하단 허브의 커맨드 바 · 결과 Drop-up · 한 줄 요약)
 /** 질의를 넣고 결과 첫 줄을 돌려줍니다. 결과가 이 질의의 것으로 바뀔 때까지(첫 줄에 기대값이 나오거나 10초) 기다립니다. */
 async function searchTop(c, q, want) {
   const box = c.locator(".search-input");
@@ -297,23 +337,42 @@ async function searchTop(c, q, want) {
 
 async function searchFlow(c) {
   await tidy(c);
+  // 셋째 줄은 선택 설비 문맥 질의: 둘째 질의의 1위(주급수펌프)가 자동으로 골라지고, "상류 1홉" 만 쳐도 그 설비 기준으로 찾습니다.
   const queries = [
     ["103동 2층 밸브", "10LAB20AA10"],
     ["주급수 유량조절밸브 상류 1홉", "10LAB10AP001"],
+    ["상류 1홉", null],
     ["105동 밸브 유인통풍기", "10HLB10AN001"],
     ["승인 대기 MOC", "MOC-2026-1021"],
   ];
   let k = 0;
+  const record = { id: "SEARCH" };
   for (const [q, want] of queries) {
     k += 1;
     const box = c.locator(".search-input");
-    const first = await searchTop(c, q, want);
-    assert(first.includes(want), `검색 '${q}' 첫 결과에 ${want} 가 없습니다: ${first}`);
+    if (want === null) {
+      const chip = await c.locator(".command-bar .unit-tag.on").innerText();
+      assert(chip.includes("10LAB10AP001"), `앞 질의 1위가 선택 설비 문맥이 되지 않았습니다: ${chip}`);
+      await box.fill(q);
+      await box.press("Enter");
+      await waitText(c, "연결 기준 설비 10LAB10AP001", 15000);
+      const toast = await c.locator(".cmd-toast.ok, .cmd-toast.info").last().innerText();
+      assert(toast.includes("문맥 10LAB10AP001"), `문맥 질의 요약에 기준 설비가 없습니다: ${toast}`);
+      record.context = toast;
+    } else {
+      const first = await searchTop(c, q, want);
+      assert(first.includes(want), `검색 '${q}' 첫 결과에 ${want} 가 없습니다: ${first}`);
+    }
+    if (k === 1) {
+      // 1위 설비가 골라지고 도면 위 말풍선에 "왜" 리본이 붙습니다
+      await c.locator(".cctv .cctv-why").first().waitFor({ timeout: 10000 });
+      record.why = await c.locator(".cctv .cctv-why").first().innerText();
+    }
     await shot(c, `SEARCH-${k}`);
-    await box.press("Escape");
+    await box.fill("");
   }
   await tidy(c);
-  results.push({ id: "SEARCH", ok: true });
+  results.push({ ...record, ok: true });
 }
 
 // 물리엔진 폐루프 (Part 8-5): 정상 운전 → 밸브 고착 주입 → SDS 추적 → 사건 → 완화 조치 (보조 모드면 교대감독 실행) → 회복
@@ -357,8 +416,10 @@ async function phys(c) {
     const first = await searchTop(c, q, want);
     assert(first.includes(want) && first.includes(cond), `고장 중 검색 '${q}' 첫 결과에 ${want} · ${cond} 가 없습니다: ${first}`);
     await shot(c, `PHYS-1${"bc"[n - 1]}-search`);
-    await c.locator(".search-input").press("Escape");
+    await c.locator(".search-input").fill("");
   }
+  // 물리엔진 서랍은 허브 위에서 멈추므로 검색 결과판이 서랍 뒤에 남지 않게 닫습니다
+  if (await c.locator(".search-results").count()) await c.locator(".search-results .ov-close").click();
   await waitText(c, "Tier 1 자율 대응", 240000);
   await shot(c, "PHYS-2-mitigation");
   const run = c.locator(".drawer button", { hasText: "완화 조치 실행" });
@@ -381,33 +442,91 @@ async function phys(c) {
 
 // ───────── 개선안: CCTV형 통합 관제판 ─────────
 
-// 가운데 위 CAM-01(도면) · 아래 CAM-02(시계열) · CAM-03(SDS) · 오른쪽 통합 결재창이 사건 하나로 함께 떠 있는지 봅니다.
+// 2차 개선안: 도면이 무대 전체에 깔리고(빈 자리 높이를 거의 다 씀), 근본 원인 · 경보 설비에 CCTV 말풍선이 지시선으로 붙고,
+// 결재 HUD · 하단 허브(파이프라인 · 3줄 미니 파형 · 질의)가 떠 있는지 봅니다. CAM-02 · 03 은 허브의 [📈] Drop-up 안에 있습니다.
+async function visibleCards(c) {
+  return c.locator(".cctv").evaluateAll((els) => els.filter((e) => e.style.visibility !== "hidden" && e.offsetWidth > 0).map((e) => e.dataset.card));
+}
+
 async function cctv(c) {
   await tidy(c);
   await inject(c, "P2");
   await openIncident(c, "P2");
   await c.locator(".tab", { hasText: "P&ID" }).click();
+  await c.waitForSelector(".sheet img", { timeout: 30000 });
   await sleep(1500);
   const text = await c.evaluate(() => document.body.innerText);
-  for (const want of ["CAM-01", "CAM-02", "CAM-03", "감지된 핵심 병목", "인터록 게이트", "표준 조치 요약", "STUCK_LOW"]) {
+  for (const want of ["감지된 핵심 병목", "인터록 게이트", "표준 조치 요약", "STUCK_LOW", "CAM-EQ"]) {
     assert(text.includes(want), `CCTV 관제판에 '${want}' 가 없습니다`);
   }
-  assert((await c.locator(".sds-chip").count()) > 0, "도면 설비 상자에 SDS 상태 칩이 없습니다");
+  // 도면 크기: 결재 HUD 를 뺀 빈 자리에 맞춰 그립니다 (예전 6 : 4 분할에서는 410 × 290 px 였습니다)
+  const geo = await c.evaluate(() => {
+    const r = (s) => document.querySelector(s).getBoundingClientRect();
+    const st = r(".stage");
+    const sh = r(".sheet");
+    return { stage: [Math.round(st.width), Math.round(st.height)], sheet: [Math.round(sh.width), Math.round(sh.height)] };
+  });
+  assert(geo.sheet[1] >= (geo.stage[1] - 60) * 0.85, `도면이 무대 높이를 다 쓰지 않습니다 ${JSON.stringify(geo)}`);
+  const cards = await visibleCards(c);
+  assert(cards.includes("10LAB20AA102"), `근본 원인(주급수 유량조절밸브)에 CCTV 말풍선이 없습니다: ${cards}`);
+  assert(cards.includes("10HAH10BB001"), `다른 도면의 경보 설비(과열기) 말풍선이 점프 커넥터에 붙지 않았습니다: ${cards}`);
+  assert((await c.locator(".cctv-remote").count()) > 0, "다른 도면 설비 말풍선에 점프 커넥터 안내가 없습니다");
+  const lines = await c.locator(".cctv-lines line").evaluateAll((els) => els.filter((e) => e.style.display !== "none").length);
+  assert(lines >= 2, `CCTV 지시선이 ${lines} 개뿐입니다`);
   assert((await c.locator(".lag-label").count()) > 0, "원인 경로 배관에 Δt 라벨이 없습니다");
+  assert((await c.locator(".scrub-waves polyline").count()) >= 2, "허브 타임머신에 미니 파형 줄이 없습니다");
+  // 말풍선이 결재 HUD · 허브 · 코너 알약과 겹치지 않습니다
+  const overlap = await c.evaluate(() => {
+    const boxes = [...document.querySelectorAll(".ov-avoid")].map((e) => e.getBoundingClientRect()).filter((r) => r.width > 0);
+    return [...document.querySelectorAll(".cctv")]
+      .filter((e) => e.style.visibility !== "hidden")
+      .map((e) => e.getBoundingClientRect())
+      .some((a) => boxes.some((b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom));
+  });
+  assert(!overlap, "CCTV 말풍선이 떠 있는 판과 겹칩니다");
   await shot(c, "CCTV-1-p2");
-  // 재생 슬라이더를 발원 직후로 옮기면 SDS 전이와 도면 칩이 그 시각으로 바뀝니다.
+  // 허브의 [📈 CAM-02·03] → 시계열 · SDS 로직 차트 Drop-up
+  await c.locator(".charts-toggle").click();
+  await c.locator(".telemetry-dropup").waitFor({ timeout: 10000 });
+  const charts = await c.locator(".telemetry-dropup").innerText();
+  assert(charts.includes("CAM-02") && charts.includes("CAM-03"), "차트 Drop-up 에 CAM-02 · CAM-03 이 없습니다");
+  await shot(c, "CCTV-2-charts");
+  await c.locator(".telemetry-dropup .ov-close").click();
+  // 재생 슬라이더를 발원 직후로 옮기면 SDS 전이와 말풍선 파형이 그 시각으로 바뀝니다.
   await c.locator(".scrubber button", { hasText: "발원점" }).click();
   await sleep(800);
-  await shot(c, "CCTV-2-origin");
+  await shot(c, "CCTV-3-origin");
+  // 말풍선 [🔍 파형 확대] → 확대 창, ESC 로 닫힘
+  await c.locator('.cctv[data-card="10LAB20AA102"] button', { hasText: "파형 확대" }).click();
+  await c.locator(".cz-card").waitFor({ timeout: 10000 });
+  await shot(c, "CCTV-4-zoom");
+  await c.keyboard.press("Escape");
+  await c.locator(".cz-card").waitFor({ state: "detached", timeout: 5000 });
+  // 결재 HUD 를 접으면 도면이 오른쪽 빈 자리까지 넓어집니다
+  await c.locator(".approval-hud .bh-toggle").click();
+  await sleep(600);
+  const wide = await c.evaluate(() => Math.round(document.querySelector(".sheet").getBoundingClientRect().width));
+  await shot(c, "CCTV-5-hud-folded");
+  await c.locator(".approval-hud .bh-toggle").click();
+  await sleep(400);
+  // [📋 인터록 이동] → HUD 의 인터록 칸
+  await c.locator('.cctv[data-card="10LAB20AA102"] button', { hasText: "인터록 이동" }).click();
+  await c.locator(".approval-hud .il-step").first().waitFor({ timeout: 5000 });
+  // 발원점(t = 0)에서는 아직 변곡을 지난 노드가 없습니다 (탐지된 첫 변곡은 추정 발원 시각보다 조금 뒤). 분석 시각으로 돌려 핀을 봅니다.
+  await c.locator(".scrubber button", { hasText: "분석 시각" }).click();
   await c.locator(".tab", { hasText: "마인드맵" }).click();
   await sleep(2500);
-  await shot(c, "CCTV-3-mindmap");
+  assert((await c.locator(".mm-pin").count()) > 0, "마인드맵 변곡 노드에 유리 핀이 없습니다");
+  assert((await visibleCards(c)).length > 0, "마인드맵에 CCTV 말풍선이 없습니다");
+  await shot(c, "CCTV-6-mindmap");
   await c.locator(".tab", { hasText: "Mermaid" }).click();
   await c.waitForSelector(".mermaid-host svg", { timeout: 60000 });
   await waitText(c, "SDS:", 30000);
-  await shot(c, "CCTV-4-mermaid");
+  await sleep(800);
+  assert((await visibleCards(c)).length > 0, "Mermaid 노드에 CCTV 말풍선이 없습니다");
+  await shot(c, "CCTV-7-mermaid");
   await c.locator(".tab", { hasText: "P&ID" }).click();
-  results.push({ id: "CCTV", ok: true });
+  results.push({ id: "CCTV", ok: true, ...geo, folded_width: wide, cards });
 }
 
 // ───────── 추가 개선안: AI 데이터센터 모드 ─────────
@@ -422,6 +541,9 @@ async function switchDomain(c, label, brand) {
 async function aidc(c, f) {
   await switchDomain(c, "AI 데이터센터", "AI 데이터센터 자율 관제 콘솔");
   await waitText(f, "AI 데이터센터 현장 엔지니어 단말", 30000);
+  // 도면 칩은 도면 뷰의 도구줄에 있습니다 (앞 흐름이 다른 뷰에서 멈췄을 수 있음)
+  await c.locator(".tab", { hasText: "도면" }).click();
+  await sleep(800);
   const text = await c.evaluate(() => document.body.innerText);
   assert(text.includes("MEP-103-CDU"), "데이터센터 도면 칩이 없습니다");
   assert(!text.includes("INC-"), "도메인을 바꾸면 사건 목록이 비어야 합니다");
@@ -525,8 +647,7 @@ async function d3(c, f, forged) {
   await waitText(f, "접수 번호");
   await noLeak(f, `${id} 전송`);
   await sleep(1500);
-  await c.locator(".queue-item", { hasText: "현장 보고" }).first().click();
-  await sleep(1500);
+  await clickQueueItem(c, "현장 보고");
   await stage(c, 3);
   await shot(c, `${id}-2-stage3`);
   await closeDrawer(c);

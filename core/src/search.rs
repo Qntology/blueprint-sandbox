@@ -671,25 +671,20 @@ pub fn search(db: &Lattice, corpus: &Corpus, query: &str) -> SearchResult {
         }
     }
 
-    // 2) 식별자: KKS · 태그는 원장으로 교정
+    // 2) 식별자: KKS · DCIM 코드와 태그는 원장으로 교정. 원장에 그대로 있는 코드(설비든 태그든)를 먼저 봅니다:
+    //    태그 교정을 먼저 하면 설비 10LAB10AP001 이 한 글자 다른 태그 10LAB10CP001 로 "교정" 됩니다 (콘솔이 선택 설비 코드를 붙여 묻는 문맥 질의에서 드러남).
+    //    DCIM 코드는 글자로 시작하므로(`DC1CDU20AA02`) 첫 글자가 숫자인지가 아니라 12자리 영숫자인지로 봅니다.
     let mut ids: Vec<String> = Vec::new();
     for w in &words {
         let raw = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-').to_uppercase();
-        if raw.len() == 12 && raw.starts_with(|c: char| c.is_ascii_digit()) {
-            match db.match_tag(&raw) {
-                KksMatch::Exact(c) => ids.push(c),
-                KksMatch::Corrected { code, raw, distance } => {
+        if raw.len() == 12 && raw.chars().all(|c| c.is_ascii_alphanumeric()) && raw.chars().any(|c| c.is_ascii_digit()) {
+            match (db.match_tag(&raw), db.match_kks(&raw)) {
+                (KksMatch::Exact(c), _) | (_, KksMatch::Exact(c)) => ids.push(c),
+                (KksMatch::Corrected { code, raw, distance }, _) | (_, KksMatch::Corrected { code, raw, distance }) => {
                     notes.push(format!("식별자 교정 {raw} → {code} (편집 거리 {distance})"));
                     ids.push(code);
                 }
-                _ => match db.match_kks(&raw) {
-                    KksMatch::Exact(c) => ids.push(c),
-                    KksMatch::Corrected { code, raw, distance } => {
-                        notes.push(format!("식별자 교정 {raw} → {code} (편집 거리 {distance})"));
-                        ids.push(code);
-                    }
-                    _ => {}
-                },
+                _ => {}
             }
         } else if raw.contains('-') && raw.len() >= 8 {
             ids.push(raw);
@@ -1063,6 +1058,31 @@ mod tests {
         let r = search(&db, &corpus, "105동 밸브 유인통풍기");
         assert!(r.conditions.iter().any(|c| c.kind == "설비 종류" && !c.applied), "{:?}", r.conditions);
         assert_eq!(top(&r, 1), vec!["10HLB10AN001".to_string()]);
+    }
+
+    #[test]
+    fn an_exact_code_is_not_corrected_into_a_neighbouring_tag() {
+        let db = Lattice::embedded().unwrap();
+        let corpus = Corpus::build(&db, None, None);
+        // 설비 10LAB10AP001 은 태그 10LAB10CP001 과 한 글자 다릅니다. 원장에 그대로 있는 코드는 교정하지 않고 연결 기준으로 씁니다
+        // (콘솔의 선택 설비 문맥 질의 "상류 1홉" → "10LAB10AP001 상류 1홉").
+        let r = search(&db, &corpus, "10LAB10AP001 상류 1홉");
+        assert!(!r.notes.iter().any(|n| n.contains("식별자 교정")), "{:?}", r.notes);
+        assert!(r.notes.iter().any(|n| n.contains("연결 기준 설비 10LAB10AP001")), "{:?}", r.notes);
+        assert!(r.hits[0].passed && r.hits[0].doc.kks.as_deref() != Some("10LAB10AP001"), "{:?}", top(&r, 5));
+        // 오독은 여전히 교정합니다
+        let r = search(&db, &corpus, "10LABI0AA102 상류 1홉");
+        assert!(r.notes.iter().any(|n| n.contains("식별자 교정") && n.contains("10LAB20AA102")), "{:?}", r.notes);
+    }
+
+    #[test]
+    fn a_dcim_asset_code_anchors_a_relational_query() {
+        // DCIM 코드는 글자로 시작합니다 (DC1CDU20AA02). 식별자로 읽혀야 "상류 1홉" 의 기준이 됩니다.
+        let db = Lattice::embedded_for(crate::domain::DomainMode::AiDataCenter).unwrap();
+        let corpus = Corpus::build(&db, None, None);
+        let r = search(&db, &corpus, "DC1CDU20AA02 상류 1홉");
+        assert!(r.notes.iter().any(|n| n.contains("연결 기준 설비 DC1CDU20AA02")), "{:?}", r.notes);
+        assert!(r.conditions.iter().any(|c| c.applied && c.text.contains("DC1CDU20AA02")), "{:?}", r.conditions);
     }
 
     #[test]

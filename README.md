@@ -2,7 +2,7 @@
 
 물리적 폐쇄망의 1.2GW 초초임계압(USC) 석탄화력발전소에서, 알람이 나면 **P&ID 도면 위에 위치를 찍고**, **계통 마인드맵을 상류로 거슬러 근본 원인을 찾고**, **Zoro-1 로 원인 판정과 비정상 운전절차서(AOP) 초안을 만드는** 온디바이스 관제 파이프라인입니다. 기획은 [docs/powerplant-control-plan.md](docs/powerplant-control-plan.md)(Part 8 · 8-1 · 8-1B · 8-2), [docs/powerplant-timeseries-sds-plan.md](docs/powerplant-timeseries-sds-plan.md)(Part 8-3), 개선안 [docs/powerplant-a0-interlock-plan.md](docs/powerplant-a0-interlock-plan.md)(Part 8-4) · [docs/powerplant-physics-auto-plan.md](docs/powerplant-physics-auto-plan.md)(Part 8-5) · [docs/powerplant-multi-issue-plan.md](docs/powerplant-multi-issue-plan.md)(Part 8-6) 입니다. 자연어 검색은 logis-center 의 방식을 옮겼습니다 ([docs/search.md](docs/search.md)). 글자 없는 설비 심볼 · KKS 없는 판독 · 시계열 / SDS 고도화는 [docs/powerplant-symbol-plan.md](docs/powerplant-symbol-plan.md) 입니다.
 
-콘솔 머리의 스위치 하나로 **100MW 하이퍼스케일 AI 데이터센터**(DLC 수냉 GPU 클러스터: CDU 냉각수 유량 → GPU 정션 온도)로 바꿔 같은 엔진 · 같은 모델로 관제합니다 ([docs/aidc-control-plan.md](docs/aidc-control-plan.md), 합성 데이터 [docs/synthetic-aidc-data.md](docs/synthetic-aidc-data.md)). 콘솔은 CCTV형 통합 관제판입니다: 위는 3-Way 도면, 아래는 시계열 · SDS 로직 차트, 오른쪽은 병목 · 인터록 · 결재가 늘 함께 떠 있습니다 ([docs/cctv-console-plan.md](docs/cctv-console-plan.md)).
+콘솔 머리의 스위치 하나로 **100MW 하이퍼스케일 AI 데이터센터**(DLC 수냉 GPU 클러스터: CDU 냉각수 유량 → GPU 정션 온도)로 바꿔 같은 엔진 · 같은 모델로 관제합니다 ([docs/aidc-control-plan.md](docs/aidc-control-plan.md), 합성 데이터 [docs/synthetic-aidc-data.md](docs/synthetic-aidc-data.md)). 콘솔은 풀스크린 오버레이 관제판입니다: 고른 3-Way 도면이 화면 전체에 깔리고, 그 위에 근본 원인 · 경보 · 선택 설비의 CCTV 말풍선(60초 파형 · 도면 조각)이 지시선으로 붙고, 병목 · 인터록 · 결재 HUD 와 파이프라인 · 타임머신 · 자연어 질의 허브가 반투명 유리 판으로 떠 있습니다 ([docs/overlay-console-plan.md](docs/overlay-console-plan.md), 앞 단계 [docs/cctv-console-plan.md](docs/cctv-console-plan.md)).
 
 - **바탕**: [zoro-gravity](https://github.com/Qntology/zoro-gravity) 의 구조를 그대로 따릅니다. 5-Gate 파이프라인 · 자동화 정책(보조 모드 기본, 불리한 판정 자동 확정 금지) · 감사 로그 · 사실 대조(`factcheck`) · Tauri 두 창 앱.
 - **AI 엔진 · 모델**: zoro-gravity 의 `core/src/ai` 와 **같은 모델**(SigLIP2 크롭 · gocr 문서 인식 · Zoro-1 판단 · 글쓰기)을 씁니다. 모델은 zoro-gravity 의 앱 데이터 폴더에서 **가져옵니다**(큰 가중치는 하드 링크). [docs/engine.md](docs/engine.md)
@@ -22,10 +22,11 @@
 | Part 8-4 A0 · 시계열 질의 · 인터록 | `tiling.rs`, `tsdb.rs`, `interlock.rs`, `A0View.tsx` | 구현. A0 4×4 타일 판독 · 전역 좌표 · 중복 병합, 정적 시드 + 60초 링버퍼 질의(촬영 시각 값 · 구간 요약 · 변곡 시차), 절차서 선행 절차 3단계(깊이 순서 강제 · 미완료 확정 차단) | A0 실측: 타일 35/35 · 251 s, 원장 상자 빠른 확인 35/35 · 33 s (300 DPI: 타일 566 s · 상자 30 s), 상자 하나 재확인 2.2 s, 인터록 순서 위반 차단 |
 | Part 8-5 물리엔진 · 자율 대응 | `physics.rs`, `mitigation.rs`, `PhysicsPanel.tsx` | 구현. 급수 계통 100 ms 물리엔진 · 고장 주입 · SDS 상태 추적 · Tier 1 우회 개방(자동화 모드 ∧ 규칙 ∧ 네 기준 ≥ 0.95, 명령은 시뮬레이터에만) | 폐루프 시험: 밸브 고착 → 사건 → 자동 우회 → 과열기 고점 트립 전 |
 | Part 8-6 이슈 분해 | `issues.rs`, `SidePanel.tsx` | 구현. 단일 · 절차 · 복합 이슈 카탈로그(A-1 ~ C-3)와 하위 이슈 분해 트리 | P2 = 복합(C-1 + B-3), P1 = 단일(A-1), P4 = 단일(A-2) |
-| 자연어 검색 (logis-center 방식) | `search.rs`, `SearchBox.tsx` | 구현. 유형 먼저(머리 낱말 규칙) · 조건 대조 후 힌트로 내림 · 전체 질의 경로 RRF · 구제 · 식별자 교정 · 질적 상태(높음 · 고착 · 비정상 …, 지금 계측이 있을 때만 필터) · "왜 찾았나" | 계측 없음 17개 MRR 0.941 · Hit@1 15/17, P2 재생 계측 7개 MRR 0.929 · Hit@1 6/7 ([docs/search.md](docs/search.md)) |
+| 자연어 검색 (logis-center 방식) | `search.rs`, `cctv/CommandBar.tsx` | 구현. 유형 먼저(머리 낱말 규칙) · 조건 대조 후 힌트로 내림 · 전체 질의 경로 RRF · 구제 · 식별자 교정 · 질적 상태(높음 · 고착 · 비정상 …, 지금 계측이 있을 때만 필터) · "왜 찾았나" | 계측 없음 17개 MRR 0.941 · Hit@1 15/17, P2 재생 계측 7개 MRR 0.929 · Hit@1 6/7 ([docs/search.md](docs/search.md)) |
 | 개선안: 설비 심볼 · KKS 없는 판독 | `symbols.rs`, `identify.rs`, `gen_pid_drawings.py` 심볼 범례 | 구현. 상자 오른쪽 위 심볼 10종, 잉크 연결 요소 후보 + SigLIP2 그림 사전(`symbol_dict.bin`, `crop_probe.bin` 과 별도), 이름 · 위치 · 계기 태그 · 항목 · 좌표 · 심볼 단서로 KKS 없이 설비 판독(애매하면 사람) | 시험 표본 191/200 맞음 · 틀림 0, 마스터 심볼 32/32 찾음 · 31 분류, 명판 훼손 L1 35/35 · L2 34/35 · L3 32/35 · 틀림 0 ([docs/powerplant-symbol-plan.md](docs/powerplant-symbol-plan.md)) |
 | 시계열 · SDS 고도화 | `timeseries.rs`, `sds.rs`, `physics.rs` | 구현. 신호 모양(SDS 상태 코드) · 고장 코드(`VALVE_STUCK_LOW`) · CUSUM · 2차 TTF · 한 표본 튐 막기 · 변화 시작 시차 · 회복 히스테리시스 | CUSUM 1.5σ 탐지 98.8 % (띠 51.5 %) · 같은 오경보 수준, P5 순간 잡음은 열지 않음 |
 | 개선안: CCTV형 통합 관제판 | `OfficerView.tsx`, `cctv/` (`CamPanel` · `Docks` · `RightRail`), `views/*` 오버레이, `mermaid.rs` 배지, `ai/siglip2/delta.rs` · `ink.rs` 전처리 | 구현. 가운데 6:4 (CAM-01 3-Way 도면 / CAM-02 시계열 · CAM-03 SDS 로직 차트 상시 도킹), 우측 병목 · 인터록 신호등 · 결재 통합, 단계 바 + 마이닝 레인 한 줄, 도면 설비마다 SDS 상태 칩 · 기울기 · 미니 파형, 원인 배관 Δt, 마인드맵 변곡 링, 현장 단말 스캔 조각 대조 카드 · 장갑 스테퍼, 델타 판독 전처리(고정 안내문 자리 잘라 내기 · 유채색 잉크 · 도각 평행 이동 맞춤) | 단위 시험 (도각 7 · 5 px 밀림 맞춤, 흑백 선 위 붉은 수정선, 안내문 자리 잘라 내기), 앱 E2E `CCTV` · [docs/cctv-console-plan.md](docs/cctv-console-plan.md) |
+| 2차 개선안: 풀스크린 오버레이 콘솔 | `OfficerView.tsx`, `PlantTopologyView.tsx`, `cctv/` (`stage` · `CctvOverlay` · `CctvZoom` · `CommandBar` · `RightRail` · `ZoomCtl` · `traces`), `views/*`, `TimeScrubber.tsx`, `drawings.ts` | 구현. 6 : 4 격자 분할을 걷어 내고 고른 뷰 하나를 무대 전체(`inset: 0`)에 깔고 빈 자리 맞춤 · 휠 확대 · 끌어 이동, 근본 원인 · 경보 · 선택 · 검색 1위 설비에 CCTV 말풍선 + 지시선(판 · 서로 · 설비를 피하는 자리 찾기, 다른 도면 설비는 점프 커넥터에), 좌상단 · 우상단 알약, 사건 대기열 · 설정 팝오버, 접는 결재 HUD, 하단 허브(파이프라인 · 3줄 미니 파형 리플레이 · 자연어 커맨드 바 · CAM-02 · 03 Drop-up), ESC 판 닫기 순서 · Enter · / 포커스 · 질의 기록, 선택 설비 문맥 질의. Rust 는 검색 식별자 우선순위 하나만 고침 | 앱 E2E 17개 (CCTV: 도면 높이 · 말풍선 · 지시선 · 판과 겹침 없음 · 확대 창 · HUD 접기 · 마인드맵 핀 · Mermaid 말풍선, SEARCH: "왜" 리본 · 문맥 질의) · [docs/overlay-console-plan.md](docs/overlay-console-plan.md) |
 | 추가 개선안: AI 데이터센터 모드 | `domain.rs` (`DomainMode` · `Terms` · `PhysicsConfig`), `plant.rs` `CodeScheme` (KKS · DCIM), `aidc_db.json` · `aidc_scenarios.json` · MEP · NET · SLD 도면, `switch_domain_mode` | 구현. 원장 · 시나리오 · 도면 · 용어 · 물리 계통을 도메인마다 갈아 끼우고 엔진 · 모델은 공유. DCIM 자리 꼴 오독 교정, 냉각수 · 냉수 · 냉각탑 매체 방향 규칙, CDU → GPU 열수력 물리엔진 | 시나리오 E2E 8개 (D1 ~ D7 · D3F · 폐루프 · 전환 뒤 사건 번호), 실제 모델 판정 8/8 · 자산 코드 32/32 · 스캔 3/3 ([docs/verification.md](docs/verification.md) 9절) |
 | 개선안: 3대 병목 | `state_machine/staged.rs`, `ai/residency.rs` (`Coexist`), `ai/siglip2/delta.rs`, `ink::glyphs` | 구현 (일부는 실측으로 방식을 바꿈). 엔진 잠금을 준비 · 반영에만 쥐고 모델은 잠금 밖에서, SigLIP2 비전 타워 공존(선택, 기본 꺼짐), 마스터 대비 잉크가 바뀐 곳만 다시 읽는 델타 판독(Red-line · A0), 글자 없는 띠 건너뛰기 | 대역 모델 시험: 조회 대기 475 → 0.0 ms. Red-line P3 36.6 → 11.2 s · P3F 33.9 → 7.0 s (값 같음), 바뀌지 않은 A0 타일 17 ms. [docs/powerplant-bottleneck-plan.md](docs/powerplant-bottleneck-plan.md) |
 
@@ -34,7 +35,7 @@
 ## 시험
 
 ```bat
-:: 단위 363개 + 엔진 잠금 4개 + 시나리오 E2E 발전소 14개 · AI 데이터센터 8개 (CPU, 모델 없이 규칙 · 대역 모델)
+:: 단위 365개 + 엔진 잠금 4개 + 시나리오 E2E 발전소 14개 · AI 데이터센터 8개 (CPU, 모델 없이 규칙 · 대역 모델)
 cargo test -p blueprint-core --no-default-features
 cargo test -p blueprint-models
 
@@ -88,17 +89,17 @@ cargo run -p blueprint-models -- import
 | `gocr` | [Qntology/GravityOCR-KO-gguf](https://huggingface.co/Qntology/GravityOCR-KO-gguf) | 1.6 GB |
 | `siglip2` | [Qntology/siglip2-so400m-patch16-naflex-gguf](https://huggingface.co/Qntology/siglip2-so400m-patch16-naflex-gguf) | 1.7 GB |
 
-## 콘솔 화면 (기획 Part 8-1 · 8-1B · 8-2, 개선안 CCTV형 통합 관제판)
+## 콘솔 화면 (기획 Part 8-1 · 8-1B · 8-2, 개선안 CCTV형 통합 관제판 → 2차 개선안 풀스크린 오버레이)
 
-가운데 위 **CAM-01**(3-Way 도면) · 아래 **CAM-02**(시계열 로직 차트) · **CAM-03**(SDS 로직 차트)과 오른쪽 통합 결재창이 한 화면에 늘 떠 있고, 선택 설비 하나 · 재생 시각 하나로 함께 움직입니다 ([docs/cctv-console-plan.md](docs/cctv-console-plan.md)).
+고른 3-Way 뷰 하나가 화면 전체에 깔린 배경 월드이고, 나머지는 모두 그 위에 뜬 반투명 유리 판입니다. 선택 설비 하나 · 재생 시각 하나로 함께 움직입니다 ([docs/overlay-console-plan.md](docs/overlay-console-plan.md)).
 
-- **머리**: 도메인 스위치, 검색, 트립(셧다운) 잔여 TTF, 교대감독 사번, 자동화 모드(승인자 · 근거 규정), 시뮬레이터, 모델 설정
-- **공간 Depth 브레드크럼**: Lv1 호기 ▸ Lv2 동 ▸ Lv3 층(EL) ▸ Lv4 도면(개정) ▸ Lv5 KKS
-- **좌측 대기열**: 현장 대기(⏳) · 결재 대기 · 공동 결재(🔒) · 처리 완료(자동 확정 표시)
-- **중앙 3-Way 뷰**: ① P&ID 도면 위 `norm_bbox` 상자 · 홉 뎁스 · 근본 원인 🔥 · 점프 커넥터(누르면 연결 도면으로) ② Mermaid 섹터 서브그래프 · 원인 경로 굵은 선 · 원본 펼치기 ③ 옵시디언 힘 기반 그래프(중심 Depth 0 후광, ±1 밝게, 나머지 흐림, 드래그)
-- **우측 (통합)**: 감지된 핵심 병목(물리 · 의사결정) → 절차서 인터록 신호등 게이트 → 표준 조치 요약 · 결재(재점검 지시 · 공동 결재 · 확정) → 선택 설비 계측 · 기준치 · 이슈 트리 · 홉 뎁스
-- **가운데 아래**: CAM-02 상류(역류) → 원인 → 하류 파형 · 60초 링버퍼 지표(변곡 · 기울기 · 가속도 · TTF), CAM-03 SDS 상태 전이 · 3축 직교 분할(최솟값) · 게이트 벡터
-- **하단**: Stage 1~5 카드(실측 시간 · 상태 · 마이닝 레인 건수 · 최대 대기) → 누르면 단계 상세(크롭 · 교정, 3중 진실 대조 · 실명 열람 요청, Zoro-1 사실 · 선택지 막대 · SDS 축, 절차서 초안 · Factcheck · 공동 결재), 타임머신 리플레이, 시계열 · SDS 심층 분석기
+- **무대 (3-Way 뷰)**: ① P&ID 도면 위 `norm_bbox` 상자 · 홉 뎁스 · 근본 원인 🔥 · 원인 배관 Δt · 점프 커넥터(누르면 연결 도면으로), 결재 HUD 를 뺀 빈 자리에 맞춤 · 휠 확대 · 끌어 이동 · 🌓 어둡게 ② Mermaid 섹터 서브그래프 · 원인 경로 굵은 선 · SDS 배지 ③ 옵시디언 힘 기반 그래프(중심 Depth 0 후광, ±1 밝게, 변곡 노드 유리 핀 `t=0 발원` · `Δt`), A0 종합 도면은 타일 확대 · 왼쪽 아래 미니맵
+- **CCTV 말풍선**: 근본 원인 · 경보 · 선택 · 검색 1위 설비에서 지시선으로 뜨는 카드(SDS 상태 · dx/dt · 60초 파형 · 도면 조각, `[🔍 파형 확대]` `[📋 인터록 이동]`). 다른 도면에 있는 설비는 그 도면으로 가는 점프 커넥터에 붙습니다
+- **좌상단**: 브랜드 · 도메인 스위치 · `[🚨 사건 대기열]` 팝오버(시뮬레이터 · 마이닝 레인 · 현장 대기 ⏳ · 결재 대기 · 공동 결재 🔒 · 처리 완료), 뷰 도구줄(도면 선택 · 전체 계통 · A0 정보), 공간 Depth(Lv1 호기 ▸ Lv2 동 ▸ Lv3 층 ▸ Lv4 도면 ▸ Lv5 KKS)
+- **우상단**: 3-Way 뷰 전환 · 흐름 · 병목 오버레이 · 물리엔진 · `[⚙️ 사번 · 모드]` 설정 팝오버(교대감독 사번 · 자동화 모드 · 모델 관리)
+- **오른쪽 결재 HUD (접기 ▸)**: 감지된 핵심 병목 → 절차서 인터록 신호등 게이트 → 표준 조치 요약 · 결재(재점검 지시 · 공동 결재 · 확정) → 선택 설비 계측 · 기준치 · 이슈 트리 · 홉 뎁스
+- **하단 허브**: 파이프라인(Stage 1~5 · 마이닝 레인 건수 · 최대 대기 → 누르면 단계 상세 서랍), 트립(셧다운) 잔여 TTF · 타임머신 리플레이(바탕에 D-1 · D0 · D+n 3줄 미니 파형), 자연어 커맨드 바(Enter · / · ↑↓ 기록 · `[🛠 KKS ✕]` 문맥 · 결과 Drop-up · 한 줄 요약), `[📈 CAM-02·03]` Drop-up(상류 → 원인 → 하류 파형 · 링버퍼 지표, SDS 상태 전이 · 3축 분할 · 게이트 벡터), 시계열 · SDS 심층 분석기
+- **ESC** 는 위에 뜬 판부터 하나씩 닫고(확대 창 → 설정 → 대기열 → 질의 결과 → 차트 → 서랍 → 검색 표시 → 설비 선택), 글을 쓰던 질의 줄에서는 글만 지웁니다
 
 ## 디렉토리
 
