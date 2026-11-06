@@ -83,6 +83,8 @@ pub struct InterlockState {
     pub target: String,
     pub fault: String,
     pub steps: Vec<StepState>,
+    /// 계측 근거의 이름 (발전소 `DCS`, 데이터센터 `BMC·DCIM`)
+    pub telemetry: String,
 }
 
 impl InterlockState {
@@ -145,21 +147,23 @@ pub fn evaluate(db: &Lattice, aop_id: &str, telemetry: &Telemetry, now_ms: i64, 
             StepState { no: st.no, req_depth: st.req_depth, kks: st.kks.clone(), text: st.text.clone(), check: st.check.clone(), status: StepStatus::Pending, observed: None, unit, source: None, evidence: None }
         })
         .collect();
+    let source = db.terms().telemetry.clone();
     for step in &mut steps {
-        refresh(step, telemetry, now_ms, reports, &row.target);
+        refresh(step, telemetry, now_ms, reports, &row.target, &source);
     }
-    Some(InterlockState { aop_id: row.aop_id.clone(), target: row.target.clone(), fault: row.fault.clone(), steps })
+    Some(InterlockState { aop_id: row.aop_id.clone(), target: row.target.clone(), fault: row.fault.clone(), steps, telemetry: source })
 }
 
 /// 계측 · 현장 보고가 새로 들어오면 아직 끝나지 않은 단계를 다시 봅니다. 이미 끝난 단계는 그대로 둡니다.
 pub fn refresh_all(state: &mut InterlockState, telemetry: &Telemetry, now_ms: i64, reports: &[FieldReport]) {
     let target = state.target.clone();
+    let source = state.telemetry.clone();
     for step in state.steps.iter_mut().filter(|s| !s.passed()) {
-        refresh(step, telemetry, now_ms, reports, &target);
+        refresh(step, telemetry, now_ms, reports, &target, &source);
     }
 }
 
-fn refresh(step: &mut StepState, telemetry: &Telemetry, now_ms: i64, reports: &[FieldReport], target: &str) {
+fn refresh(step: &mut StepState, telemetry: &Telemetry, now_ms: i64, reports: &[FieldReport], target: &str, source: &str) {
     match step.check.clone() {
         InterlockCheck::Below { tag, .. } | InterlockCheck::AtLeast { tag, .. } => {
             let Some(v) = telemetry.value_at(&tag, now_ms) else { return };
@@ -167,7 +171,7 @@ fn refresh(step: &mut StepState, telemetry: &Telemetry, now_ms: i64, reports: &[
             if step.holds(v) {
                 step.status = StepStatus::Passed;
                 step.source = Some(Source::Dcs);
-                step.evidence = Some(format!("DCS {tag} {} {} (조건 {})", fmt_value(v), step.unit.as_deref().unwrap_or(""), step.requirement()));
+                step.evidence = Some(format!("{source} {tag} {} {} (조건 {})", fmt_value(v), step.unit.as_deref().unwrap_or(""), step.requirement()));
             }
         }
         InterlockCheck::Loto => {

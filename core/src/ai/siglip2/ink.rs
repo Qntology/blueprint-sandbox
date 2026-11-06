@@ -28,11 +28,16 @@ const RULE_MIN_UNITS: f32 = 3.5;
 const GLYPH_MIN: f32 = 0.4;
 const GLYPH_MAX: f32 = 2.8;
 
+/// 유채색 잉크로 보는 채도 (`max(R,G,B) − min(R,G,B)`, 개선안 1-2). 붉은 · 푸른 펜과 직인은 70 ~ 180, 흑백 인쇄 · 스캔 색조는 20 아래입니다.
+pub const CHROMA_MIN: u8 = 45;
+
 /// 잉크 지도. 행 · 열 프로파일과 경계 찾기를 맡습니다.
 pub struct InkPage {
     pub width: u32,
     pub height: u32,
     mask: Vec<u8>,
+    /// 유채색 잉크 화소 (비어 있으면 색을 보지 않은 지도)
+    color: Vec<u8>,
 }
 
 /// 밝기 히스토그램의 90 백분위. 글자보다 종이가 훨씬 많다는 가정입니다.
@@ -54,7 +59,39 @@ impl InkPage {
     pub fn new(gray: &GrayImage) -> Self {
         let gate = paper_level(gray).saturating_sub(INK_DROP).max(32);
         let mask = gray.as_raw().iter().map(|v| (*v < gate) as u8).collect();
-        Self { width: gray.width(), height: gray.height(), mask }
+        Self { width: gray.width(), height: gray.height(), mask, color: Vec::new() }
+    }
+
+    /// 잉크 가운데 유채색(붉은 · 푸른 펜, 직인) 화소를 따로 표시합니다 (개선안 1-2). 마스터 도면은 흑백이라 이 화소는 새로 적은 것이고,
+    /// 흑백 배관 · 글자 위에 겹쳐 그은 수정선도 잉크 차분에서 빠지지 않습니다. 그림 크기가 다르면 그대로 돌려줍니다.
+    pub fn with_color(mut self, rgb: &RgbImage) -> Self {
+        if rgb.dimensions() != (self.width, self.height) {
+            return self;
+        }
+        self.color = rgb
+            .pixels()
+            .zip(&self.mask)
+            .map(|(p, m)| {
+                let [r, g, b] = p.0;
+                (*m == 1 && r.max(g).max(b) - r.min(g).min(b) >= CHROMA_MIN) as u8
+            })
+            .collect();
+        self
+    }
+
+    /// 유채색 잉크 (비어 있으면 색을 보지 않은 지도)
+    pub fn color(&self) -> &[u8] {
+        &self.color
+    }
+
+    /// 도각(바깥 테두리)의 왼쪽 열 · 위 행 (개선안 1-3). 가장자리 6 % 안에서 잉크가 길이의 절반 넘게 이어지는 첫 열 · 행입니다.
+    pub fn frame_origin(&self) -> Option<(u32, u32)> {
+        let (w, h) = (self.width, self.height);
+        let cols = self.col_counts((0, 0, w, h));
+        let rows = self.row_counts((0, 0, w, h));
+        let left = cols.iter().take((w * 6 / 100).max(1) as usize).position(|c| *c * 2 > h)?;
+        let top = rows.iter().take((h * 6 / 100).max(1) as usize).position(|c| *c * 2 > w)?;
+        Some((left as u32, top as u32))
     }
 
     pub fn full(&self) -> Bbox {

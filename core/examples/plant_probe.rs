@@ -2,6 +2,8 @@
 //!
 //!   cargo run -p blueprint-core --release --example plant_probe -- [현장 스캔 폴더] [결과 JSON]
 //!
+//! `BLUEPRINT_DOMAIN=aidc` 면 AI 데이터센터 원장 · 마스터(MEP · SLD) · 시나리오 D1 ~ D7 로 같은 측정을 합니다 (추가 개선안).
+//!
 //! 1. 사전 인덱싱(Phase A): 마스터 P&ID 다섯 장을 읽어 KKS 를 찾고 원장 좌표와 맞춥니다 (찾은 비율 · 상자 겹침).
 //! 2. 현장 스캔: `python scripts/gen_pid_drawings.py` 가 만든 점검표 · Red-line 을 읽어 정답과 맞춥니다.
 //! 3. 시나리오 P1 ~ P7: 엔진에 실제 판단 · 글쓰기 모델을 꽂아 판정 · 확신도 · SDS 축 · AOP 초안 · 단계 시간을 기록합니다.
@@ -15,6 +17,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use blueprint_core::ai::runtime;
 use blueprint_core::case::{FieldReport, ReadTimings, Signature};
+use blueprint_core::domain::DomainMode;
 use blueprint_core::extract::{extract, DocKind, Extracted, PageText};
 use blueprint_core::lattice::Lattice;
 use blueprint_core::policy::AutomationPolicy;
@@ -56,8 +59,10 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let field_dir = PathBuf::from(args.first().cloned().unwrap_or_else(|| "out/field".into()));
     let out_path = PathBuf::from(args.get(1).cloned().unwrap_or_else(|| "out/plant_probe.json".into()));
-    let db = Lattice::embedded()?;
-    let set = ScenarioSet::embedded()?;
+    let mode = std::env::var("BLUEPRINT_DOMAIN").ok().and_then(|k| DomainMode::from_key(&k)).unwrap_or_default();
+    let db = Lattice::embedded_for(mode)?;
+    let set = ScenarioSet::embedded_for(mode)?;
+    println!("[도메인] {} · 설비 {} · 센서 {} · 시나리오 {}", mode.label(), db.node_count(), db.sensors().len(), set.scenarios.len());
     let t = Instant::now();
     let rt = runtime::open()?;
     println!("[엔진] {} · 모델 열기 {:.1}s", rt.backend, t.elapsed().as_secs_f64());
@@ -132,6 +137,7 @@ fn main() -> Result<()> {
 
     // 3. 시나리오
     let mut engine = Engine::new(b"probe", AutomationPolicy::default(), None);
+    engine.reset_for(db.terms().clone());
     engine.model = Some(std::sync::Arc::new(rt.model));
     engine.writer = Some(std::sync::Arc::new(rt.writer));
     let mut results = Vec::new();

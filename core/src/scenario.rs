@@ -1,6 +1,6 @@
-//! 합성 사건 시나리오 (`fixtures/plant_scenarios.json`, `scripts/gen_plant_cases.py` 가 만듭니다).
+//! 합성 사건 시나리오 (`fixtures/plant_scenarios.json` · `fixtures/aidc_scenarios.json`, `scripts/gen_plant_cases.py` 가 만듭니다).
 //!
-//! DCS 연계가 없어서 시나리오를 재생해 알람을 넣습니다 (앱의 DCS 시뮬레이터, 시험의 E2E).
+//! DCS · BMC 연계가 없어서 시나리오를 재생해 알람을 넣습니다 (앱의 시뮬레이터, 시험의 E2E).
 //! 시나리오의 시각은 기준 시각 `t0` 에서 몇 초인지로 적혀 있고, 여기서 실제 시각(epoch ms)으로 바꿉니다.
 
 use std::collections::BTreeMap;
@@ -11,10 +11,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::case::{AlarmEvent, AlarmKind, FieldKind, FieldReport, Incident, IncidentSource, Signature};
+use crate::domain::DomainMode;
 use crate::plant::Sector;
 use crate::timeseries::{Series, Telemetry};
-
-const EMBEDDED: &str = include_str!("../fixtures/plant_scenarios.json");
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AlarmRow {
@@ -77,8 +76,14 @@ pub struct ScenarioSet {
 }
 
 impl ScenarioSet {
+    /// 발전소 시나리오 (P1 ~ P7)
     pub fn embedded() -> Result<Self> {
-        serde_json::from_str(EMBEDDED).context("합성 시나리오를 읽을 수 없습니다")
+        Self::embedded_for(DomainMode::PowerPlant)
+    }
+
+    /// 도메인의 시나리오 (발전소 P1 ~ P7, AI 데이터센터 D1 ~ D7)
+    pub fn embedded_for(mode: DomainMode) -> Result<Self> {
+        serde_json::from_str(mode.scenarios_json()).with_context(|| format!("{} 합성 시나리오를 읽을 수 없습니다", mode.label()))
     }
 
     pub fn get(&self, id: &str) -> Option<&Scenario> {
@@ -170,13 +175,20 @@ mod tests {
 
     #[test]
     fn every_scenario_loads_with_full_series() {
-        let set = ScenarioSet::embedded().unwrap();
-        let db = crate::lattice::Lattice::embedded().unwrap();
-        assert_eq!(set.scenarios.len(), 8);
-        for s in &set.scenarios {
-            assert_eq!(s.series.len(), db.sensors().len(), "{}", s.id);
-            assert!(s.series.values().all(|v| v.len() == 151), "{}", s.id);
-            assert!(s.alarm.is_some() || !s.scans.is_empty(), "{}: 알람이나 현장 보고가 있어야 합니다", s.id);
+        for mode in DomainMode::ALL {
+            let set = ScenarioSet::embedded_for(mode).unwrap();
+            let db = crate::lattice::Lattice::embedded_for(mode).unwrap();
+            assert_eq!(set.scenarios.len(), 8);
+            for s in &set.scenarios {
+                assert!(s.id.starts_with(mode.scenario_prefix()), "{}", s.id);
+                assert_eq!(s.series.len(), db.sensors().len(), "{}", s.id);
+                assert!(s.series.keys().all(|t| db.sensor(t).is_some()), "{}: 원장에 없는 태그", s.id);
+                assert!(s.series.values().all(|v| v.len() == 151), "{}", s.id);
+                assert!(s.alarm.is_some() || !s.scans.is_empty(), "{}: 알람이나 현장 보고가 있어야 합니다", s.id);
+                for scan in &s.scans {
+                    assert!(db.equipment(&scan.kks).is_some() && db.sensor(&scan.tag).is_some() && db.sector(&scan.sector).is_some(), "{}", s.id);
+                }
+            }
         }
     }
 

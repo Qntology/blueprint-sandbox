@@ -293,7 +293,7 @@ fn find_codes(db: &Lattice, text: &str, tags: bool) -> Vec<KksMatch> {
 }
 
 fn closer_to_a_tag(db: &Lattice, cand: &str, equipment: &KksMatch) -> bool {
-    let repaired = crate::plant::repair_kks(cand);
+    let repaired = db.repair(cand);
     let tag_distance = match db.match_tag(cand) {
         KksMatch::Exact(_) => 0,
         KksMatch::Corrected { code, .. } => edit_distance(&repaired, &code),
@@ -313,19 +313,19 @@ fn correction(field: &str, m: &KksMatch) -> Option<Correction> {
     }
 }
 
-/// 문서 종류를 정합니다.
-fn classify(text: &str) -> DocKind {
+/// 문서 종류를 정합니다. `prefixes` 는 원장의 변경 관리 번호 머리입니다 (`MOC` · `MOP`).
+fn classify(text: &str, prefixes: &[String]) -> DocKind {
     let flat = squeeze(text);
     let has = |label: &str| flat.contains(&squeeze(label)) || best_distance(label, &flat) <= 1;
     if has("현장 계기 점검표") || has("계기 점검표") {
         DocKind::GaugeCard
     } else if has("도면번호") || flat.contains("PID") {
-        if moc_runs(text).is_empty() {
+        if moc_runs(text, prefixes).is_empty() {
             DocKind::Drawing
         } else {
             DocKind::Redline
         }
-    } else if !moc_runs(text).is_empty() && arrow_pair(text).is_some() {
+    } else if !moc_runs(text, prefixes).is_empty() && arrow_pair(text).is_some() {
         // 표제란이 없는 조각만 읽었어도(A0 타일 · 바뀐 곳만 읽은 델타) 변경번호와 변경 수치가 함께 있으면 Red-line 입니다.
         DocKind::Redline
     } else {
@@ -351,38 +351,46 @@ fn best_distance(want: &str, text: &str) -> usize {
     best
 }
 
-/// `MOC-2026-1104` 꼴 (오독 `M0C`, 공백 포함)
-fn moc_runs(text: &str) -> Vec<String> {
+/// `MOC-2026-1104` · `MOP-2026-1104` 꼴 (오독 `M0C` · `MDP`, 공백 포함). 머리는 원장에 있는 것만 봅니다.
+fn moc_runs(text: &str, prefixes: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
         let flat: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-        let up = flat.to_uppercase().replace("M0C", "MOC").replace("MDC", "MOC");
-        let mut from = 0;
-        while let Some(i) = up[from..].find("MOC") {
-            let start = from + i;
-            // `MOC-연도-번호`: 숫자 여덟 개까지만 봅니다. 숫자 자리의 O · I · L 은 숫자로 읽습니다.
-            let mut tail = String::from("MOC");
-            let mut digits = 0;
-            for c in up[start + 3..].chars() {
-                let d = match c {
-                    '0'..='9' => Some(c),
-                    'O' => Some('0'),
-                    'I' | 'L' => Some('1'),
-                    _ => None,
-                };
-                match d {
-                    Some(d) if digits < 8 => {
-                        tail.push(d);
-                        digits += 1;
-                    }
-                    None if c == '-' => tail.push('-'),
-                    _ => break,
+        for prefix in prefixes {
+            let mut up = flat.to_uppercase();
+            // 머리의 O 를 0 · D 로 읽은 오독 (`M0C` · `MDP`)
+            for wrong in [prefix.replace('O', "0"), prefix.replace('O', "D")] {
+                if wrong != *prefix {
+                    up = up.replace(&wrong, prefix);
                 }
             }
-            if digits >= 6 {
-                out.push(tail.trim_end_matches('-').to_string());
+            let mut from = 0;
+            while let Some(i) = up[from..].find(prefix.as_str()) {
+                let start = from + i;
+                // `MOC-연도-번호`: 숫자 여덟 개까지만 봅니다. 숫자 자리의 O · I · L 은 숫자로 읽습니다.
+                let mut tail = prefix.clone();
+                let mut digits = 0;
+                for c in up[start + prefix.len()..].chars() {
+                    let d = match c {
+                        '0'..='9' => Some(c),
+                        'O' => Some('0'),
+                        'I' | 'L' => Some('1'),
+                        _ => None,
+                    };
+                    match d {
+                        Some(d) if digits < 8 => {
+                            tail.push(d);
+                            digits += 1;
+                        }
+                        None if c == '-' => tail.push('-'),
+                        _ => break,
+                    }
+                }
+                if digits >= 6 {
+                    out.push(tail.trim_end_matches('-').to_string());
+                }
+                from = start + prefix.len();
             }
-            from = start + 3;
         }
     }
     out
@@ -449,24 +457,29 @@ fn worker_id_in(s: &str) -> Option<String> {
         .find(|w| w.len() >= 3 && w.len() <= 7 && w.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) && w.chars().any(|c| c.is_ascii_digit()))
 }
 
-/// 계기 점검표의 항목
-const GAUGE_LABELS: [(&str, &str); 8] = [
-    ("taken_at", "점검 일시"),
-    ("worker_name", "점검자"),
-    ("worker_id", "사번"),
-    ("sector", "관할 섹터"),
-    ("kks", "설비 KKS"),
-    ("tag", "센서 태그"),
-    ("reading", "현장 실측치"),
-    ("unit", "단위"),
+/// 계기 점검표의 항목 (설비 코드 칸은 발전소 `설비 KKS`, 데이터센터 `자산 코드`)
+const GAUGE_LABELS: [(&str, &[&str]); 8] = [
+    ("taken_at", &["점검 일시"]),
+    ("worker_name", &["점검자"]),
+    ("worker_id", &["사번"]),
+    ("sector", &["관할 섹터", "관할 구역"]),
+    ("kks", &["설비 KKS", "자산 코드"]),
+    ("tag", &["센서 태그"]),
+    ("reading", &["현장 실측치"]),
+    ("unit", &["단위"]),
 ];
+
+/// 설비 코드 칸의 이름 (교정 기록 · 확인 요청에 씁니다): `설비 KKS` · `설비 자산코드`
+pub fn code_field(db: &Lattice) -> String {
+    format!("설비 {}", db.terms().code)
+}
 
 fn gauge_card(db: &Lattice, page: &PageText, out: &mut Extracted) {
     let mut found: Vec<(&str, String, f32)> = Vec::new();
     for crop in &page.crops {
         for row in rows_of(crop) {
             for (i, cell) in row.iter().enumerate() {
-                let Some((key, _)) = GAUGE_LABELS.iter().find(|(_, label)| near(&cell.text, label)) else { continue };
+                let Some((key, _)) = GAUGE_LABELS.iter().find(|(_, labels)| labels.iter().any(|l| near(&cell.text, l))) else { continue };
                 if found.iter().any(|(k, _, _)| k == key) {
                     continue;
                 }
@@ -477,22 +490,23 @@ fn gauge_card(db: &Lattice, page: &PageText, out: &mut Extracted) {
         }
     }
     let get = |key: &str| found.iter().find(|(k, _, _)| *k == key).map(|(_, v, c)| (v.clone(), *c));
+    let code_label = code_field(db);
     let mut low = |label: &str| out.uncertain.push(format!("{label} 확인"));
     if let Some((v, _)) = get("taken_at") {
         out.taken_at = local_time(&v);
     }
     if let Some((v, c)) = get("kks") {
         let m = db.match_kks(&v);
-        out.corrections.extend(correction("설비 KKS", &m));
+        out.corrections.extend(correction(&code_label, &m));
         match m.code() {
             Some(code) => out.kks = Some(code.to_string()),
-            None => low("설비 KKS"),
+            None => low(&code_label),
         }
         if c < LOW_CONF && !matches!(m, KksMatch::Exact(_) | KksMatch::Corrected { .. }) {
-            low("설비 KKS");
+            low(&code_label);
         }
     } else {
-        low("설비 KKS");
+        low(&code_label);
     }
     if let Some((v, _)) = get("tag") {
         let m = db.match_tag(&v);
@@ -587,7 +601,7 @@ fn drawing(db: &Lattice, page: &PageText, out: &mut Extracted) {
 
 fn redline(db: &Lattice, page: &PageText, out: &mut Extracted) {
     let text = page.text();
-    let raw = moc_runs(&text);
+    let raw = moc_runs(&text, &db.change_prefixes());
     match raw.iter().find_map(|r| db.similar_moc(r).map(|m| (r, m))) {
         Some((_, m)) => {
             // 글자 그대로 없으면 오독을 고친 것입니다. 원문 낱말을 교정 기록에 남깁니다.
@@ -597,7 +611,7 @@ fn redline(db: &Lattice, page: &PageText, out: &mut Extracted) {
                     .find(|w| w.to_uppercase().starts_with('M') && w.chars().filter(char::is_ascii_digit).count() >= 4)
                     .unwrap_or(&m.moc_no)
                     .to_string();
-                out.corrections.push(Correction { field: "MOC 번호".into(), distance: edit_distance(&written, &m.moc_no), raw: written, fixed: m.moc_no.clone() });
+                out.corrections.push(Correction { field: format!("{} 번호", db.terms().change), distance: edit_distance(&written, &m.moc_no), raw: written, fixed: m.moc_no.clone() });
             }
             out.moc_no = Some(m.moc_no.clone());
         }
@@ -621,7 +635,7 @@ fn redline(db: &Lattice, page: &PageText, out: &mut Extracted) {
         Some(m) if note_codes.iter().any(|c| c.code() == Some(m.kks.as_str())) => {
             out.kks = Some(m.kks.clone());
             out.tag = Some(m.tag.clone());
-            if let Some(c) = note_codes.iter().find(|c| c.code() == Some(m.kks.as_str())).and_then(|c| correction("설비 KKS", c)) {
+            if let Some(c) = note_codes.iter().find(|c| c.code() == Some(m.kks.as_str())).and_then(|c| correction(&code_field(db), c)) {
                 out.corrections.push(c);
             }
         }
@@ -647,7 +661,7 @@ fn redline(db: &Lattice, page: &PageText, out: &mut Extracted) {
 /// 한 장에서 문서 종류와 항목을 뽑습니다.
 pub fn extract(page: &PageText, db: &Lattice) -> Extracted {
     let text = page.text();
-    let kind = classify(&text);
+    let kind = classify(&text, &db.change_prefixes());
     let mut out = Extracted { kind: Some(kind), signed: !page.signs.is_empty(), ..Extracted::default() };
     match kind {
         DocKind::GaugeCard => gauge_card(db, page, &mut out),
@@ -796,9 +810,12 @@ mod tests {
         assert_eq!(arrow_pair("점프 → PID-101-HAD"), None);
         assert_eq!(arrow_pair("위치: 103동 2F (EL.+9.0m) CF001 급수 유량 1,850.0 t/h 점프 → PID-101-HAD\n29.0 MPa → 31.0 MPa"), Some((29.0, 31.0)));
         assert_eq!(arrow_pair("103동 2F → PID-101-HAD"), None);
-        assert_eq!(moc_runs("변경번호 : MOC - 2026 - 1104"), vec!["MOC-2026-1104".to_string()]);
-        assert_eq!(classify("어떤 글"), DocKind::Unknown);
-        assert_eq!(classify("MOC-2026-1104\n29.0 MPa → 31.0 MPa"), DocKind::Redline, "표제란 없이 읽은 Red-line 메모");
-        assert_eq!(classify("MOC-2026-1104 참조"), DocKind::Unknown, "변경 수치가 없으면 Red-line 으로 보지 않음");
+        let moc = ["MOC".to_string()];
+        assert_eq!(moc_runs("변경번호 : MOC - 2026 - 1104", &moc), vec!["MOC-2026-1104".to_string()]);
+        assert_eq!(moc_runs("MDP-2026-11O4", &["MOP".to_string()]), vec!["MOP-2026-1104".to_string()], "데이터센터 MOP 번호와 그 오독");
+        assert!(moc_runs("MOP-2026-1104", &moc).is_empty(), "원장에 없는 머리는 보지 않음");
+        assert_eq!(classify("어떤 글", &moc), DocKind::Unknown);
+        assert_eq!(classify("MOC-2026-1104\n29.0 MPa → 31.0 MPa", &moc), DocKind::Redline, "표제란 없이 읽은 Red-line 메모");
+        assert_eq!(classify("MOC-2026-1104 참조", &moc), DocKind::Unknown, "변경 수치가 없으면 Red-line 으로 보지 않음");
     }
 }

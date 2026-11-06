@@ -23,7 +23,7 @@ use super::gocr::image::prepare as gocr_prepare;
 use super::gocr::{open as open_gocr, GocrEngine, GocrInput, OcrOutput, Strategy, EARLY_EXIT, TEXT_PROMPT};
 use super::residency::SharedResidency;
 use super::siglip2::config::DEFAULT_MAX_PATCHES;
-use super::siglip2::delta::{clip_to_changes, ink_changes, retain_changed, DeltaParams, Master, MasterSet};
+use super::siglip2::delta::{clip_to_changes, ink_changes, moved, retain_changed, trim_ignored, DeltaParams, Master, MasterSet};
 use super::siglip2::image::{prepare as siglip2_prepare, PatchInput};
 use super::siglip2::ink::{deskew, estimate_skew, Bbox, InkPage};
 use super::siglip2::plan::{plan_page, plan_unfiltered, CropKind, CropPlan, PagePlan, PlanParams, Scores};
@@ -101,6 +101,8 @@ pub struct DeltaReading {
     pub cosines: Vec<f32>,
     /// 바뀐 칸 상자 (진단용)
     pub changed_boxes: Vec<Bbox>,
+    /// 고정 안내문 자리(`ignore_zones`)를 잘라 낸 조각 수
+    pub trimmed: usize,
 }
 
 /// 계획까지 마친 페이지
@@ -119,7 +121,8 @@ fn straighten(pages: &[&RgbImage]) -> Vec<(RgbImage, f32, InkPage)> {
         .map(|page| {
             let skew = estimate_skew(&gray_of(page));
             let image = deskew(page, skew);
-            let ink = InkPage::new(&gray_of(&image));
+            // 유채색 잉크(붉은 · 푸른 펜)를 따로 표시해 델타가 흑백 획에 겹친 수정선도 봅니다 (개선안 1-2).
+            let ink = InkPage::new(&gray_of(&image)).with_color(&image);
             (image, skew, ink)
         })
         .collect()
@@ -127,7 +130,7 @@ fn straighten(pages: &[&RgbImage]) -> Vec<(RgbImage, f32, InkPage)> {
 
 /// 바뀐 곳에 걸치지 않는 조각을 계획에서 뺍니다. 마스터를 고르지 못했거나 너무 많이 바뀌었으면 계획을 그대로 둡니다.
 fn apply_delta(plan: &mut PagePlan, grid: &PatchGrid, ink: &InkPage, baseline: &Baseline<'_>, page: usize, p: &DeltaParams) -> DeltaReading {
-    let mut out = DeltaReading { master: None, similarity: 0.0, margin: 0.0, changed: 0, blocks: 0, skipped: Vec::new(), clipped: 0, clipped_blank: Vec::new(), fallback: None, cosines: Vec::new(), changed_boxes: Vec::new() };
+    let mut out = DeltaReading { master: None, similarity: 0.0, margin: 0.0, changed: 0, blocks: 0, skipped: Vec::new(), clipped: 0, clipped_blank: Vec::new(), fallback: None, cosines: Vec::new(), changed_boxes: Vec::new(), trimmed: 0 };
     let master = match baseline {
         Baseline::Best(set) => {
             let Some(m) = set.best_match(grid) else {
@@ -170,6 +173,8 @@ fn apply_delta(plan: &mut PagePlan, grid: &PatchGrid, ink: &InkPage, baseline: &
     if p.clip {
         (out.clipped, out.clipped_blank) = clip_to_changes(plan, ink, &diff, p.ink_threshold);
     }
+    // 고정 안내문 자리는 서명란과 한 띠로 묶여도 읽지 않습니다 (개선안 1-1). 자리는 마스터 좌표라 도각 이동만큼 옮겨 댑니다.
+    out.trimmed = trim_ignored(plan, ink, &moved(&master.ignore, diff.offset));
     out
 }
 

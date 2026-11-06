@@ -8,7 +8,7 @@ export function AlarmQueue({ rows, selected, onPick, catalog }: { rows: Incident
   return (
     <aside className="queue">
       <h3>확인 대기 ({waiting.length})</h3>
-      {waiting.length === 0 && <p className="muted">대기 중인 사건이 없습니다. 머리의 DCS 시뮬레이터로 시나리오를 넣어 보세요.</p>}
+      {waiting.length === 0 && <p className="muted">대기 중인 사건이 없습니다. 머리의 시뮬레이터로 시나리오를 넣어 보세요.</p>}
       {waiting.map((r) => (
         <button key={r.id} className={`queue-item ${r.verdict_class ?? ""} ${selected === r.id ? "selected" : ""}`} onClick={() => onPick(r.id)}>
           <strong>

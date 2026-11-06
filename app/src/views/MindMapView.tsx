@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { Context } from "../PlantTopologyView";
-import { equipmentLevel, fmt, hopDepths, MEDIUM_COLOR, sensorsOf, valueAt, type Level } from "../plant";
+import { equipmentLevel, fmt, hopDepths, MEDIUM_COLOR, sdsStateAt, sensorsOf, signedSecs, valueAt, type Level } from "../plant";
 
 interface Node {
   kks: string;
@@ -11,7 +11,8 @@ interface Node {
 }
 
 const LEVEL_COLOR: Record<Level, string> = { normal: "#4fd1c5", warn: "#f6c453", alarm: "#ff9f43", trip: "#ff4d4f" };
-const SECTOR_ANGLE: Record<string, number> = { feedwater: 200, boiler: 270, turbine: 340, electric: 130, env: 40 };
+/** 섹터마다 원 둘레의 자리 (원장의 섹터 순서: 발전소 보일러 · 터빈 · 급수 · 전기 · 환경, 데이터센터 컴퓨트 · 네트워크 · 냉각 · 전력 · 공조) */
+const SECTOR_ANGLES = [270, 340, 200, 130, 40];
 
 interface Label {
   x: number;
@@ -78,7 +79,8 @@ export function MindMapView({ ctx }: { ctx: Context }) {
   useEffect(() => {
     if (nodes.current.length) return;
     nodes.current = ctx.plant.equipment.map((e, i) => {
-      const a = ((SECTOR_ANGLE[e.sector] ?? 0) * Math.PI) / 180;
+      const slot = ctx.plant.sectors.findIndex((s) => s.key === e.sector);
+      const a = ((SECTOR_ANGLES[slot] ?? 0) * Math.PI) / 180;
       return { kks: e.kks, x: Math.cos(a) * 260 + ((i * 37) % 60) - 30, y: Math.sin(a) * 200 + ((i * 53) % 60) - 30, vx: 0, vy: 0 };
     });
   }, [ctx.plant]);
@@ -216,6 +218,23 @@ export function MindMapView({ ctx }: { ctx: Context }) {
           g.lineWidth = 3;
           g.stroke();
         }
+        // 개선안 2-3: SDS 변곡 링. 재생 시각이 그 설비의 첫 변곡을 지나면 켜집니다 (발원지는 적색 이중 링, 파급은 황색 링).
+        const dep = c.departures.get(n.kks);
+        if (dep !== undefined && dep <= c.t) {
+          const rings = isRoot ? [r + 6, r + 11] : [r + 6];
+          for (const rad of rings) {
+            g.beginPath();
+            g.arc(n.x, n.y, rad, 0, Math.PI * 2);
+            g.strokeStyle = isRoot ? "#ff4d4f" : "#f6c453";
+            g.lineWidth = 2.5;
+            g.stroke();
+          }
+          g.fillStyle = isRoot ? "#ff9d9d" : "#ffe08a";
+          g.font = "bold 11px Malgun Gothic, sans-serif";
+          g.textAlign = "center";
+          g.fillText(isRoot ? "t=0 발원" : `Δt ${signedSecs(dep, c.origin)}`, n.x, n.y - r - 14);
+          g.textAlign = "left";
+        }
         if (center) {
           for (const [rad, a] of [
             [r + 10, 0.5],
@@ -241,7 +260,8 @@ export function MindMapView({ ctx }: { ctx: Context }) {
         if (bright(n.kks) || center) {
           const s = sensorsOf(c.plant, n.kks)[0];
           const v = s ? (c.detail ? valueAt(c.detail.timeline, s.tag, c.t) : s.normal) : null;
-          info = `${eq.name}${s ? ` · ${fmt(v)} ${s.unit}` : ""}${d !== undefined && c.selected ? ` · D${d > 0 ? "+" : ""}${d}` : ""}`;
+          const sds = sdsStateAt(c.tracks.get(n.kks)?.[0]?.transitions, c.t);
+          info = `${eq.name}${s ? ` · ${fmt(v)} ${s.unit}` : ""}${d !== undefined && c.selected ? ` · D${d > 0 ? "+" : ""}${d}` : ""}${sds && sds !== "STABLE" ? ` · ${sds}` : ""}`;
         }
         labels.push({
           x: n.x,
@@ -261,7 +281,7 @@ export function MindMapView({ ctx }: { ctx: Context }) {
       g.fillStyle = "#8b96ad";
       g.font = "12px Malgun Gothic, sans-serif";
       g.textAlign = "left";
-      g.fillText("(◎) 선택 중심 Depth 0   (○) 1홉 직접연결 ±1   (.) 2홉 이상 흐림   🔥 근본원인   ⚠️ 경보   드래그로 노드 이동", 14, h - 14);
+      g.fillText("(◎) 선택 중심 Depth 0   (○) 1홉 ±1   (.) 2홉 이상 흐림   🔴 이중 링 최초 변곡 발원지(t=0)   🟡 링 시차 매칭 파급   🔥 근본원인   ⚠️ 경보   드래그로 이동", 14, h - 14);
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);

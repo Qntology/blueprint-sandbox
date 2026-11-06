@@ -190,7 +190,7 @@ pub fn analyze(db: &Lattice, incident: &Incident, brains: Brains<'_>, sds_id: &s
     }
     for f in field_checks.iter().filter(|f| !f.matches_dcs && vote.is_none()) {
         let unit = unit_of(db, &f.tag);
-        notes.push(format!("현장 실측 {} {unit} 가 같은 시각 DCS 값 {} {unit} 와 다릅니다", fmt_value(f.field_value), f.dcs_value.map(fmt_value).unwrap_or_else(|| "없음".into())));
+        notes.push(format!("현장 실측 {} {unit} 가 같은 시각 {} 값 {} {unit} 와 다릅니다", fmt_value(f.field_value), db.terms().telemetry, f.dcs_value.map(fmt_value).unwrap_or_else(|| "없음".into())));
     }
     if let Some(excuse) = incident.reports.iter().find_map(|r| r.excuse.as_ref()) {
         notes.push(format!("현장 소명: {}", excuse.label()));
@@ -305,7 +305,7 @@ fn draft_for(db: &Lattice, candidate: Verdict, tag: Option<&str>, substantive: &
     let template = template_summary(db, candidate, tag, causal, now_value, root_value);
     let facts: Vec<String> = substantive.facts.iter().filter(|(k, _)| k != "적용 규칙").map(|(k, v)| format!("{k}: {v}")).collect();
     let source: Vec<String> = facts.iter().cloned().chain(std::iter::once(template.clone())).collect();
-    Some(draft_aop(writer, aop, &source, &template))
+    Some(draft_aop(writer, &db.terms().drafting_system(), aop, &source, &template))
 }
 
 /// Stage 5 기록
@@ -429,7 +429,7 @@ fn truth_rows(db: &Lattice, incident: &Incident, route: &Route, vote: Option<&Vo
     let field_kks = incident.reports.iter().find(|r| r.kind != FieldKind::Redline).and_then(|r| r.kks.clone());
     if incident.alarm.is_some() || field_kks.is_some() {
         rows.push(TruthRow {
-            item: "설비 KKS 코드".into(),
+            item: if db.terms().code.ends_with("코드") { format!("설비 {}", db.terms().code) } else { format!("설비 {} 코드", db.terms().code) },
             field: field_kks.clone(),
             ledger: Some(route.kks.clone()),
             single: incident.alarm.as_ref().and_then(|a| db.sensor(&a.tag)).map(|s| s.kks.clone()),

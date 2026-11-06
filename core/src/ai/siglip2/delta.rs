@@ -39,13 +39,20 @@ pub struct DeltaParams {
     pub max_changed: f32,
     /// 남긴 조각을 바뀐 곳 둘레로 가로로 좁혀 읽습니다 ([`clip_to_changes`]).
     pub clip: bool,
+    /// 도각(바깥 테두리)으로 평행 이동을 맞춘 뒤 견줍니다 (개선안 1-3, 스캐너 급지 밀림)
+    pub align: bool,
+    /// 유채색 잉크(붉은 · 푸른 펜)는 마스터 잉크와 겹쳐도 새 획으로 셉니다 (개선안 1-2)
+    pub chroma: bool,
 }
 
 impl Default for DeltaParams {
     fn default() -> Self {
-        Self { min_margin: 0.03, radius: 3, block: 16, ink_threshold: 0.03, edge: 32, max_changed: 0.25, clip: true }
+        Self { min_margin: 0.03, radius: 3, block: 16, ink_threshold: 0.03, edge: 32, max_changed: 0.25, clip: true, align: true, chroma: true }
     }
 }
+
+/// 이 거리(화소)보다 크게 어긋난 도각은 다른 그림으로 보고 맞추지 않습니다.
+const MAX_ALIGN_PX: i32 = 60;
 
 /// 마스터 한 장의 SigLIP2 패치 특징 (int8)
 #[derive(Debug, Clone, PartialEq)]
@@ -200,12 +207,14 @@ pub struct Master {
     /// 잉크를 `radius` 넓힌 지도
     near: Vec<u8>,
     radius: u32,
+    /// 고정 안내문 자리 (화소, 개선안 1-1 `ignore_zones`). 이 자리는 조각에서 잘라 내고 읽지 않습니다.
+    pub ignore: Vec<Bbox>,
 }
 
 impl Master {
     pub fn new(id: impl Into<String>, grid: &PatchGrid, ink: InkPage, radius: u32) -> Self {
         let near = ink.dilate(radius);
-        Self { patches: MasterPatches::from_grid(id, grid), ink, near, radius }
+        Self { patches: MasterPatches::from_grid(id, grid), ink, near, radius, ignore: Vec::new() }
     }
 
     pub fn id(&self) -> &str {
@@ -232,6 +241,14 @@ pub struct Matched {
 impl MasterSet {
     pub fn get(&self, id: &str) -> Option<&Master> {
         self.pages.iter().find(|p| p.id() == id)
+    }
+
+    /// 원장 도면 정의의 고정 안내문 자리(정규화 좌표 `[x0, y0, x1, y1]`)를 마스터에 붙입니다 (개선안 1-1).
+    pub fn set_ignore(&mut self, id: &str, zones: &[[f32; 4]]) {
+        if let Some(m) = self.pages.iter_mut().find(|p| p.id() == id) {
+            let (w, h) = (m.ink.width as f32, m.ink.height as f32);
+            m.ignore = zones.iter().map(|z| ((z[0] * w) as u32, (z[1] * h) as u32, (z[2] * w).ceil() as u32, (z[3] * h).ceil() as u32)).collect();
+        }
     }
 
     /// 격자가 같은 마스터 가운데 가장 닮은 것
@@ -264,6 +281,8 @@ pub struct BlockDiff {
     pub rows: u32,
     pub cols: u32,
     pub diff: Vec<f32>,
+    /// 견줄 때 쓴 스캔의 평행 이동 (스캔 = 마스터 + 이동, 맞추지 않았으면 (0, 0))
+    pub offset: (i32, i32),
 }
 
 impl BlockDiff {
@@ -310,14 +329,24 @@ pub fn ink_changes(master: &Master, scan: &InkPage, p: &DeltaParams) -> Option<B
     let (cols, rows) = (w.div_ceil(p.block), h.div_ceil(p.block));
     let mut counts = vec![0u32; (rows * cols) as usize];
     let (sm, mm) = (scan.mask(), master.ink.mask());
+    // 스캔 (x, y) 는 마스터 (x − dx, y − dy) 와 견줍니다 (도각으로 잰 평행 이동, 없으면 0)
+    let (dx, dy) = if p.align { frame_offset(&master.ink, scan).unwrap_or((0, 0)) } else { (0, 0) };
+    let color = if p.chroma { scan.color() } else { &[] };
+    let master_at = |x: u32, y: u32| -> Option<usize> {
+        let (mx, my) = (x as i64 - dx as i64, y as i64 - dy as i64);
+        (mx >= 0 && my >= 0 && mx < w as i64 && my < h as i64).then(|| (my as u32 * w + mx as u32) as usize)
+    };
     for y in p.edge..h.saturating_sub(p.edge) {
         let row = (y / p.block) * cols;
         let s = (y * w) as usize;
         for x in p.edge..w.saturating_sub(p.edge) {
             let i = s + x as usize;
-            let added = sm[i] == 1 && master_near[i] == 0;
-            let removed = mm[i] == 1 && scan_near[i] == 0;
-            if added || removed {
+            let m = master_at(x, y);
+            let added = sm[i] == 1 && m.is_none_or(|j| master_near[j] == 0);
+            let removed = m.is_some_and(|j| mm[j] == 1) && scan_near[i] == 0;
+            // 마스터는 흑백이라 유채색 잉크는 마스터 획과 겹쳐도 새로 적은 것입니다.
+            let colored = color.get(i).is_some_and(|c| *c == 1);
+            if added || removed || colored {
                 counts[(row + x / p.block) as usize] += 1;
             }
         }
@@ -331,7 +360,75 @@ pub fn ink_changes(master: &Master, scan: &InkPage, p: &DeltaParams) -> Option<B
             *n as f32 / area.max(1) as f32
         })
         .collect();
-    Some(BlockDiff { block: p.block, rows, cols, diff })
+    Some(BlockDiff { block: p.block, rows, cols, diff, offset: (dx, dy) })
+}
+
+/// 마스터 좌표의 자리를 스캔 좌표로 옮깁니다 (스캔 = 마스터 + `offset`). 급지가 밀린 스캔에서도 안내문 자리가 띠와 맞게 합니다.
+pub fn moved(zones: &[Bbox], (dx, dy): (i32, i32)) -> Vec<Bbox> {
+    let mv = |v: u32, d: i32| (v as i64 + d as i64).max(0) as u32;
+    zones.iter().map(|z| (mv(z.0, dx), mv(z.1, dy), mv(z.2, dx), mv(z.3, dy))).collect()
+}
+
+/// 도각으로 잰 스캔의 평행 이동 `(dx, dy)` (스캔 = 마스터 + 이동, 개선안 1-3). 어느 쪽이든 도각을 못 찾거나 너무 크게 어긋나면 None.
+/// 기울기는 [`super::ink::deskew`] 가 먼저 바로잡고, 배율은 같은 해상도 스캔이라 보지 않습니다.
+pub fn frame_offset(master: &InkPage, scan: &InkPage) -> Option<(i32, i32)> {
+    let (mx, my) = master.frame_origin()?;
+    let (sx, sy) = scan.frame_origin()?;
+    let (dx, dy) = (sx as i32 - mx as i32, sy as i32 - my as i32);
+    (dx.abs() <= MAX_ALIGN_PX && dy.abs() <= MAX_ALIGN_PX).then_some((dx, dy))
+}
+
+/// 고정 안내문 자리(`ignore_zones`)를 남은 조각에서 잘라 냅니다 (개선안 1-1). 안내문은 서명란과 같은 가로 띠에 있어 한 조각으로 읽혔는데,
+/// 자리가 조각 높이의 60 % 넘게 덮으면 그 가로 구간을 빼고 남은 쪽을 잉크에 맞춰 줄입니다. 가로로도 다 덮으면 조각 전체를 읽지 않습니다.
+/// 제목은 건드리지 않고, 남은 쪽에 글자 모양 덩어리가 둘 미만이면 읽지 않습니다 (서명 조각은 손글씨가 덩어리로 안 잡혀도 남깁니다).
+/// 돌려주는 값: 잘라 내거나 뺀 조각 수
+pub fn trim_ignored(plan: &mut PagePlan, ink: &InkPage, zones: &[Bbox]) -> usize {
+    if zones.is_empty() {
+        return 0;
+    }
+    let mut trimmed = 0;
+    let mut out = Vec::with_capacity(plan.crops.len());
+    for mut c in std::mem::take(&mut plan.crops) {
+        if c.kind == CropKind::Title {
+            out.push(c);
+            continue;
+        }
+        let (mut cut, mut inside) = (false, false);
+        for z in zones {
+            let (x0, y0, x1, y1) = c.bbox;
+            let overlap_y = y1.min(z.3).saturating_sub(y0.max(z.1));
+            if overlap_y * 10 < (y1 - y0) * 6 || z.2 <= x0 || z.0 >= x1 {
+                continue;
+            }
+            // 바뀐 곳 둘레로 좁힌 조각이 안내문 자리 안에 통째로 든 경우 (P3 실측에서 안내문 두 줄을 읽던 조각)
+            if z.0 <= x0 && z.2 >= x1 {
+                inside = true;
+                break;
+            }
+            // 자리가 조각의 왼쪽을 덮으면 오른쪽만, 오른쪽을 덮으면 왼쪽만 남깁니다 (가운데에 끼면 넓은 쪽).
+            let (left, right) = (z.0.saturating_sub(x0), x1.saturating_sub(z.2));
+            let keep = if z.0 <= x0 || (z.2 < x1 && right >= left) { (z.2.max(x0), y0, x1, y1) } else { (x0, y0, z.0.min(x1), y1) };
+            if keep.2 > keep.0 {
+                c.bbox = ink.tighten(keep).unwrap_or(keep);
+                cut = true;
+            }
+        }
+        if inside && c.kind != CropKind::Sign {
+            trimmed += 1;
+            plan.blank.push(c.bbox);
+            continue;
+        }
+        if cut {
+            trimmed += 1;
+            if c.kind != CropKind::Sign && ink.glyphs(c.bbox, 2) < 2 {
+                plan.blank.push(c.bbox);
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    plan.crops = out;
+    trimmed
 }
 
 /// 상자가 덮는 격자 칸 (행 우선 인덱스)
@@ -587,7 +684,7 @@ mod tests {
                 }
             }
         }
-        BlockDiff { block: 16, rows, cols, diff }
+        BlockDiff { block: 16, rows, cols, diff, offset: (0, 0) }
     }
 
     #[test]
@@ -625,6 +722,127 @@ mod tests {
         assert_eq!(clipped, 1);
         assert!(plan.crops.is_empty(), "{:?}", plan.crops);
         assert!(blank.len() <= 1);
+    }
+
+    /// 도각 테두리(1 px)가 있는 400 × 300 쪽
+    fn framed(shift: (u32, u32), extra: &[(u32, u32, u32, u32)]) -> InkPage {
+        let (sx, sy) = shift;
+        let mut s = vec![(4 + sx, 4 + sy, 6 + sx, 290 + sy), (4 + sx, 4 + sy, 390 + sx, 6 + sy), (388 + sx, 4 + sy, 390 + sx, 290 + sy), (4 + sx, 288 + sy, 390 + sx, 290 + sy)];
+        for (x0, y0, x1, y1) in [(60, 60, 200, 63), (60, 120, 200, 123), (250, 70, 253, 200)] {
+            s.push((x0 + sx, y0 + sy, x1 + sx, y1 + sy));
+        }
+        s.extend_from_slice(extra);
+        page(400, 300, &s, 255)
+    }
+
+    #[test]
+    fn a_feed_shifted_scan_is_aligned_by_the_frame_before_diffing() {
+        // 개선안 1-3: 스캐너 급지 밀림 (7, 5) px. 맞추지 않으면 모든 획이 새 획 + 지운 획이 되고, 맞추면 새로 적은 곳만 바뀝니다.
+        let p = DeltaParams { block: 16, edge: 0, ..DeltaParams::default() };
+        let master = Master::new("m", &grid(1, 1, 4, 1), framed((0, 0), &[]), p.radius);
+        let scan = framed((7, 5), &[(300, 230, 340, 236)]);
+        assert_eq!(frame_offset(&master.ink, &scan), Some((7, 5)));
+        let aligned = ink_changes(&master, &scan, &p).unwrap();
+        let boxes = aligned.changed_boxes(p.ink_threshold);
+        assert!(!boxes.is_empty() && boxes.iter().all(|b| b.0 >= 288 && b.1 >= 224 && b.3 <= 240 + 16), "새 획만: {boxes:?}");
+        let raw = ink_changes(&master, &scan, &DeltaParams { align: false, ..p }).unwrap();
+        assert!(raw.changed(p.ink_threshold) > aligned.changed(p.ink_threshold) * 4, "맞추지 않으면 밀린 획이 모두 바뀜: {} vs {}", raw.changed(p.ink_threshold), aligned.changed(p.ink_threshold));
+    }
+
+    #[test]
+    fn red_pen_over_a_black_line_counts_as_a_change() {
+        // 개선안 1-2: 흑백 선 위에 겹쳐 그은 붉은 수정선은 회색 잉크로는 그대로 같아 보입니다.
+        use image::{Rgb, RgbImage};
+        let p = DeltaParams { block: 16, edge: 0, ..DeltaParams::default() };
+        let line = (20, 30, 120, 34);
+        let master = Master::new("m", &grid(1, 1, 4, 1), page(160, 64, &[line], 255), p.radius);
+        let mut rgb = RgbImage::from_pixel(160, 64, Rgb([255, 255, 255]));
+        for y in line.1..line.3 {
+            for x in line.0..line.2 {
+                rgb.put_pixel(x, y, Rgb([20, 20, 25]));
+            }
+        }
+        for x in 60..100 {
+            rgb.put_pixel(x, 31, Rgb([205, 25, 25]));
+            rgb.put_pixel(x, 32, Rgb([205, 25, 25]));
+        }
+        let gray = image::imageops::grayscale(&rgb);
+        let scan = InkPage::new(&gray).with_color(&rgb);
+        assert_eq!(scan.color().iter().filter(|c| **c == 1).count(), 80, "붉은 화소만 유채색");
+        let d = ink_changes(&master, &scan, &p).unwrap();
+        assert!(d.touches((60, 28, 100, 36), p.ink_threshold), "붉은 수정선 칸이 바뀜");
+        assert!(!d.touches((20, 28, 50, 36), p.ink_threshold), "그대로인 검은 선");
+        let mono = ink_changes(&master, &scan, &DeltaParams { chroma: false, ..p }).unwrap();
+        assert_eq!(mono.changed(p.ink_threshold), 0, "색을 보지 않으면 놓칩니다");
+    }
+
+    #[test]
+    fn the_fixed_notice_zone_is_cut_out_of_the_signature_band() {
+        // 개선안 1-1: 고정 안내문(왼쪽)과 서명란(오른쪽)이 한 가로 띠로 묶인 조각에서 안내문 자리를 빼고 서명란만 남깁니다.
+        let mut strokes = Vec::new();
+        for line_y in [1260u32, 1290, 1320] {
+            let mut x = 100;
+            while x + 10 <= 1250 {
+                strokes.push((x, line_y, x + 10, line_y + 14));
+                x += 16;
+            }
+        }
+        for x in (1480..1800).step_by(16) {
+            strokes.push((x, 1230, x + 10, 1244));
+        }
+        let ink = page(2000, 1400, &strokes, 255);
+        let band = CropPlan { kind: CropKind::Form, bbox: (60, 1220, 1960, 1360), upscale: 1.0, guide_margin: None };
+        let title = CropPlan { kind: CropKind::Title, bbox: (60, 20, 1940, 130), upscale: 1.0, guide_margin: None };
+        let mut plan = PagePlan { width: 2000, height: 1400, crops: vec![title.clone(), band], dropped: Vec::new(), blank: Vec::new(), unfiltered: false };
+        let guide = (70, 1253, 1320, 1365);
+        assert_eq!(trim_ignored(&mut plan, &ink, &[guide]), 1);
+        assert_eq!(plan.crops[0], title, "제목은 그대로");
+        let c = plan.crops[1].bbox;
+        assert!(c.0 >= 1320 && c.0 <= 1480 && c.2 >= 1790, "서명란만 남음: {c:?}");
+        // 안내문만 있는 조각은 글자가 남지 않아 읽지 않습니다.
+        let mut only = PagePlan { width: 2000, height: 1400, crops: vec![CropPlan { kind: CropKind::Form, bbox: (60, 1250, 1300, 1340), upscale: 1.0, guide_margin: None }], dropped: Vec::new(), blank: Vec::new(), unfiltered: false };
+        trim_ignored(&mut only, &ink, &[guide]);
+        assert!(only.crops.is_empty() && only.blank.len() == 1, "{:?}", only.crops);
+        // 바뀐 곳 둘레로 좁혀져 안내문 자리 안에 통째로 든 조각도 읽지 않습니다. 서명 조각은 남깁니다.
+        let inner = |kind| PagePlan { width: 2000, height: 1400, crops: vec![CropPlan { kind, bbox: (554, 1247, 712, 1340), upscale: 1.0, guide_margin: None }], dropped: Vec::new(), blank: Vec::new(), unfiltered: false };
+        let mut table = inner(CropKind::Table);
+        assert_eq!(trim_ignored(&mut table, &ink, &[guide]), 1);
+        assert!(table.crops.is_empty() && table.blank.len() == 1, "{:?}", table.crops);
+        let mut sign = inner(CropKind::Sign);
+        assert_eq!(trim_ignored(&mut sign, &ink, &[guide]), 0);
+        assert_eq!(sign.crops.len(), 1, "서명 조각은 남김");
+    }
+
+    #[test]
+    fn the_notice_zone_moves_with_the_frame_offset() {
+        // 급지가 (9, 40) px 밀린 스캔: 마스터 좌표의 안내문 자리를 그대로 대면 띠를 60 % 넘게 덮지 못해 자르지 못하고, 도각 이동만큼 옮기면 자릅니다.
+        let (dx, dy) = (9u32, 40u32);
+        let mut strokes = Vec::new();
+        for line_y in [1260u32, 1290, 1320] {
+            let mut x = 100;
+            while x + 10 <= 1250 {
+                strokes.push((x + dx, line_y + dy, x + 10 + dx, line_y + 14 + dy));
+                x += 16;
+            }
+        }
+        for x in (1480..1800).step_by(16) {
+            strokes.push((x + dx, 1230 + dy, x + 10 + dx, 1244 + dy));
+        }
+        let ink = page(2000, 1500, &strokes, 255);
+        let plan = || PagePlan {
+            width: 2000,
+            height: 1500,
+            crops: vec![CropPlan { kind: CropKind::Form, bbox: (60 + dx, 1220 + dy, 1960, 1360 + dy), upscale: 1.0, guide_margin: None }],
+            dropped: Vec::new(),
+            blank: Vec::new(),
+            unfiltered: false,
+        };
+        let guide = [(70, 1255, 1320, 1340)];
+        assert_eq!(trim_ignored(&mut plan(), &ink, &guide), 0, "옮기지 않은 자리는 띠와 어긋남");
+        let mut shifted = plan();
+        assert_eq!(trim_ignored(&mut shifted, &ink, &moved(&guide, (dx as i32, dy as i32))), 1);
+        let c = shifted.crops[0].bbox;
+        assert!(c.0 >= 1320 + dx && c.0 <= 1480 + dx && c.2 >= 1790 + dx, "서명란만 남음: {c:?}");
     }
 
     #[test]

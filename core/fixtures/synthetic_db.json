@@ -9,7 +9,27 @@
       { "code": "10", "label": "1호기", "capacity_mw": 1200 },
       { "code": "20", "label": "2호기", "capacity_mw": 1200 },
       { "code": "00", "label": "공용설비", "capacity_mw": 0 }
-    ]
+    ],
+    "domain": "power_plant",
+    "code_scheme": "kks",
+    "terms": {
+      "code": "KKS",
+      "procedure": "AOP",
+      "procedure_long": "비정상 운전절차서(AOP)",
+      "change": "MOC",
+      "telemetry": "DCS",
+      "control_room": "주제어실",
+      "drawing": "P&ID",
+      "site": "발전소",
+      "field_worker": "현장 운전원",
+      "trip": "트립",
+      "supervisor": "교대감독",
+      "archive_prefix": "MCR",
+      "permit": "PTW · LOTO",
+      "bypass": "급수 바이패스",
+      "console_title": "1.2GW 발전소 관제 콘솔",
+      "kiosk_title": "1.2GW 발전소 현장 순시 · 정비 단말"
+    }
   },
   "sectors": [
     { "key": "boiler", "code": "Sector01Boiler", "building": "101동", "label": "보일러동", "kks": "10UHA", "drawing": "PID-101-HAD", "blurb": "과열기 · 재열기 · 미분탄기 · 버너 계통" },
@@ -28,11 +48,11 @@
     { "code": "OUT", "label": "옥외", "elevation_m": 0.0 }
   ],
   "drawings": [
-    { "id": "PID-101-HAD", "sector": "boiler", "title": "보일러 연소 및 증기 발생 계통도", "rev": "Rev.5", "issued": "2026-09-17", "signer": "E102" },
-    { "id": "PID-102-MAA", "sector": "turbine", "title": "주증기 터빈 및 발전기 계통도", "rev": "Rev.4", "issued": "2026-06-02", "signer": "E118" },
-    { "id": "PID-103-LAB", "sector": "feedwater", "title": "주급수펌프 및 고압급수 제어 계통도", "rev": "Rev.3", "issued": "2026-03-15", "signer": "E102" },
-    { "id": "PID-104-BBA", "sector": "electric", "title": "소내 전력 및 6.9kV 배전 계통도", "rev": "Rev.2", "issued": "2025-12-08", "signer": "E118" },
-    { "id": "PID-105-HLB", "sector": "env", "title": "연소가스 처리 및 통풍 계통도", "rev": "Rev.2", "issued": "2026-01-20", "signer": "E102" }
+    { "id": "PID-101-HAD", "sector": "boiler", "title": "보일러 연소 및 증기 발생 계통도", "rev": "Rev.5", "issued": "2026-09-17", "signer": "E102", "ignore_zones": [[0.035, 0.895, 0.66, 0.975]] },
+    { "id": "PID-102-MAA", "sector": "turbine", "title": "주증기 터빈 및 발전기 계통도", "rev": "Rev.4", "issued": "2026-06-02", "signer": "E118", "ignore_zones": [[0.035, 0.895, 0.66, 0.975]] },
+    { "id": "PID-103-LAB", "sector": "feedwater", "title": "주급수펌프 및 고압급수 제어 계통도", "rev": "Rev.3", "issued": "2026-03-15", "signer": "E102", "ignore_zones": [[0.035, 0.895, 0.66, 0.975]] },
+    { "id": "PID-104-BBA", "sector": "electric", "title": "소내 전력 및 6.9kV 배전 계통도", "rev": "Rev.2", "issued": "2025-12-08", "signer": "E118", "ignore_zones": [[0.035, 0.895, 0.66, 0.975]] },
+    { "id": "PID-105-HLB", "sector": "env", "title": "연소가스 처리 및 통풍 계통도", "rev": "Rev.2", "issued": "2026-01-20", "signer": "E102", "ignore_zones": [[0.035, 0.895, 0.66, 0.975]] }
   ],
   "equipment": [
     { "kks": "10HFC10AJ001", "name": "미분탄기 A", "sector": "boiler", "floor": "1F", "drawing": "PID-101-HAD", "kind": "mill", "bbox": [0.140, 0.130, 0.305, 0.255] },
@@ -245,7 +265,8 @@
         "계측제어 담당이 전송기와 입출력 카드를 점검한다"
       ],
       "risk_actions": [],
-      "high_risk": false
+      "high_risk": false,
+      "role": "flatline"
     },
     {
       "id": "AOP-COM-EMI01",
@@ -257,7 +278,8 @@
         "같은 잡음이 반복되면 계측 케이블 차폐와 접지를 점검한다"
       ],
       "risk_actions": [],
-      "high_risk": false
+      "high_risk": false,
+      "role": "spike"
     }
   ],
   "a0_drawings": [

@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { shortTag, useTerms } from "./domain";
 import { fmt } from "./plant";
 import type { Plant, Timeline } from "./types";
 import { WaveChart, type Trace } from "./WaveChart";
@@ -19,6 +20,9 @@ interface Mitigation {
 }
 
 interface PhysicsStatus {
+  /** 그리는 태그 (원인 밸브 · 우회 밸브 · 유량 · 펌프 토출압 · 하류 온도)와 하류 온도 태그. 지금 도메인 원장의 `physics` 입니다. */
+  shown: string[];
+  hot_tag: string;
   running: boolean;
   busy: boolean;
   t_secs: number;
@@ -41,12 +45,7 @@ interface PhysicsStatus {
   note: string | null;
 }
 
-const TRACES: Trace[] = [
-  { tag: "10LAB20CG102", title: "① 103동 주 조절밸브 개도 (10LAB20CG102, %)", color: "#ff6b3d" },
-  { tag: "10LAB20CG103", title: "② 급수 바이패스 개도 (10LAB20CG103, %)", color: "#9ae66e" },
-  { tag: "10LAB20CF001", title: "③ 급수 유량 (10LAB20CF001, t/h)", color: "#4fd1c5" },
-  { tag: "10HAH10CT001", title: "④ 101동 과열기 출구 증기 온도 (10HAH10CT001, ℃)", color: "#f6c453" },
-];
+const TRACE_COLORS = ["#ff6b3d", "#9ae66e", "#4fd1c5", "#7aa2ff", "#f6c453"];
 
 const STATE_LABEL: Record<string, string> = {
   STABLE: "STABLE",
@@ -59,6 +58,7 @@ const STATE_LABEL: Record<string, string> = {
 /** 물리엔진 이벤트 시뮬레이터 & Zoro-1 자율 대응 (Part 8-5). 고장을 주입하면 식으로 연쇄가 생기고, SDS 추적기가 사건을 열고,
  *  정책이 허락하면 Tier 1 우회 개방을 자동 실행합니다. 명령은 시뮬레이터에만 들어갑니다. */
 export function PhysicsPanel({ plant, supervisor, automation, onOpenIncident }: { plant: Plant; supervisor: string; automation: boolean; onOpenIncident: (id: string) => void }) {
+  const terms = useTerms();
   const [st, setSt] = useState<PhysicsStatus | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
 
@@ -88,26 +88,42 @@ export function PhysicsPanel({ plant, supervisor, automation, onOpenIncident }: 
 
   const timeline: Timeline | null = st && Object.keys(st.series).length ? { t0_ms: st.t0_ms, period_ms: st.period_ms, now_ms: st.now_ms, series: st.series, channels: {} } : null;
   const m = st?.mitigation;
-  const trip = plant.sensors.find((s) => s.tag === "10HAH10CT001")?.trip_high ?? 645;
+  // 그리는 태그 (펌프 토출압은 빼고 넷): 이름은 원장의 설비 · 센서 이름
+  const traces = useMemo<Trace[]>(
+    () =>
+      (st?.shown ?? [])
+        .filter((tag) => !shortTag(tag).startsWith("CP"))
+        .map((tag, i) => {
+          const s = plant.sensors.find((x) => x.tag === tag);
+          const e = plant.equipment.find((x) => x.kks === s?.kks);
+          const sector = plant.sectors.find((x) => x.key === e?.sector);
+          return { tag, title: `${"①②③④⑤"[i]} ${sector?.building ?? ""} ${e?.name ?? ""} ${s?.label ?? ""} (${tag}, ${s?.unit ?? ""})`, color: TRACE_COLORS[i % TRACE_COLORS.length] };
+        }),
+    [st?.shown, plant],
+  );
+  const hot = plant.sensors.find((s) => s.tag === st?.hot_tag);
+  const hotEq = plant.equipment.find((e) => e.kks === hot?.kks);
+  const valve = plant.equipment.find((e) => e.kks === plant.sensors.find((s) => s.tag === st?.shown[0])?.kks);
+  const trip = hot?.trip_high ?? 0;
 
   return (
     <div className="physics">
       <div className="physics-controls">
-        <span className={`tag ${automation ? "auto" : ""}`}>{automation ? "🟢 자동화 모드" : "보조 모드 (교대감독 실행)"}</span>
+        <span className={`tag ${automation ? "auto" : ""}`}>{automation ? "🟢 자동화 모드" : `보조 모드 (${terms.supervisor} 실행)`}</span>
         <button className="plain" onClick={() => call("physics_start")}>
           {st?.running ? "↺ 정상 운전으로 리셋" : "▶ 시뮬레이터 시작"}
         </button>
         <button className="danger-fill" disabled={!st?.running} onClick={() => call("physics_inject", { kind: "valve_stuck" })}>
-          🔥 103동 급수밸브 18% 고착 주입
+          🔥 {valve?.name ?? "조절밸브"} 18% 고착 주입
         </button>
         <button className="plain" disabled={!st?.running} onClick={() => call("physics_inject", { kind: "sensor_drift" })}>
-          📉 102동 압력 전송기 A 드리프트
+          📉 압력 전송기 A 드리프트
         </button>
         <button className="plain" disabled={!st?.running} onClick={() => call("physics_stop")}>
           ■ 정지
         </button>
         <span className="muted">
-          물리 틱 100 ms · t = {st ? st.t_secs.toFixed(1) : "-"}s · 과열기 고점 {st ? fmt(st.peak_sh) : "-"} ℃ (트립 {fmt(trip)} ℃)
+          물리 틱 100 ms · t = {st ? st.t_secs.toFixed(1) : "-"}s · {hotEq?.name ?? "하류"} 고점 {st ? fmt(st.peak_sh) : "-"} ℃ ({terms.trip} {fmt(trip)} ℃)
         </span>
       </div>
       {msg && <p className="note">{msg}</p>}
@@ -115,7 +131,7 @@ export function PhysicsPanel({ plant, supervisor, automation, onOpenIncident }: 
         <section>
           <h4>[실시간 물리엔진 → 시계열 · SDS 트래킹 → 자율 복구 파형] (최근 60초)</h4>
           {timeline ? (
-            <WaveChart timeline={timeline} traces={TRACES} sensors={plant.sensors} from={timeline.t0_ms} to={timeline.now_ms} markers={[{ at_ms: timeline.now_ms, label: "지금", color: "#ffffff" }]} height={96} />
+            <WaveChart timeline={timeline} traces={traces} sensors={plant.sensors} from={timeline.t0_ms} to={timeline.now_ms} markers={[{ at_ms: timeline.now_ms, label: "지금", color: "#ffffff" }]} height={96} />
           ) : (
             <p className="muted">시뮬레이터를 시작하세요. 처음 25초는 정상 운전 기준 구간입니다.</p>
           )}
@@ -185,7 +201,7 @@ export function PhysicsPanel({ plant, supervisor, automation, onOpenIncident }: 
                 </div>
               ))}
               <p>
-                최솟값(확신도) <b>{m.decided.judgement.confidence != null ? m.decided.judgement.confidence.toFixed(3) : "없음"}</b> · {m.auto ? "자동 실행" : `교대감독 확인: ${m.reason}`}
+                최솟값(확신도) <b>{m.decided.judgement.confidence != null ? m.decided.judgement.confidence.toFixed(3) : "없음"}</b> · {m.auto ? "자동 실행" : `${terms.supervisor} 확인: ${m.reason}`}
               </p>
               {m.executed_at ? (
                 <p className="good">
@@ -193,7 +209,7 @@ export function PhysicsPanel({ plant, supervisor, automation, onOpenIncident }: 
                 </p>
               ) : (
                 <button className="danger-fill" disabled={!supervisor.trim()} onClick={() => call("physics_execute", { supervisorId: supervisor })}>
-                  ⚡ 완화 조치 실행 (교대감독 {supervisor || "사번 필요"})
+                  ⚡ 완화 조치 실행 ({terms.supervisor} {supervisor || "사번 필요"})
                 </button>
               )}
             </div>

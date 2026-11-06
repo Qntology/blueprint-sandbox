@@ -9,6 +9,7 @@ use chrono::{DateTime, Months, NaiveDate, Utc};
 use serde::Serialize;
 
 use crate::causal::CausalReport;
+use crate::domain::Terms;
 use crate::lattice::{AopRow, Lattice};
 use crate::plant::fmt_value;
 use crate::privacy::{find_leaks, FIELD_FORBIDDEN};
@@ -16,16 +17,20 @@ use crate::verdict::Verdict;
 
 /// 보존 기간 (년)
 pub const RETENTION_YEARS: u32 = 5;
-/// 공통 절차서
+/// 공통 절차서 (발전소 원장의 번호. 다른 도메인은 원장의 `role` 로 찾습니다)
 pub const AOP_FLATLINE: &str = "AOP-COM-IC02";
 pub const AOP_SPIKE: &str = "AOP-COM-EMI01";
+
+fn common<'a>(db: &'a Lattice, role: &str, plant_id: &str) -> Option<&'a AopRow> {
+    db.aop_by_role(role).or_else(|| db.aop(plant_id))
+}
 
 /// 판정과 원인으로 표준 절차서를 고릅니다. 승인된 변경 반영 · 위조 잠금에는 절차서가 없습니다.
 pub fn select_aop<'a>(db: &'a Lattice, verdict: Verdict, alarm_tag: Option<&str>, causal: Option<&CausalReport>) -> Option<&'a AopRow> {
     match verdict {
-        Verdict::G1SensorFlatline => db.aop(AOP_FLATLINE),
-        Verdict::G1SpikeFiltered | Verdict::G3EligibleNormal => db.aop(AOP_SPIKE),
-        Verdict::G2SensorDriftIsolated | Verdict::G2FieldRecheckRequired => alarm_tag.and_then(|t| db.aop_for(&[t])).or_else(|| db.aop(AOP_FLATLINE)),
+        Verdict::G1SensorFlatline => common(db, "flatline", AOP_FLATLINE),
+        Verdict::G1SpikeFiltered | Verdict::G3EligibleNormal => common(db, "spike", AOP_SPIKE),
+        Verdict::G2SensorDriftIsolated | Verdict::G2FieldRecheckRequired => alarm_tag.and_then(|t| db.aop_for(&[t])).or_else(|| common(db, "flatline", AOP_FLATLINE)),
         Verdict::G3AdverseUpstreamCause => {
             let root = causal.and_then(|c| c.root.as_ref()).map(|r| r.tag.as_str());
             let tags: Vec<&str> = root.into_iter().chain(alarm_tag).collect();
@@ -78,16 +83,17 @@ pub fn check_field_text(text: &str, extra: &[String]) -> Result<(), (Verdict, us
     }
 }
 
-/// 현장 단말에 보여 줄 확정 안내. 내부 판정은 넣지 않습니다.
-pub fn field_notice(incident_id: &str, final_code: &str) -> String {
+/// 현장 단말에 보여 줄 확정 안내. 내부 판정은 넣지 않습니다. 관제실 이름은 도메인 용어를 씁니다 (주제어실 · NOC 관제실).
+pub fn field_notice(incident_id: &str, final_code: &str, terms: &Terms) -> String {
+    let room = &terms.control_room;
     let body = if final_code.contains("G2_MOC_VERIFIED") {
-        "제출한 설비 변경 내용이 승인 기록과 확인되어 주제어실 기준치에 반영되었습니다."
+        format!("제출한 설비 변경 내용이 승인 기록과 확인되어 {room} 기준치에 반영되었습니다.")
     } else if final_code.contains("G2_REJECT_CONTRADICTION_LOCK") {
-        "제출한 변경 내용을 승인 기록에서 확인하지 못했습니다. 기술책임자에게 변경 승인 여부를 확인해 주세요."
+        "제출한 변경 내용을 승인 기록에서 확인하지 못했습니다. 기술책임자에게 변경 승인 여부를 확인해 주세요.".to_string()
     } else if final_code.starts_with("SUPERVISOR_REJECT") {
-        "주제어실에서 제출 내용을 반려했습니다. 필요하면 다시 점검해 주세요."
+        format!("{room}에서 제출 내용을 반려했습니다. 필요하면 다시 점검해 주세요.")
     } else {
-        "주제어실이 현장 보고를 확인하고 조치를 확정했습니다. 추가 지시는 무전으로 안내합니다."
+        format!("{room}이 현장 보고를 확인하고 조치를 확정했습니다. 추가 지시는 무전으로 안내합니다.")
     };
     format!("처리 결과 안내 (접수 번호 {incident_id})\n{body}")
 }
@@ -143,8 +149,20 @@ mod tests {
     }
 
     #[test]
+    fn data_center_procedures_are_found_by_role_and_cause() {
+        let db = Lattice::embedded_for(crate::domain::DomainMode::AiDataCenter).unwrap();
+        assert_eq!(select_aop(&db, Verdict::G1SensorFlatline, Some("DC1GPU10CT02"), None).unwrap().id, "EOP-COM-BMC02");
+        assert_eq!(select_aop(&db, Verdict::G1SpikeFiltered, Some("DC1GPU10CT01"), None).unwrap().id, "EOP-COM-EMI01");
+        assert_eq!(select_aop(&db, Verdict::G2SensorDriftIsolated, Some("DC1MNF10CP01"), None).unwrap().id, "EOP-101-IC01");
+        assert_eq!(select_aop(&db, Verdict::G3ViolationHighRisk, Some("DC1BES10CT01"), None).unwrap().id, "EOP-104-BAT01");
+        let notice = field_notice("F-1", "G2_MOC_VERIFIED", db.terms());
+        assert!(notice.contains("NOC 관제실 기준치") && check_field_text(&notice, &[]).is_ok(), "{notice}");
+    }
+
+    #[test]
     fn field_text_with_internal_terms_or_other_names_is_blocked() {
-        assert!(check_field_text(&field_notice("F-1", "G2_MOC_VERIFIED"), &[]).is_ok());
+        assert!(check_field_text(&field_notice("F-1", "G2_MOC_VERIFIED", &Terms::default()), &[]).is_ok());
+        assert!(field_notice("F-1", "SUPERVISOR_REJECT:G3_ELIGIBLE_NORMAL", &Terms::default()).contains("주제어실에서 제출 내용을 반려"));
         assert!(check_field_text("G3_VIOLATION_HIGH_RISK 확신도 0.97", &[]).is_err());
         assert!(check_field_text("김태현 엔지니어의 변경", &["김태현".to_string()]).is_err());
         assert_eq!(retention_until(NaiveDate::from_ymd_opt(2026, 11, 4).unwrap()), NaiveDate::from_ymd_opt(2031, 11, 4).unwrap());

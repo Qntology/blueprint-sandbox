@@ -1,4 +1,5 @@
 // 백엔드(app/src-tauri/src/lib.rs, core 의 Serialize) 와 같은 모양입니다.
+import type { DomainMode, Terms } from "./domain";
 
 export type Dir = "Up" | "Down";
 
@@ -82,6 +83,10 @@ export interface Aop {
 export interface Plant {
   name: string;
   kind: string;
+  /** 관제 도메인과 설비 코드 체계 · 화면 용어 (추가 개선안) */
+  domain: DomainMode;
+  code_scheme: "kks" | "dcim";
+  terms: Terms;
   sectors: Sector[];
   floors: Floor[];
   drawings: Drawing[];
@@ -320,6 +325,8 @@ export interface Interlock {
   target: string;
   fault: string;
   steps: InterlockStep[];
+  /** 계측 근거 이름 (DCS · BMC·DCIM) */
+  telemetry: string;
 }
 
 export type InterlockCheck = { kind: "below"; tag: string; value: number } | { kind: "at_least"; tag: string; value: number } | { kind: "loto" };
@@ -395,8 +402,17 @@ export interface Detail {
   timeline: Timeline;
   flows: EdgeFlow[];
   issues: IssueReport;
+  /** 센서별 SDS 신호 상태 전이 (도면 배지 · 마인드맵 링 · SDS 도킹 차트) */
+  signals: SdsTrack[];
   scenario: string | null;
   sim_time: string;
+}
+
+export interface SdsTrack {
+  tag: string;
+  kks: string;
+  /** [시각 epoch ms, 상태 코드] */
+  transitions: [number, string][];
 }
 
 export interface Bottleneck {

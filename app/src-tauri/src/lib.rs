@@ -11,17 +11,18 @@
 
 mod physics_mode;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use blueprint_core::ai::accel;
 use blueprint_core::ai::document::{Baseline, DocumentReader, PageReading};
 use blueprint_core::ai::siglip2::delta::{DeltaParams, MasterSet};
 use blueprint_core::case::{DeviationExcuse, FieldKind, ReadTimings, Signature};
-use blueprint_core::extract::{extract, DocKind, Extracted, PageText};
+use blueprint_core::domain::DomainMode;
+use blueprint_core::extract::{code_field, extract, DocKind, Extracted, PageText};
 use blueprint_core::interlock::Evidence;
 use blueprint_core::issues;
 use blueprint_core::audit::AuditCategory;
@@ -49,22 +50,32 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, State, Window};
 const CONSOLE: &str = "console";
 const FIELD: &str = "field";
 
-/// 마스터 도면 (사전 인덱싱한 P&ID). 도면 뷰가 이 이미지 위에 설비 상자를 얹습니다.
-const DRAWINGS: [(&str, &[u8]); 5] = [
+/// 마스터 도면 (사전 인덱싱한 발전소 P&ID 5장 · AI 데이터센터 MEP · SLD 5장). 도면 뷰가 이 이미지 위에 설비 상자를 얹습니다.
+const DRAWINGS: [(&str, &[u8]); 10] = [
     ("PID-101-HAD", include_bytes!("../../../core/fixtures/drawings/PID-101-HAD.png")),
     ("PID-102-MAA", include_bytes!("../../../core/fixtures/drawings/PID-102-MAA.png")),
     ("PID-103-LAB", include_bytes!("../../../core/fixtures/drawings/PID-103-LAB.png")),
     ("PID-104-BBA", include_bytes!("../../../core/fixtures/drawings/PID-104-BBA.png")),
     ("PID-105-HLB", include_bytes!("../../../core/fixtures/drawings/PID-105-HLB.png")),
+    ("MEP-101-POD", include_bytes!("../../../core/fixtures/drawings/MEP-101-POD.png")),
+    ("NET-102-FAB", include_bytes!("../../../core/fixtures/drawings/NET-102-FAB.png")),
+    ("MEP-103-CDU", include_bytes!("../../../core/fixtures/drawings/MEP-103-CDU.png")),
+    ("SLD-104-PWR", include_bytes!("../../../core/fixtures/drawings/SLD-104-PWR.png")),
+    ("MEP-105-CHL", include_bytes!("../../../core/fixtures/drawings/MEP-105-CHL.png")),
 ];
 
 /// 도면 생성기가 그린 배관 꺾은선 (정규화 좌표). 도면 뷰의 흐름 오버레이가 이미지와 같은 선을 따라 그립니다.
-const DRAWING_META: [&str; 5] = [
+const DRAWING_META: [&str; 10] = [
     include_str!("../../../core/fixtures/drawings/PID-101-HAD.json"),
     include_str!("../../../core/fixtures/drawings/PID-102-MAA.json"),
     include_str!("../../../core/fixtures/drawings/PID-103-LAB.json"),
     include_str!("../../../core/fixtures/drawings/PID-104-BBA.json"),
     include_str!("../../../core/fixtures/drawings/PID-105-HLB.json"),
+    include_str!("../../../core/fixtures/drawings/MEP-101-POD.json"),
+    include_str!("../../../core/fixtures/drawings/NET-102-FAB.json"),
+    include_str!("../../../core/fixtures/drawings/MEP-103-CDU.json"),
+    include_str!("../../../core/fixtures/drawings/SLD-104-PWR.json"),
+    include_str!("../../../core/fixtures/drawings/MEP-105-CHL.json"),
 ];
 
 /// A0 종합 도면 (Part 8-4): 배치 · 격자 타일 · 설비마다 A0 좌표와 든 타일
@@ -89,11 +100,11 @@ fn a0_views(db: &Lattice) -> Value {
     Value::Array(views)
 }
 
-fn drawing_pipes() -> Value {
+fn drawing_pipes(db: &Lattice) -> Value {
     let mut out = serde_json::Map::new();
     for text in DRAWING_META {
         if let Ok(meta) = serde_json::from_str::<Value>(text) {
-            if let (Some(id), Some(pipes)) = (meta["drawing"].as_str(), meta.get("pipes")) {
+            if let (Some(id), Some(pipes)) = (meta["drawing"].as_str().filter(|id| db.drawing(id).is_some()), meta.get("pipes")) {
                 out.insert(id.to_string(), pipes.clone());
             }
         }
@@ -122,8 +133,10 @@ impl Live {
 /// 관제 상태. 엔진은 진행 중 사건의 세션을 들고 있습니다.
 struct Desk {
     engine: Mutex<Engine>,
-    db: Lattice,
-    scenarios: ScenarioSet,
+    /// 지금 도메인(발전소 · AI 데이터센터)의 원장과 시나리오. 도메인을 바꾸면 통째로 갈아 끼웁니다 (명령마다 같은 사본을 씁니다).
+    ledger: RwLock<Arc<Lattice>>,
+    cases: RwLock<Arc<ScenarioSet>>,
+    domain: Mutex<DomainMode>,
     /// GPU 를 쓰는 일은 한 번에 하나입니다.
     gpu: Mutex<()>,
     reader: Mutex<Option<Arc<DocumentReader>>>,
@@ -146,6 +159,18 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+impl Desk {
+    /// 지금 도메인의 원장 (사본 손잡이)
+    fn db(&self) -> Arc<Lattice> {
+        self.ledger.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// 지금 도메인의 합성 시나리오
+    fn scenarios(&self) -> Arc<ScenarioSet> {
+        self.cases.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
 /// 엔진 잠금은 준비 · 반영 때만 짧게 쥐고, 모델(판단 · 글쓰기)은 GPU 잠금만 쥔 채 돌립니다.
 /// 모델이 생각하는 동안에도 사건 목록 · 상태 줄 · 교대감독의 조회와 결정이 멈추지 않습니다.
 impl EngineAccess for Desk {
@@ -163,7 +188,7 @@ fn console_only(window: &Window) -> Result<(), String> {
     if window.label() == CONSOLE {
         Ok(())
     } else {
-        Err("주제어실 콘솔에서만 할 수 있습니다".to_string())
+        Err("관제 콘솔에서만 할 수 있습니다".to_string())
     }
 }
 
@@ -394,6 +419,10 @@ struct ConnectorDto {
 struct PlantDto {
     name: String,
     kind: String,
+    domain: DomainMode,
+    code_scheme: blueprint_core::plant::CodeScheme,
+    /// 화면 용어 (KKS · AOP · DCS · 주제어실 ↔ 자산코드 · EOP · BMC · NOC 관제실)
+    terms: Value,
     sectors: Value,
     floors: Value,
     drawings: Value,
@@ -410,7 +439,8 @@ struct PlantDto {
 #[tauri::command(async)]
 fn plant_topology(window: Window, desk: State<'_, Desk>) -> Result<PlantDto, String> {
     console_only(&window)?;
-    let db = &desk.db;
+    let db_arc = desk.db();
+    let db = &*db_arc;
     let engine = lock(&desk.engine);
     let equipment = db
         .equipment_all()
@@ -456,6 +486,9 @@ fn plant_topology(window: Window, desk: State<'_, Desk>) -> Result<PlantDto, Str
     Ok(PlantDto {
         name: db.plant().name.clone(),
         kind: db.plant().kind.clone(),
+        domain: db.domain(),
+        code_scheme: db.scheme(),
+        terms: json!(db.terms()),
         sectors: json!(db.sectors()),
         floors: json!(db.floors()),
         drawings: json!(db.drawings()),
@@ -464,7 +497,7 @@ fn plant_topology(window: Window, desk: State<'_, Desk>) -> Result<PlantDto, Str
         edges: json!(db.edges()),
         connectors,
         aops: json!(db.aops()),
-        pipes: drawing_pipes(),
+        pipes: drawing_pipes(db),
         a0: a0_views(db),
     })
 }
@@ -493,7 +526,7 @@ struct ScenarioDto {
 fn scenario_list(window: Window, desk: State<'_, Desk>) -> Result<Vec<ScenarioDto>, String> {
     console_only(&window)?;
     Ok(desk
-        .scenarios
+        .scenarios()
         .scenarios
         .iter()
         .map(|s| ScenarioDto { id: s.id.clone(), title: s.title.clone(), story: s.story.clone(), has_alarm: s.alarm.is_some(), scans: s.scans.iter().map(|x| x.image.clone()).collect() })
@@ -508,16 +541,17 @@ fn notify_console(app: &AppHandle) {
 #[tauri::command(async)]
 fn inject_scenario(window: Window, app: AppHandle, desk: State<'_, Desk>, id: String) -> Result<Option<String>, String> {
     console_only(&window)?;
-    let s = desk.scenarios.get(&id).ok_or_else(|| format!("시나리오가 없습니다: {id}"))?;
-    let telemetry = s.telemetry(&desk.scenarios);
+    let (db, set) = (desk.db(), desk.scenarios());
+    let s = set.get(&id).ok_or_else(|| format!("시나리오가 없습니다: {id}"))?;
+    let telemetry = s.telemetry(&set);
     let sim_at = s.time(s.now_s);
-    let end = s.time((desk.scenarios.from_s + (s.series.values().next().map_or(0, |v| v.len()) as i64 - 1) * desk.scenarios.period_s) as f64);
+    let end = s.time((set.from_s + (s.series.values().next().map_or(0, |v| v.len()) as i64 - 1) * set.period_s) as f64);
     *lock(&desk.live) = Some(Live { scenario: s.id.clone(), telemetry, sim_at, wall_at: Instant::now(), end });
     if s.alarm.is_none() {
         notify_console(&app);
         return Ok(None);
     }
-    let result = staged::open(&*desk, &desk.db, "INC", Utc::now(), false, |id| s.incident(&desk.scenarios, id)).map(|(id, _)| id);
+    let result = staged::open(&*desk, &db, "INC", Utc::now(), false, |id| s.incident(&set, id)).map(|(id, _)| id);
     notify_console(&app);
     result.map(Some).map_err(|e| format!("{e:#}"))
 }
@@ -650,6 +684,8 @@ struct DetailDto {
     flows: Value,
     /// 단일 · 절차 · 복합 이슈 분해 (Part 8-6)
     issues: Value,
+    /// 센서별 SDS 신호 상태 전이 (CCTV 도킹 차트 · 도면 배지)
+    signals: Vec<SdsTrack>,
     scenario: Option<String>,
     sim_time: String,
 }
@@ -697,9 +733,11 @@ fn incident_detail(window: Window, desk: State<'_, Desk>, id: String) -> Result<
         })
         .collect();
     let now_ms = s.incident.now_ms();
-    let flows = mining::edge_flows(&desk.db, Some(&s.incident.telemetry), now_ms, Some(&s.analysis));
+    let db = desk.db();
+    let flows = mining::edge_flows(&db, Some(&s.incident.telemetry), now_ms, Some(&s.analysis));
     let intercepted: Vec<String> = engine.store.audit().of(&id).iter().filter(|e| e.category == AuditCategory::IllegalActionIntercepted).map(|e| e.detail.clone()).collect();
-    let issues = issues::decompose(&desk.db, &s.analysis, &s.incident.reports, &intercepted);
+    let issues = issues::decompose(&db, &s.analysis, &s.incident.reports, &intercepted);
+    let signals = sds_tracks(&db, &s.incident.telemetry, s.analysis.sds.center_ms, now_ms);
     Ok(DetailDto {
         id: id.clone(),
         state: if s.status == SessionStatus::AwaitingField { "awaiting_field" } else { "review" },
@@ -715,6 +753,7 @@ fn incident_detail(window: Window, desk: State<'_, Desk>, id: String) -> Result<
         timeline: timeline(&s.incident.telemetry, now_ms),
         flows: json!(flows),
         issues: json!(issues),
+        signals,
         scenario: s.incident.scenario.clone(),
         sim_time: plant::local(s.incident.received_at).format("%H:%M:%S").to_string(),
     })
@@ -741,7 +780,8 @@ struct MermaidInput {
 #[tauri::command(async)]
 fn mermaid_source(window: Window, desk: State<'_, Desk>, input: MermaidInput) -> Result<String, String> {
     console_only(&window)?;
-    let db = &desk.db;
+    let db_arc = desk.db();
+    let db = &*db_arc;
     let engine = lock(&desk.engine);
     let session = input.incident.as_deref().and_then(|i| engine.store.active(i));
     let analysis = session.map(|s| &s.analysis);
@@ -760,6 +800,35 @@ fn mermaid_source(window: Window, desk: State<'_, Desk>, input: MermaidInput) ->
         }
         _ => None,
     };
+    // 개선안 2-2: 설비 블록에 지금 SDS 상태 · 기울기, 원인 경로 간선에 관측 Δt 와 배관 허용 범위
+    let mut badges: BTreeMap<String, String> = BTreeMap::new();
+    let mut notes: BTreeMap<(String, String), String> = BTreeMap::new();
+    if let Some(s) = session {
+        let a = &s.analysis;
+        for track in sds_tracks(db, &s.incident.telemetry, a.sds.center_ms, s.incident.now_ms()) {
+            let Some((_, code)) = track.transitions.last() else { continue };
+            let unit = db.sensor(&track.tag).map(|x| x.unit.clone()).unwrap_or_default();
+            let slope = a.metrics.iter().find(|m| m.sensor_tag == track.tag).map(|m| format!(" · dx/dt {:+.2} {unit}/s", m.slope_per_sec_milli as f64 / 1000.0)).unwrap_or_default();
+            badges.entry(track.kks.clone()).or_insert_with(|| format!("SDS: {code}{slope}"));
+        }
+        // 계측이 없는 설비(헤더 등)는 변곡이 없어, 변곡이 있는 두 설비 사이 구간의 시차를 구간 첫 간선에 적고 허용 범위는 간선 지연을 더합니다.
+        let departed = |kks: &str| a.chain.iter().find(|c| c.kind == "departure" && c.kks == kks).map(|c| c.at_ms);
+        let mut anchor: Option<(usize, f64)> = None;
+        for (i, kks) in path.iter().enumerate() {
+            let Some(at) = departed(kks) else { continue };
+            if let Some((j, up)) = anchor {
+                let edges: Option<Vec<_>> = path[j..=i].windows(2).map(|w| db.edge_between(&w[0], &w[1])).collect();
+                if let Some(edges) = edges {
+                    let (lo, hi) = edges.iter().fold((0.0, 0.0), |(lo, hi), e| (lo + e.lag[0], hi + e.lag[1]));
+                    let lag = (at - up) / 1000.0;
+                    let ok = lag >= lo - 0.5 && lag <= hi + 0.5;
+                    let hops = if i - j > 1 { format!(" · {}홉", i - j) } else { String::new() };
+                    notes.insert((path[j].clone(), path[j + 1].clone()), format!("Δt {lag:+.1}s{hops} ∈ [{}~{}s] {}", plant::fmt_value(lo), plant::fmt_value(hi), if ok { "✓" } else { "✗" }));
+                }
+            }
+            anchor = Some((i, at));
+        }
+    }
     Ok(mermaid::source(
         db,
         &flows,
@@ -770,6 +839,8 @@ fn mermaid_source(window: Window, desk: State<'_, Desk>, input: MermaidInput) ->
             root: root.map(|r| r.kks.as_str()),
             path: &path,
             mining: input.mining,
+            badges: Some(&badges),
+            edge_notes: Some(&notes),
         },
     ))
 }
@@ -785,7 +856,7 @@ fn mining_overview(window: Window, desk: State<'_, Desk>) -> Result<MiningDto, S
     console_only(&window)?;
     let engine = lock(&desk.engine);
     let now = Utc::now();
-    Ok(MiningDto { bottlenecks: json!(mining::bottlenecks(&desk.db, &engine.store, now)), lanes: json!(mining::lanes(&engine.store, now)) })
+    Ok(MiningDto { bottlenecks: json!(mining::bottlenecks(&desk.db(), &engine.store, now)), lanes: json!(mining::lanes(&engine.store, now)) })
 }
 
 // ───────────────────────── 교대감독 결정 ─────────────────────────
@@ -893,8 +964,9 @@ fn search(window: Window, desk: State<'_, Desk>, query: String) -> Result<bluepr
         Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
         Err(std::sync::TryLockError::WouldBlock) => None,
     };
-    let corpus = blueprint_core::search::Corpus::build(&desk.db, live.as_ref().map(|(t, at)| (t, *at)), engine.as_ref().map(|e| &e.store));
-    let mut result = blueprint_core::search::search(&desk.db, &corpus, &query);
+    let db = desk.db();
+    let corpus = blueprint_core::search::Corpus::build(&db, live.as_ref().map(|(t, at)| (t, *at)), engine.as_ref().map(|e| &e.store));
+    let mut result = blueprint_core::search::search(&db, &corpus, &query);
     if engine.is_none() {
         result.notes.push("엔진이 사건을 분석 중이라 이번 검색에는 진행 중 사건 · 보관 문서가 빠졌습니다".into());
     }
@@ -953,7 +1025,7 @@ fn console_status(window: Window, desk: State<'_, Desk>) -> Result<ConsoleDto, S
         engine: lock(&desk.status).clone(),
         pending: engine.store.active_count(),
         archived: engine.store.archive().len(),
-        graph_nodes: desk.db.node_count(),
+        graph_nodes: desk.db().node_count(),
         audit_count: audit.len(),
         audit_last: audit.iter().rev().take(6).map(|e| format!("{} {:?} · {}", plant::local(e.at).format("%H:%M:%S"), e.actor, e.detail)).collect(),
         overlays: json!(engine.store.overlays()),
@@ -963,9 +1035,130 @@ fn console_status(window: Window, desk: State<'_, Desk>) -> Result<ConsoleDto, S
 
 /// 판정 코드 · 우리말 이름 · 성격 (콘솔 창 전용)
 #[tauri::command]
-fn verdict_catalog(window: Window) -> Result<Vec<Value>, String> {
+fn verdict_catalog(window: Window, desk: State<'_, Desk>) -> Result<Vec<Value>, String> {
     console_only(&window)?;
-    Ok(blueprint_core::verdict::ALL.iter().map(|v| json!({ "code": v.code(), "label": v.label(), "class": format!("{:?}", v.class()).to_lowercase() })).collect())
+    let db = desk.db();
+    // Gate 0 라우팅 판정의 이름은 지금 도메인의 구역 이름입니다 (SEC_03 은 발전소 103동 급수동, 데이터센터 103동 수냉 CDU룸).
+    let label = |v: &blueprint_core::verdict::Verdict| {
+        Sector::ALL
+            .into_iter()
+            .find(|s| blueprint_core::state_machine::gate0_router::verdict_of(*s) == *v)
+            .and_then(|s| db.sector_for(s))
+            .map(|r| format!("{} {}", r.building, r.label))
+            .unwrap_or_else(|| v.label().to_string())
+    };
+    Ok(blueprint_core::verdict::ALL.iter().map(|v| json!({ "code": v.code(), "label": label(v), "class": format!("{:?}", v.class()).to_lowercase() })).collect())
+}
+
+// ───────────────────────── 도메인 모드 (추가 개선안 4.1절 5번) ─────────────────────────
+
+#[derive(Debug, Serialize)]
+struct DomainDto {
+    mode: DomainMode,
+    label: &'static str,
+    /// 고를 수 있는 도메인 (`[{ mode, label }]`)
+    modes: Vec<Value>,
+    /// 화면 용어 (콘솔 · 현장 단말)
+    terms: Value,
+    site: String,
+}
+
+fn domain_dto(desk: &Desk) -> DomainDto {
+    let mode = *lock(&desk.domain);
+    let db = desk.db();
+    DomainDto {
+        mode,
+        label: mode.label(),
+        modes: DomainMode::ALL.iter().map(|m| json!({ "mode": m, "label": m.label() })).collect(),
+        terms: json!(db.terms()),
+        site: db.plant().name.clone(),
+    }
+}
+
+/// 지금 도메인과 화면 용어 (콘솔 · 현장 단말 모두). 현장 단말에도 내부 정보는 없습니다 (도메인 이름 · 용어뿐).
+#[tauri::command]
+fn domain_info(desk: State<'_, Desk>) -> DomainDto {
+    domain_dto(&desk)
+}
+
+/// 도메인을 바꿉니다 (콘솔 창 전용). 원장 · 시나리오 · 도면 색인을 그 도메인 것으로 갈아 끼우고, 진행 · 보관 사건 · 감사 기록 ·
+/// 자동화 모드 · 물리엔진 · 현장 단말 대기를 비웁니다. 모델(SigLIP2 · gocr · Zoro-1)은 두 도메인이 같아서 그대로 둡니다.
+#[tauri::command(async)]
+fn switch_domain_mode(window: Window, app: AppHandle, desk: State<'_, Desk>, mode: String) -> Result<DomainDto, String> {
+    console_only(&window)?;
+    let mode = DomainMode::from_key(&mode).ok_or_else(|| format!("모르는 도메인입니다: {mode}"))?;
+    if *lock(&desk.domain) == mode {
+        return Ok(domain_dto(&desk));
+    }
+    let db = Lattice::embedded_for(mode).map_err(|e| format!("{e:#}"))?;
+    let set = ScenarioSet::embedded_for(mode).map_err(|e| format!("{e:#}"))?;
+    {
+        let mut ph = lock(&desk.physics);
+        let generation = ph.generation_next();
+        *ph = physics_mode::PhysicsState::stopped(generation);
+    }
+    lock(&desk.engine).reset_for(db.terms().clone());
+    *desk.ledger.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(db);
+    *desk.cases.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(set);
+    *lock(&desk.domain) = mode;
+    *lock(&desk.live) = None;
+    *lock(&desk.field_case) = None;
+    lock(&desk.field_scans).clear();
+    *lock(&desk.field_timings) = None;
+    *lock(&desk.masters) = None;
+    // 새 도메인 마스터 도면 다섯 장으로 델타 색인을 다시 만듭니다 (모델이 열려 있을 때, 뒤에서 1 ~ 2 초).
+    if let Some(reader) = lock(&desk.reader).clone() {
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            let desk = app2.state::<Desk>();
+            match index_masters(&desk, &reader) {
+                // 색인하는 동안 다시 바뀌었으면 버립니다.
+                Ok(set) if *lock(&desk.domain) == mode => *lock(&desk.masters) = Some(Arc::new(set)),
+                Ok(_) => {}
+                Err(e) => eprintln!("[델타] {} 마스터 도면을 색인하지 못했습니다 (Red-line 은 전부 읽음): {e:#}", mode.label()),
+            }
+        });
+    }
+    let dto = domain_dto(&desk);
+    let _ = app.emit("domain_changed", json!({ "mode": mode, "label": mode.label() }));
+    notify_console(&app);
+    Ok(dto)
+}
+
+/// 센서 하나의 SDS 신호 상태 전이 (`STABLE → SLEW_DROP → STUCK_LOW`)
+#[derive(Debug, Serialize)]
+struct SdsTrack {
+    tag: String,
+    kks: String,
+    /// (시각 epoch ms, 상태 코드). 처음 판정부터 바뀐 때만 적습니다.
+    transitions: Vec<(i64, &'static str)>,
+}
+
+/// 사건 계측에서 센서마다 1초 간격으로 신호 모양을 판정해 바뀐 곳만 모읍니다 (SDS 중심 30초 앞부터 분석 시각까지).
+/// 안정에서 한 번도 벗어나지 않은 센서는 넣지 않습니다. 도면 배지 · 마인드맵 링 · SDS 도킹 차트가 같은 기록을 씁니다.
+fn sds_tracks(db: &Lattice, telemetry: &Telemetry, center_ms: i64, now_ms: i64) -> Vec<SdsTrack> {
+    use blueprint_core::timeseries::{classify, SignalState, BASELINE_SECS};
+    let mut out = Vec::new();
+    for s in db.sensors() {
+        let Some(series) = telemetry.get(&s.tag) else { continue };
+        let from = (series.t0_ms + (BASELINE_SECS + 1) * 1000).max(center_ms - 30_000);
+        let mut t = from - from.rem_euclid(1000);
+        let mut last: Option<SignalState> = None;
+        let mut transitions = Vec::new();
+        while t <= now_ms {
+            if let Some(r) = classify(s, series, t) {
+                if last != Some(r.state) {
+                    transitions.push((t, r.state.code()));
+                    last = Some(r.state);
+                }
+            }
+            t += 1000;
+        }
+        if transitions.iter().any(|(_, c)| *c != "STABLE") {
+            out.push(SdsTrack { tag: s.tag.clone(), kks: s.kks.clone(), transitions });
+        }
+    }
+    out
 }
 
 // ───────────────────────── 현장 단말 ─────────────────────────
@@ -987,7 +1180,7 @@ struct SectorChoice {
 #[tauri::command]
 fn field_sectors(window: Window, desk: State<'_, Desk>) -> Result<Vec<SectorChoice>, String> {
     field_only(&window)?;
-    Ok(desk.db.sectors().iter().map(|s| SectorChoice { key: s.key.clone(), building: s.building.clone(), label: s.label.clone(), kks: s.kks.clone(), blurb: s.blurb.clone() }).collect())
+    Ok(desk.db().sectors().iter().map(|s| SectorChoice { key: s.key.clone(), building: s.building.clone(), label: s.label.clone(), kks: s.kks.clone(), blurb: s.blurb.clone() }).collect())
 }
 
 #[tauri::command]
@@ -1013,6 +1206,37 @@ struct ScanReply {
     corrected: Vec<&'static str>,
     signed: bool,
     unknown_pages: usize,
+    /// 원터치 대조 카드 (개선안 4단계): 값을 읽은 장의 줄인 그림과, 항목마다 그 값이 나온 조각 상자 (정규화 좌표)
+    image: Option<String>,
+    image_size: Option<[u32; 2]>,
+    boxes: serde_json::Map<String, Value>,
+    /// 원문 글자 (교정 전) — 대조 카드의 "스캔 원문" 줄
+    raw: serde_json::Map<String, Value>,
+}
+
+/// 줄인 그림 (data URL, 긴 변 1,200 px · JPEG). 현장 단말이 스캔 조각을 값 옆에 보여 줄 때 씁니다.
+fn preview_url(img: &image::RgbImage) -> Option<String> {
+    use base64::Engine as _;
+    let scale = (1200.0 / img.width().max(img.height()) as f32).min(1.0);
+    let small = image::imageops::resize(img, ((img.width() as f32 * scale) as u32).max(1), ((img.height() as f32 * scale) as u32).max(1), image::imageops::FilterType::Triangle);
+    let mut buf = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 82).encode_image(&small).ok()?;
+    Some(format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(buf)))
+}
+
+/// 항목 값이 나온 조각: 글자(공백 무시)에 `needle` 이 든 조각 중 가장 작은 것의 정규화 상자
+fn crop_box(page: &PageReading, size: (u32, u32), needle: &str) -> Option<[f32; 4]> {
+    let squeeze = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase();
+    let want = squeeze(needle);
+    if want.chars().count() < 2 {
+        return None;
+    }
+    let (w, h) = (size.0.max(1) as f32, size.1.max(1) as f32);
+    page.crops
+        .iter()
+        .filter(|c| squeeze(&blueprint_core::extract::strip_tags(&c.output.text)).contains(&want))
+        .min_by_key(|c| (c.bbox.2 - c.bbox.0) as u64 * (c.bbox.3 - c.bbox.1) as u64)
+        .map(|c| [c.bbox.0 as f32 / w, c.bbox.1 as f32 / h, c.bbox.2 as f32 / w, c.bbox.3 as f32 / h])
 }
 
 /// 스캐너 폴더의 이미지를 읽어 칸을 채웁니다 (현장 단말 전용). 읽은 이미지는 바로 지웁니다.
@@ -1035,9 +1259,11 @@ fn scan_field_documents(window: Window, desk: State<'_, Desk>) -> Result<ScanRep
         hashes.push(salted_hash(b"scan", &String::from_utf8_lossy(&bytes)));
         images.push(image::load_from_memory(&bytes).map_err(|e| format!("이미지를 읽을 수 없습니다: {e}"))?.to_rgb8());
     }
+    let db = desk.db();
+    let room = db.terms().control_room.clone();
     let pages = read_scans(&desk, &reader, &images).map_err(|e| {
         eprintln!("[스캔] 읽기 실패: {e:#}");
-        "문서를 읽지 못했습니다. 주제어실에 알려 주세요.".to_string()
+        format!("문서를 읽지 못했습니다. {room}에 알려 주세요.")
     })?;
     let mut timings = ReadTimings::default();
     let found: Vec<Extracted> = pages
@@ -1052,7 +1278,7 @@ fn scan_field_documents(window: Window, desk: State<'_, Desk>) -> Result<ScanRep
             timings.dropped += p.plan.dropped.len();
             timings.blank += p.plan.blank.len();
             timings.skipped += p.delta.as_ref().map_or(0, |d| d.skipped.len());
-            extract(&PageText::from_reading(h, img.dimensions(), p), &desk.db)
+            extract(&PageText::from_reading(h, img.dimensions(), p), &db)
         })
         .collect();
     for f in &files {
@@ -1070,7 +1296,7 @@ fn scan_field_documents(window: Window, desk: State<'_, Desk>) -> Result<ScanRep
                 scanned.push(key);
             }
         };
-        put("sector", x.sector.map(|s| json!(s.key())));
+        put("sector", x.sector.and_then(|s| db.sector_for(s)).map(|r| json!(r.key)));
         put("kks", x.kks.clone().map(Value::from));
         put("tag", x.tag.clone().map(Value::from));
         put("reading", x.reading.map(|v| json!(v)));
@@ -1082,21 +1308,51 @@ fn scan_field_documents(window: Window, desk: State<'_, Desk>) -> Result<ScanRep
         put("drawing", x.drawing.clone().map(Value::from));
         put("drawing_rev", x.drawing_rev.clone().map(Value::from));
         put("taken_at", x.taken_at.map(|t| json!(plant::local(t).format("%Y-%m-%d %H:%M:%S").to_string())));
+        let code_label = code_field(&db);
         for c in &x.corrections {
             corrected.push(match c.field.as_str() {
-                "설비 KKS" => "kks",
+                f if f == code_label => "kks",
                 "센서 태그" => "tag",
                 "서명자 이름" => "worker_name",
                 _ => "moc_no",
             });
         }
     }
+    // 원터치 대조 카드: 값마다 그 값을 읽은 조각 (교정했으면 교정 전 원문으로 찾습니다)
+    let mut boxes = serde_json::Map::new();
+    let mut raw = serde_json::Map::new();
+    let main_idx = main.as_ref().and_then(|m| found.iter().position(|x| x == m));
+    if let (Some(i), Some(x)) = (main_idx, &main) {
+        let size = images[i].dimensions();
+        let one = |v: f64| plant::fmt_value(v);
+        let raw_of = |field: &str| x.corrections.iter().find(|c| c.field == field).map(|c| c.raw.clone());
+        let code_label = code_field(&db);
+        let needles: Vec<(&str, Option<String>)> = vec![
+            ("kks", raw_of(&code_label).or_else(|| x.kks.clone())),
+            ("tag", raw_of("센서 태그").or_else(|| x.tag.clone())),
+            ("moc_no", x.corrections.iter().find(|c| c.field.ends_with("번호")).map(|c| c.raw.clone()).or_else(|| x.moc_no.clone())),
+            ("reading", x.reading.map(one)),
+            ("old_value", x.old_value.map(one)),
+            ("worker_name", raw_of("서명자 이름").or_else(|| x.worker_name.clone())),
+            ("worker_id", x.worker_id.clone()),
+            ("taken_at", x.taken_at.map(|t| plant::local(t).format("%H:%M").to_string())),
+        ];
+        for (key, needle) in needles {
+            let Some(needle) = needle else { continue };
+            if let Some(b) = crop_box(&pages[i], size, &needle) {
+                boxes.insert(key.to_string(), json!(b));
+            }
+            raw.insert(key.to_string(), json!(needle));
+        }
+    }
+    let image = main_idx.and_then(|i| preview_url(&images[i]));
+    let image_size = main_idx.map(|i| [images[i].width(), images[i].height()]);
     let docs = found.iter().filter_map(|x| x.kind.map(|k| k.label().to_string())).collect();
     let kind = main.as_ref().and_then(|x| x.kind).map(|k| if k == DocKind::Redline { "redline" } else { "gauge_card" });
     let signed = found.iter().any(|x| x.signed);
     *lock(&desk.field_timings) = Some(timings);
     lock(&desk.field_scans).extend(found);
-    Ok(ScanReply { docs, kind, prefill: Value::Object(prefill), scanned, corrected, signed, unknown_pages })
+    Ok(ScanReply { docs, kind, prefill: Value::Object(prefill), scanned, corrected, signed, unknown_pages, image, image_size, boxes, raw })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1192,15 +1448,16 @@ fn submit_field_report(window: Window, app: AppHandle, desk: State<'_, Desk>, in
     };
     // 자유 서술 소명은 Zoro-1 이 표준 소명으로 바꿉니다. 바꾸지 못하면 그대로 교대감독에게 갑니다.
     let mut form = form;
+    let db = desk.db();
     if let Some(DeviationExcuse::FreeText(text)) = form.excuse.clone() {
         let minds = desk.engine(|e| e.minds());
         if let Some(writer) = minds.writer.as_deref() {
-            if let Ok(Some(std)) = desk.infer(|| blueprint_core::drafting::normalize_excuse(writer, &text)) {
+            if let Ok(Some(std)) = desk.infer(|| blueprint_core::drafting::normalize_excuse(writer, &db.terms().excuse_system(), &text)) {
                 form.excuse = Some(std);
             }
         }
     }
-    let result = field::submit_staged(&*desk, &desk.db, &form, live.as_ref().map(|l| &l.0), sim_now);
+    let result = field::submit_staged(&*desk, &db, &form, live.as_ref().map(|l| &l.0), sim_now);
     notify_console(&app);
     let reply = match result {
         Ok(receipt) => {
@@ -1220,7 +1477,7 @@ fn submit_field_report(window: Window, app: AppHandle, desk: State<'_, Desk>, in
         Err(FieldError::NeedExcuse { message }) => FieldReply { state: "excuse", receipt_no: None, notice: None, message: Some(message) },
         Err(FieldError::Internal(e)) => {
             eprintln!("[현장] 접수 실패: {e:#}");
-            return Err("전송하지 못했습니다. 주제어실에 알려 주세요.".to_string());
+            return Err(format!("전송하지 못했습니다. {}에 알려 주세요.", db.terms().control_room));
         }
     };
     Ok(reply)
@@ -1237,7 +1494,7 @@ fn notify_field_case(app: &AppHandle, desk: &Desk, id: &str) {
         match engine.store.archive().iter().find(|a| a.incident_id == id) {
             Some(a) => (a.field_notice.clone(), true),
             None => match engine.store.active(id).and_then(|s| s.field_request.clone()) {
-                Some(note) => (format!("주제어실 재점검 요청 (접수 번호 {id})\n{note}"), false),
+                Some(note) => (format!("{} 재점검 요청 (접수 번호 {id})\n{note}", desk.db().terms().control_room), false),
                 None => return,
             },
         }
@@ -1250,11 +1507,22 @@ fn notify_field_case(app: &AppHandle, desk: &Desk, id: &str) {
 
 // ───────────────────────── 시작 ─────────────────────────
 
-/// 마스터 도면(앱에 든 5장)의 SigLIP2 특징 격자와 잉크를 만듭니다.
+/// 지금 도메인의 마스터 도면(앱에 든 5장)의 SigLIP2 특징 격자와 잉크를 만듭니다. 두 도메인 도면은 같은 서식(표제란 · 일람표 · 서명란)이라
+/// 열 장을 한꺼번에 견주면 1 · 2위 차이가 줄어 델타를 덜 쓰게 되므로, 도메인을 바꾸면 그 도메인 다섯 장으로 다시 색인합니다.
 fn index_masters(desk: &Desk, reader: &DocumentReader) -> anyhow::Result<MasterSet> {
-    let pages: Vec<(String, image::RgbImage)> = DRAWINGS.iter().map(|(id, bytes)| Ok((id.to_string(), image::load_from_memory(bytes)?.to_rgb8()))).collect::<anyhow::Result<_>>()?;
+    let db = desk.db();
+    let pages: Vec<(String, image::RgbImage)> = DRAWINGS
+        .iter()
+        .filter(|(id, _)| db.drawing(id).is_some())
+        .map(|(id, bytes)| Ok((id.to_string(), image::load_from_memory(bytes)?.to_rgb8())))
+        .collect::<anyhow::Result<_>>()?;
     let _gpu = lock(&desk.gpu);
-    reader.index_masters(&pages, &DeltaParams::default())
+    let mut set = reader.index_masters(&pages, &DeltaParams::default())?;
+    // 고정 안내문 자리 (개선안 1-1): 델타 판독이 서명란 띠에서 잘라 냅니다.
+    for d in db.drawings() {
+        set.set_ignore(&d.id, &d.ignore_zones);
+    }
+    Ok(set)
 }
 
 /// 스캔을 읽습니다. 마스터 색인이 있으면 바뀐 조각만 읽고(SDS 델타 패치), 읽은 도면번호가 고른 마스터와 다르면 그 장을 전부 다시 읽습니다.
@@ -1265,7 +1533,7 @@ fn read_scans(desk: &Desk, reader: &DocumentReader, images: &[image::RgbImage]) 
     let mut pages = reader.read_pages_delta(images, &Baseline::Best(&masters), &DeltaParams::default())?;
     for (i, page) in pages.iter_mut().enumerate() {
         let Some(master) = page.delta.as_ref().filter(|d| d.fallback.is_none() && !d.skipped.is_empty()).and_then(|d| d.master.clone()) else { continue };
-        let read = extract(&PageText::from_reading("", images[i].dimensions(), page), &desk.db);
+        let read = extract(&PageText::from_reading("", images[i].dimensions(), page), &desk.db());
         if read.drawing.as_deref().is_some_and(|d| d != master) {
             eprintln!("[델타] 도면번호 {:?} 가 고른 마스터 {master} 와 달라 전부 다시 읽습니다", read.drawing);
             *page = reader.read_pages(std::slice::from_ref(&images[i]))?.remove(0);
@@ -1315,10 +1583,16 @@ fn load_models(app: AppHandle) {
 
 pub fn run() {
     let salt: Vec<u8> = (0..8).flat_map(|_| random_u32().to_le_bytes()).collect();
+    // 시작 도메인: `BLUEPRINT_DOMAIN=aidc` 면 AI 데이터센터, 없으면 발전소 (콘솔 머리의 스위치로 언제든 바꿉니다)
+    let start_mode = std::env::var("BLUEPRINT_DOMAIN").ok().and_then(|k| DomainMode::from_key(&k)).unwrap_or_default();
+    let ledger = Lattice::embedded_for(start_mode).expect("합성 원장을 읽을 수 없습니다");
+    let mut engine = Engine::new(&salt, AutomationPolicy::default(), None);
+    engine.reset_for(ledger.terms().clone());
     let desk = Desk {
-        engine: Mutex::new(Engine::new(&salt, AutomationPolicy::default(), None)),
-        db: Lattice::embedded().expect("합성 원장을 읽을 수 없습니다"),
-        scenarios: ScenarioSet::embedded().expect("합성 시나리오를 읽을 수 없습니다"),
+        engine: Mutex::new(engine),
+        ledger: RwLock::new(Arc::new(ledger)),
+        cases: RwLock::new(Arc::new(ScenarioSet::embedded_for(start_mode).expect("합성 시나리오를 읽을 수 없습니다"))),
+        domain: Mutex::new(start_mode),
         gpu: Mutex::new(()),
         reader: Mutex::new(None),
         masters: Mutex::new(None),
@@ -1367,6 +1641,8 @@ pub fn run() {
             set_automation,
             console_status,
             verdict_catalog,
+            domain_info,
+            switch_domain_mode,
             field_ready,
             field_sectors,
             field_reset,
