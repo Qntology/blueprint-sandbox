@@ -1,5 +1,5 @@
 // 자연어 질의 커맨드 바 (2차 개선안 2: logis-center 방식 검색을 noto-sandbox 하단 허브의 `.command-bar` · `.dropup` · `.cmd-toast` 로).
-// 백엔드 `search` 명령은 그대로 쓰고(Rust 변경 없음), 화면만 하단 허브로 옮겼습니다.
+// 백엔드 `search` 명령이 한국어 · 영어 질의를 그대로 읽습니다 (Stanza 품사 · 원형, 임베딩 경로, NMS 조각: docs/search.md).
 import { useRef, useState, type KeyboardEvent, type RefObject } from "react";
 import { useT, type T } from "../i18n";
 import { tr } from "../i18n/lang";
@@ -28,9 +28,17 @@ export interface SearchResult {
   conditions: { kind: string; text: string; applied: boolean; note: string }[];
   notes: string[];
   hits: SearchHit[];
+  /** 질의 언어 (엔진이 판단) */
+  lang?: "ko" | "en";
+  /** 쓴 모델 ("Stanza en · ko · 임베딩 granite-97m", 없으면 "규칙만") */
+  engine?: string;
+  /** 낱말마다 품사 · 원형 · 줄기 */
+  tokens?: { text: string; upos: string | null; xpos: string | null; lemma: string | null; forms: string[]; function: boolean }[];
+  /** NMS 에서 이긴 조각 (낱말 창 → 원장 설비 · 센서) */
+  segments?: { text: string; label: string; cos: number; z: number }[];
 }
 
-/** 한 번의 질의: 입력한 글 · 문맥을 붙인 글 · 엔진에 보낸 글(영어 화면이면 한국어 낱말로 옮긴 것) · 결과 */
+/** 한 번의 질의: 입력한 글 · 문맥을 붙인 글 · 엔진에 보낸 글(문맥을 붙인 글 그대로, 영어도 옮기지 않음) · 결과 */
 export interface SearchRun {
   typed: string;
   sent: string;
@@ -256,7 +264,11 @@ export function SearchDropup({ run, onClose, onSelect, onPick, onInterlock, inte
           </span>
         ))}
         {run.context && <span className="cond ctx">{t(`🛠 문맥 ${run.context}`, `🛠 Context ${run.context}`)}</span>}
-        {run.engine !== run.sent && <span className="cond ctx" title={run.engine}>{t("엔진 질의", "Engine query")}: {run.engine}</span>}
+        {r.engine && (
+          <span className="cond ctx" title={t("이번 검색에 쓴 분석 모델 (모델 설정에서 가져오기)", "Analysis models used for this search (import them in Model Settings)")}>
+            🧠 {r.engine}
+          </span>
+        )}
         <span className="grow" />
         <button className="ov-close" onClick={onClose} aria-label={t("닫기", "Close")} title={t("닫기 (ESC)", "Close (ESC)")}>
           ✕

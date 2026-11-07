@@ -9,7 +9,6 @@ import { RightRail } from "./cctv/RightRail";
 import { HUD_W, TOP_INSET, useElementSize, type Insets } from "./cctv/stage";
 import { causalTraces } from "./cctv/traces";
 import { DEFAULT_SUPERVISOR, DOMAIN_ICON, PLANT_TERMS, PLANT_TERMS_EN, TermsContext, type DomainInfo, type DomainMode } from "./domain";
-import { queryToKo } from "./i18n/query";
 import { ModelSettings } from "./ModelSettings";
 import { PhysicsPanel } from "./PhysicsPanel";
 import { fmt, mmss } from "./plant";
@@ -271,8 +270,8 @@ export function OfficerView() {
       const kks = context ? selectedKks : null;
       const sent = kks ? contextual(text, kks, plant) : text;
       try {
-        // 엔진의 질의 파서는 한국어입니다. 영어 화면이면 영어 질의를 한국어 낱말로 옮겨 보냅니다 (i18n/query.ts).
-        const engine = lang === "en" ? queryToKo(sent) : sent;
+        // 엔진이 한국어 · 영어 질의를 그대로 읽습니다 (예전 i18n/query.ts 의 영어 → 한국어 낱말 옮기기는 엔진 lexicon 으로 옮겼습니다).
+        const engine = sent;
         const result = await invoke<SearchResult>("search", { query: engine });
         setSearch({ typed: text, sent, engine, context: sent !== text ? kks : null, result });
         setSearchOpen(true);
@@ -285,7 +284,7 @@ export function OfficerView() {
         return false;
       }
     },
-    [plant, context, selectedKks, lang],
+    [plant, context, selectedKks],
   );
 
   // ESC 는 맨 위 판부터 하나씩 닫고(noto-sandbox overlays.js 의 STACK), 닫을 판이 없으면 검색 표시 → 설비 선택을 풉니다.

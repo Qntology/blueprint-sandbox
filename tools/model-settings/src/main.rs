@@ -1,11 +1,13 @@
 //! 모델 폴더 명령줄 도구. 앱을 띄우지 않고 모델을 준비할 때 씁니다.
 //!
 //!   blueprint-models status            모델 폴더와 모델 상태
-//!   blueprint-models import [이름...]   zoro-gravity 모델 폴더에서 가져오기 (이름이 없으면 없는 모델 모두)
+//!   blueprint-models import [이름...]   가져올 곳에서 가져오기 (이름이 없으면 없는 모델 모두)
+//!                                       zoro · gocr · siglip2 ← zoro-gravity, embed ← logis-center, stanza ← BLUEPRINT_STANZA_FROM
+//!   blueprint-models import <이름> <폴더>  그 폴더(모델 폴더 자체)에서 가져오기. 예: import stanza ../stanza-onnx-export/onnx_final
 //!   blueprint-models download <이름>    Hugging Face 에서 내려받기
 
 use anyhow::{bail, Result};
-use blueprint_models::{download, import_from, import_missing, import_source, models_dir, status};
+use blueprint_models::{download, import_auto, import_dir, import_missing, import_source, models_dir, status};
 
 fn gb(bytes: u64) -> String {
     format!("{:.2} GB", bytes as f64 / 1e9)
@@ -29,9 +31,10 @@ fn main() -> Result<()> {
             }
         }
         Some("import") => {
-            let done = if args.len() > 1 {
-                let Some(source) = import_source() else { bail!("가져올 곳을 모릅니다. BLUEPRINT_IMPORT_FROM 을 주세요") };
-                args[1..].iter().map(|n| import_from(&source, n).map(|r| (n.clone(), r))).collect::<Result<Vec<_>>>()?
+            let done = if args.len() == 3 && std::path::Path::new(&args[2]).is_dir() {
+                vec![(args[1].clone(), import_dir(std::path::Path::new(&args[2]), &args[1])?)]
+            } else if args.len() > 1 {
+                args[1..].iter().map(|n| import_auto(n).map(|r| (n.clone(), r))).collect::<Result<Vec<_>>>()?
             } else {
                 import_missing()?.into_iter().map(|(n, r)| (n.to_string(), r)).collect()
             };
@@ -43,7 +46,7 @@ fn main() -> Result<()> {
             }
         }
         Some("download") => {
-            let Some(name) = args.get(1) else { bail!("내려받을 모델 이름을 주세요 (zoro, gocr, siglip2)") };
+            let Some(name) = args.get(1) else { bail!("내려받을 모델 이름을 주세요 (zoro, gocr, siglip2, embed)") };
             download(name, &mut |p| println!("[{:>3}%] {}", p.percent, p.message))?;
         }
         Some(other) => bail!("모르는 명령입니다: {other} (status · import · download)"),

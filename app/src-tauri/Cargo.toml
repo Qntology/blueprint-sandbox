@@ -29,5 +29,5 @@ tauri = { version = "2", features = [] }
 candle-core = "0.11.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 # 진단 로직은 코어가 맡습니다. GPU 백엔드는 앱의 기능으로 고릅니다.
-blueprint-core = { path = "../../core", default-features = false }
+blueprint-core = { path = "../../core", default-features = false, features = ["stanza"] }
 blueprint-models = { path = "../../tools/model-settings" }

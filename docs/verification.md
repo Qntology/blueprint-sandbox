@@ -548,3 +548,44 @@ E2E 를 고친 것: 영어 화면은 콘솔 머리를 `Control Console` · `Spat
 - 판단 확신도는 기획 수치와 같은 모양: P2 0.754 (시간 0.887 · 물리 0.838 · 센서 0.754), D2 0.734, P3 0.984, P4 · D4 확신도 없음(모델 이견). 초안 P2 AOP-103-FW02 숫자 3/3 일치 · 모델 글 채택 · 12.2 s · 86 토큰 (토큰당 142 ms).
 - 전처리 Off · On 숫자는 측정 파일에서: P3 델타 11.1 → 8.6 s (전부 읽기 36.6 s), D3 14.6 → 9.9 s (39.0 s), 밀린 스캔 맞춤 없음 36.3 s(전부 읽기로 물러남) → 맞춤 9.1 s, 심볼 사전 기준 0.944 / 0.015 · 마스터 31/32.
 - 영상: 한국어 `out/video/blueprint_master_e2e_ko.mp4` · 영어 `out/video/blueprint_master_e2e_en.mp4`, 둘 다 약 13분 40초 · 137 구간 · 1920 × 1080 · 30 fps · 50 MB 안팎 (H.264). 같은 편집 대본에 자막 · 모델 장면 글만 언어별입니다.
+
+## 13. 한국어 · 영어 자연어 검색: Stanza · 임베딩 · NMS (2026-11-08)
+
+logis-center 의 Stanza 전처리 · 슬라이딩 창 NMS 배틀 · 임베딩 경로를 검색에 옮기고, 영어 질의를 엔진이 그대로 읽게 했습니다 ([search.md](search.md)).
+
+### 13.1 Stanza 변환본 재검증 (stanza-onnx-export)
+
+이전 변환 스크립트를 stanza 1.15 로 en · ko 를 다시 돌려 PyTorch Stanza 와 같은 문장(언어마다 30: 일반 10 + 검색 질의 20)으로 대조했습니다.
+입력을 가장 바르게 채워도 영어 POS 44.5 % · 한국어 75.0 %, 원형은 93 · 99 % 가 실행 실패(디코더 반복이 추적 길이 6 으로 굳음), 한국어 의존 구문은 90 % 문장이 실행 실패였습니다.
+결함(문자 투영 누락 · 문자 언어모델을 낱말마다 · 학습된 LSTM 초기 상태 버림 · 사전학습 사전 없음 · 원형 교사 강제 한 번 · ROOT 없음 · xpos 임베딩에 upos)을 고쳐 다시 변환한 판은
+품사(upos · xpos · feats) · 원형 · 의존 구문(머리 · 관계) 모두 100 % 같고 그래프 차이는 최대 7.6e-5 입니다. 재검증 중 ONNX 의 `Log(Sigmoid(x))` 가 `-inf` → `NaN` 을 만들어
+`고착된` 원형이 `고착+되<PAD>+ㄴ` 로 나오던 것을 찾아 안정된 식으로 바꿨습니다. 자세한 표는 stanza-onnx-export `README.md`.
+
+### 13.2 Rust 실행기 대조 (모델 필요, `--ignored`)
+
+| 시험 | 결과 |
+| --- | --- |
+| `nlp::stanza::tests::real_models_match_pytorch_stanza` (tract) | 통과: `급수펌프의 토출 압력이 높은 밸브를` → PROPN NOUN NOUN ADJ NOUN, `급수펌프+의` · `압력+이` · `높+ㄴ` · `밸브+를`, xpos `nq+jcm` …, `고착된 밸브를 보여줘` → `고착+되+ㄴ` · `밸브+를` · `보이+어+주+ㄴ`, 영어 `valves` → valve |
+| `ai::embed::tests::matches_transformers` (candle CPU) | 통과: HF transformers ModernBertModel(F32 · eager) 기준 10개 글(4 ~ 63 토큰, 한 · 영) 코사인 > 0.9999, 토큰 번호 같음 |
+
+tract 는 ONNX 에 적힌 동적 축 이름으로 모델당 한 번만 최적화합니다 (한국어 POS 읽기 0.1 s · 최적화 0.06 s · 문장 3 ~ 5 ms, 영어 0.14 · 0.13 s · 19 ~ 47 ms).
+
+### 13.3 검색 평가 (`search_eval`, CPU release)
+
+[search.md 3-0](search.md) 의 표: 한국어 묶음은 세 모드 모두 그대로(발전소 0.941 · 데이터센터 0.900), 영어 묶음은 화면 번역 없이 발전소 0.971 · 데이터센터 0.900,
+뜻풀이 묶음은 임베딩으로 0.31 → 0.48 (한국어) · 0.61 → 0.68 (영어) · 0.69 → 0.78 (데이터센터). 임베딩을 켜면 `유량 낮은 급수` 의 1위가 밸브에서 센서 `급수 유량` 으로 바뀌는 한 건이 있습니다.
+처음 검색 때 검색 표 · 개념 뱅크 임베딩 6.8 s (그 뒤 캐시), 질의당 +임베딩 20 ~ 70 ms.
+
+### 13.4 시험
+
+- `cargo test -p blueprint-core --no-default-features --features stanza`: 단위 377 (+ 검색 영어 3 · 분석 2 · 낱말 목록 2 · Stanza 2 · 모델 없는 대조), 시나리오 E2E 발전소 14 · 데이터센터 8, 엔진 잠금 4 모두 통과.
+- `cargo test -p blueprint-models`: 21 (+ 검색 모델 가져오기: 하위 폴더 · ONNX 하드 링크 · 가져올 곳 없으면 거부).
+- `npx tsc --noEmit` 통과. 영어 화면 번역 표에 새 검색 기록(품사 분석 · NMS 조각 · 의미 경로 · 모델 요약) 틀을 더하고 `build_en.py` 로 확인 (남는 한글 0).
+- CI 와 같은 조건(`--workspace --exclude blueprint-app --no-default-features`, Stanza 기능 꺼짐 → 실행기는 사전 해석만 남고 거부): 코어 376 · 통합 26 · 모델 도구 21 통과.
+
+### 13.5 앱 E2E (실제 앱 · ROCm · `console.js --only SEARCH`)
+
+| 실행 | 결과 | 기록 |
+| --- | --- | --- |
+| 한국어 | **통과** | 앱 시작 때 검색 모델 읽기 3.5 s (Stanza ko 0.4 · en 1.8 · 임베딩 1.3), 검색 표 · 개념 뱅크 임베딩 4.2 s. 머리줄에 `🧠 Stanza en · ko · 임베딩 granite-97m`, 기록에 `NMS 조각 '주급수 유량조절밸브' → 주급수 유량조절밸브 (설비 · 코사인 1.000 · z 4.6)`. 문맥 질의 `상류 1홉` → `문맥 10LAB10AP001 + '상류 1홉'` · 4건 |
+| 영어 (화면 번역 없이 엔진이 영어를 읽음) | **통과** | `main feedwater flow control valve 1 hop upstream` → `NMS segment … → Main Feedwater Flow Control Valve (equipment · cosine 0.988 · z 3.7)` · 기준 설비 10LAB20AA102 · 1위 Main Feedwater Pump A. 문맥 `1 hop upstream` → `context 10LAB10AP001 + '1 hop upstream'` · 4 hits. 화면 감사가 찾은 한글은 새 모델 설정 이름 두 줄 → 번역 표에 더함 |

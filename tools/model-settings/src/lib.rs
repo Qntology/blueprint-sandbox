@@ -13,6 +13,11 @@
 //! 작은 파일(`active.json`, 크롭 앵커 `crop_probe.bin` 등)은 복사합니다. 작은 파일은 앱이 고쳐 쓸 수 있어서 두 앱이 같은 파일을 보면 안 됩니다.
 //! 하드 링크를 걸 수 없으면 (다른 드라이브 등) 큰 파일도 복사합니다.
 //!
+//! 검색용 모델 두 가지는 선택입니다 (없어도 앱은 돌고, 검색이 규칙 · 글자 경로만 씁니다).
+//! - `embed`: granite-embedding-97m-multilingual-r2 (IBM, Apache-2.0). logis-center 가 받아 둔 것이 있으면 가져오고, 없으면 Hugging Face 에서 받습니다.
+//! - `stanza`: Stanza en · ko 품사 · 원형 ONNX. 공개 저장소가 없어 `stanza-onnx-export` 로 변환한 폴더(`onnx_final`)에서 가져옵니다
+//!   (`BLUEPRINT_STANZA_FROM` 또는 `blueprint-models import stanza <폴더>`).
+//!
 //! 다운로드는 `download` 기능에 있습니다. 코어 엔진은 폴더 위치만 씁니다.
 
 use std::fs;
@@ -33,6 +38,23 @@ pub const MODELS_DIR_ENV: &str = "BLUEPRINT_MODELS_DIR";
 pub const IMPORT_FROM_ENV: &str = "BLUEPRINT_IMPORT_FROM";
 /// zoro-gravity 의 앱 데이터 폴더 이름
 pub const ZOROGRAVITY_APP_DIR: &str = "zorogravity";
+/// logis-center 의 앱 데이터 폴더 이름 (임베딩 모델을 가져옴)
+pub const LOGIS_APP_DIR: &str = "logis-center";
+/// 임베딩 모델을 가져올 폴더를 정하는 환경 변수 (없으면 logis-center 의 모델 폴더)
+pub const EMBED_FROM_ENV: &str = "BLUEPRINT_EMBED_FROM";
+/// Stanza 변환본(`stanza-onnx-export` 의 onnx_final)을 가져올 폴더를 정하는 환경 변수
+pub const STANZA_FROM_ENV: &str = "BLUEPRINT_STANZA_FROM";
+
+/// 가져올 곳
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// zoro-gravity 모델 폴더의 같은 이름 하위 폴더
+    ZoroGravity,
+    /// logis-center 모델 폴더의 이 하위 폴더 (`BLUEPRINT_EMBED_FROM` 이 있으면 그 폴더)
+    LogisCenter(&'static str),
+    /// `BLUEPRINT_STANZA_FROM` (stanza-onnx-export 출력 폴더)
+    StanzaExport,
+}
 
 /// 내려받을 파일 하나. `bytes` 는 진행률과 화면 표시에 쓰는 크기입니다 (실제 완료 판단은 서버가 알려 준 크기로 합니다).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +79,9 @@ pub struct ModelEntry {
     pub files: &'static [ModelFile],
     /// 내려받지는 않지만 가져올 때 함께 가져오는 파일 (있을 때만). 예: 학습한 크롭 앵커
     pub extras: &'static [&'static str],
+    /// 없으면 앱이 설정을 열어 받게 하는가 (검색용 모델은 선택이라 false)
+    pub required: bool,
+    pub source: Source,
 }
 
 impl ModelEntry {
@@ -65,7 +90,7 @@ impl ModelEntry {
     }
 }
 
-pub const CATALOG: [ModelEntry; 3] = [
+pub const CATALOG: [ModelEntry; 5] = [
     ModelEntry {
         name: "zoro",
         label: "Zoro-1 판단 · 글쓰기",
@@ -80,6 +105,8 @@ pub const CATALOG: [ModelEntry; 3] = [
             file("active.json", 216),
         ],
         extras: &[],
+        required: true,
+        source: Source::ZoroGravity,
     },
     ModelEntry {
         name: "gocr",
@@ -94,6 +121,8 @@ pub const CATALOG: [ModelEntry; 3] = [
             file("active.json", 216),
         ],
         extras: &[],
+        required: true,
+        source: Source::ZoroGravity,
     },
     ModelEntry {
         name: "siglip2",
@@ -108,6 +137,42 @@ pub const CATALOG: [ModelEntry; 3] = [
         ],
         // 시각 앵커는 zoro-gravity 가 합성 서식으로 학습한 파일입니다. 없으면 크롭이 버리는 조각 없이 모두 읽습니다.
         extras: &["crop_probe.bin", "precision-q8.json"],
+        required: true,
+        source: Source::ZoroGravity,
+    },
+    ModelEntry {
+        name: "embed",
+        label: "검색 임베딩 (granite-embedding-97m)",
+        license: "Apache-2.0",
+        repo: Some("ibm-granite/granite-embedding-97m-multilingual-r2"),
+        files: &[file("config.json", 1_261), file("tokenizer.json", 27_136_500), file("model.safetensors", 194_889_568)],
+        extras: &[],
+        required: false,
+        source: Source::LogisCenter("granite-embedding-97m-multilingual-r2"),
+    },
+    ModelEntry {
+        name: "stanza",
+        label: "검색 품사 · 원형 (Stanza en · ko ONNX)",
+        license: "Apache-2.0",
+        repo: None,
+        files: &[
+            file("en/pos.onnx", 176_310_517),
+            file("en/pretrain_vocab.json", 2_833_253),
+            file("en/lemma_encoder.onnx", 630_677),
+            file("en/lemma_decoder.onnx", 1_563_390),
+            file("en/lemma_dict.json", 15_011_754),
+            file("ko/pos.onnx", 121_091_769),
+            file("ko/pretrain_vocab.json", 3_389_054),
+            file("ko/lemma_encoder.onnx", 1_045_877),
+            file("ko/lemma_decoder.onnx", 3_664_307),
+            file("ko/lemma_dict.json", 2_835_424),
+            // 사전을 마지막에 둡니다. vocab.json 이 있어야 그 언어를 여는데, 큰 파일을 다 가져오기 전에 열리지 않게
+            file("en/vocab.json", 197_296),
+            file("ko/vocab.json", 272_693),
+        ],
+        extras: &[],
+        required: false,
+        source: Source::StanzaExport,
     },
 ];
 
@@ -144,6 +209,16 @@ pub fn import_source() -> Option<PathBuf> {
     }
 }
 
+/// 이 모델을 가져올 폴더 (모델 폴더 자체). 모르면 None
+pub fn source_dir(entry: &ModelEntry) -> Option<PathBuf> {
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    match entry.source {
+        Source::ZoroGravity => import_source().map(|s| s.join(entry.name)),
+        Source::LogisCenter(folder) => env(EMBED_FROM_ENV).or_else(|| dirs::data_local_dir().map(|d| d.join(LOGIS_APP_DIR).join("models").join(folder))),
+        Source::StanzaExport => env(STANZA_FROM_ENV),
+    }
+}
+
 /// 화면에 보여 줄 모델 상태
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelStatus {
@@ -167,17 +242,20 @@ fn installed(dir: &Path, entry: &ModelEntry) -> bool {
 
 fn dir_bytes(dir: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(dir) else { return 0 };
-    entries.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()
+    entries
+        .flatten()
+        .filter_map(|e| e.metadata().ok().map(|m| (e.path(), m)))
+        .map(|(p, m)| if m.is_dir() { dir_bytes(&p) } else { m.len() })
+        .sum()
 }
 
 pub fn status() -> Vec<ModelStatus> {
-    let source = import_source();
     CATALOG
         .iter()
         .map(|entry| {
             let dir = model_dir(entry.name);
             let here = installed(&dir, entry);
-            let importable = !here && source.as_deref().is_some_and(|s| s.join(entry.name) != dir && installed(&s.join(entry.name), entry));
+            let importable = !here && source_dir(entry).is_some_and(|s| s != dir && installed(&s, entry));
             ModelStatus { entry, installed: here, bytes_on_disk: dir_bytes(&dir), importable }
         })
         .collect()
@@ -198,7 +276,7 @@ pub struct ImportReport {
 
 /// 큰 가중치만 하드 링크로 겁니다. 나머지는 복사해서 한쪽이 고쳐도 다른 쪽이 바뀌지 않게 합니다.
 fn link_worthy(name: &str) -> bool {
-    name.ends_with(".gguf") || name.ends_with(".safetensors")
+    name.ends_with(".gguf") || name.ends_with(".safetensors") || name.ends_with(".onnx")
 }
 
 /// 파일 하나를 가져옵니다. 받는 쪽에 같은 크기의 파일이 있으면 그대로 둡니다.
@@ -212,6 +290,9 @@ fn bring(from: &Path, to: &Path, name: &str, report: &mut ImportReport) -> Resul
     }
     if dst.exists() {
         fs::remove_file(&dst).with_context(|| format!("모델 파일을 바꿀 수 없습니다 (쓰는 중일 수 있습니다): {}", dst.display()))?;
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
     }
     if link_worthy(name) && fs::hard_link(&src, &dst).is_ok() {
         report.linked.push(name.to_string());
@@ -229,7 +310,25 @@ fn bring(from: &Path, to: &Path, name: &str, report: &mut ImportReport) -> Resul
 /// `source` 폴더(예: zoro-gravity 의 모델 폴더)에서 모델 하나를 가져옵니다. `active.json` 을 맨 마지막에 둡니다.
 pub fn import_from(source: &Path, name: &str) -> Result<ImportReport> {
     let Some(entry) = entry(name) else { bail!("모르는 모델입니다: {name}") };
-    let from = source.join(entry.name);
+    import_dir(&source.join(entry.name), name)
+}
+
+/// 모델 하나를 그 모델의 가져올 곳([`source_dir`])에서 가져옵니다.
+pub fn import_auto(name: &str) -> Result<ImportReport> {
+    let Some(entry) = entry(name) else { bail!("모르는 모델입니다: {name}") };
+    let env = match entry.source {
+        Source::StanzaExport => STANZA_FROM_ENV,
+        Source::LogisCenter(_) => EMBED_FROM_ENV,
+        Source::ZoroGravity => IMPORT_FROM_ENV,
+    };
+    let Some(from) = source_dir(entry) else { bail!("{name} 을 가져올 곳을 모릅니다 ({env})") };
+    import_dir(&from, name)
+}
+
+/// `from` (그 모델의 폴더)에서 모델 하나를 가져옵니다.
+pub fn import_dir(from: &Path, name: &str) -> Result<ImportReport> {
+    let Some(entry) = entry(name) else { bail!("모르는 모델입니다: {name}") };
+    let from = from.to_path_buf();
     let to = model_dir(entry.name);
     if from == to {
         bail!("가져올 곳과 모델 폴더가 같습니다: {}", to.display());
@@ -254,10 +353,9 @@ pub fn import_from(source: &Path, name: &str) -> Result<ImportReport> {
 
 /// 여기 없고 가져올 곳에 있는 모델을 모두 가져옵니다. 가져온 모델 이름과 결과를 돌려줍니다.
 pub fn import_missing() -> Result<Vec<(&'static str, ImportReport)>> {
-    let Some(source) = import_source() else { return Ok(Vec::new()) };
     let mut out = Vec::new();
     for s in status().into_iter().filter(|s| s.importable) {
-        out.push((s.entry.name, import_from(&source, s.entry.name)?));
+        out.push((s.entry.name, import_auto(s.entry.name)?));
     }
     Ok(out)
 }
@@ -302,6 +400,9 @@ pub(crate) mod testing {
             std::fs::create_dir_all(&source).unwrap();
             std::env::set_var(super::MODELS_DIR_ENV, &dir);
             std::env::set_var(super::IMPORT_FROM_ENV, &source);
+            // 이 PC 의 logis-center 모델 폴더 · 변환본을 보지 않게 (시험이 실제 폴더에 따라 달라지지 않게)
+            std::env::set_var(super::EMBED_FROM_ENV, root.join("logis-embed"));
+            std::env::remove_var(super::STANZA_FROM_ENV);
             Self { dir, source, _guard: guard }
         }
 
@@ -314,6 +415,8 @@ pub(crate) mod testing {
         fn drop(&mut self) {
             std::env::remove_var(super::MODELS_DIR_ENV);
             std::env::remove_var(super::IMPORT_FROM_ENV);
+            std::env::remove_var(super::EMBED_FROM_ENV);
+            std::env::remove_var(super::STANZA_FROM_ENV);
             if let Some(root) = self.dir.parent() {
                 let _ = std::fs::remove_dir_all(root);
             }
@@ -364,10 +467,36 @@ mod tests {
         assert_eq!(entry("gocr").unwrap().repo, Some("Qntology/GravityOCR-KO-gguf"));
         assert_eq!(entry("siglip2").unwrap().repo, Some("Qntology/siglip2-so400m-patch16-naflex-gguf"));
         assert!(entry("없음").is_none());
-        for e in CATALOG.iter().filter(|e| e.repo.is_some()) {
+        for e in CATALOG.iter().filter(|e| e.repo.is_some_and(|r| r.starts_with("Qntology/"))) {
             assert_eq!(e.files.last().unwrap().name, "active.json", "{}", e.name);
             assert!(e.total_bytes() > 1_000_000_000);
+            assert!(e.required);
         }
+        // 검색용 모델은 선택이고, 가져올 곳이 따로 있습니다
+        assert!(!entry("embed").unwrap().required && !entry("stanza").unwrap().required);
+        assert_eq!(entry("embed").unwrap().repo, Some("ibm-granite/granite-embedding-97m-multilingual-r2"));
+        assert!(entry("stanza").unwrap().repo.is_none());
+    }
+
+    #[test]
+    fn search_models_import_from_their_own_sources_with_subfolders() {
+        let t = TempModels::new("search-models");
+        let export = t.source.parent().unwrap().join("onnx_final");
+        for n in names(entry("stanza").unwrap()) {
+            let p = export.join(n);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, format!("data of {n}")).unwrap();
+        }
+        std::env::set_var(STANZA_FROM_ENV, &export);
+        let st = status();
+        assert!(st.iter().find(|s| s.entry.name == "stanza").unwrap().importable);
+        let r = import_auto("stanza").unwrap();
+        assert!(r.linked.contains(&"ko/pos.onnx".to_string()), "ONNX 는 하드 링크 {r:?}");
+        assert!(r.copied.contains(&"ko/vocab.json".to_string()));
+        assert!(t.path().join("stanza/en/lemma_dict.json").exists());
+        assert!(status().iter().find(|s| s.entry.name == "stanza").unwrap().bytes_on_disk > 0, "하위 폴더 크기도 셉니다");
+        std::env::remove_var(STANZA_FROM_ENV);
+        assert!(import_auto("stanza").is_err(), "가져올 곳을 모르면 거부");
     }
 
     #[test]
