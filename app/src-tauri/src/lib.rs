@@ -22,6 +22,7 @@ use blueprint_core::ai::document::{Baseline, DocumentReader, PageReading};
 use blueprint_core::ai::siglip2::delta::{DeltaParams, MasterSet};
 use blueprint_core::case::{DeviationExcuse, FieldKind, ReadTimings, Signature};
 use blueprint_core::domain::DomainMode;
+use blueprint_core::i18n::{self, Lang};
 use blueprint_core::extract::{code_field, extract, DocKind, Extracted, PageText};
 use blueprint_core::interlock::Evidence;
 use blueprint_core::issues;
@@ -62,6 +63,20 @@ const DRAWINGS: [(&str, &[u8]); 10] = [
     ("MEP-103-CDU", include_bytes!("../../../core/fixtures/drawings/MEP-103-CDU.png")),
     ("SLD-104-PWR", include_bytes!("../../../core/fixtures/drawings/SLD-104-PWR.png")),
     ("MEP-105-CHL", include_bytes!("../../../core/fixtures/drawings/MEP-105-CHL.png")),
+];
+
+/// 영어 화면용 도면 (같은 배치 · 같은 좌표, 글만 영어. `python scripts/gen_pid_drawings.py --lang en` 이 만듭니다)
+const DRAWINGS_EN: [(&str, &[u8]); 10] = [
+    ("PID-101-HAD", include_bytes!("../../../core/fixtures/drawings/en/PID-101-HAD.png")),
+    ("PID-102-MAA", include_bytes!("../../../core/fixtures/drawings/en/PID-102-MAA.png")),
+    ("PID-103-LAB", include_bytes!("../../../core/fixtures/drawings/en/PID-103-LAB.png")),
+    ("PID-104-BBA", include_bytes!("../../../core/fixtures/drawings/en/PID-104-BBA.png")),
+    ("PID-105-HLB", include_bytes!("../../../core/fixtures/drawings/en/PID-105-HLB.png")),
+    ("MEP-101-POD", include_bytes!("../../../core/fixtures/drawings/en/MEP-101-POD.png")),
+    ("NET-102-FAB", include_bytes!("../../../core/fixtures/drawings/en/NET-102-FAB.png")),
+    ("MEP-103-CDU", include_bytes!("../../../core/fixtures/drawings/en/MEP-103-CDU.png")),
+    ("SLD-104-PWR", include_bytes!("../../../core/fixtures/drawings/en/SLD-104-PWR.png")),
+    ("MEP-105-CHL", include_bytes!("../../../core/fixtures/drawings/en/MEP-105-CHL.png")),
 ];
 
 /// 도면 생성기가 그린 배관 꺾은선 (정규화 좌표). 도면 뷰의 흐름 오버레이가 이미지와 같은 선을 따라 그립니다.
@@ -502,13 +517,66 @@ fn plant_topology(window: Window, desk: State<'_, Desk>) -> Result<PlantDto, Str
     })
 }
 
-/// 마스터 도면 이미지 (data URL)
+/// 마스터 도면 이미지 (data URL). 영어 화면이면 같은 배치로 글만 영어로 그린 도면을 줍니다 (`gen_pid_drawings.py --lang en`).
+/// 판독 · 델타 색인은 언제나 한국어 마스터(`DRAWINGS`)를 씁니다. 현장 서류가 한국어이기 때문입니다.
 #[tauri::command]
 fn drawing_image(window: Window, id: String) -> Result<String, String> {
     console_only(&window)?;
     use base64::Engine as _;
-    let (_, bytes) = DRAWINGS.iter().find(|(d, _)| *d == id).ok_or_else(|| format!("도면이 없습니다: {id}"))?;
+    let english = (i18n::current() == Lang::En).then(|| DRAWINGS_EN.iter().find(|(d, _)| *d == id)).flatten();
+    let (_, bytes) = english.or_else(|| DRAWINGS.iter().find(|(d, _)| *d == id)).ok_or_else(|| format!("도면이 없습니다: {id}"))?;
     Ok(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
+}
+
+// ───────────────────────── 화면 언어 (한국어 · 영어) ─────────────────────────
+
+/// 앱 설정 파일 (모델 폴더 옆 `settings.json`). 지금은 화면 언어 하나입니다.
+fn settings_path() -> std::path::PathBuf {
+    app_dir().join("settings.json")
+}
+
+fn saved_language() -> Option<Lang> {
+    let text = std::fs::read_to_string(settings_path()).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    Lang::parse(v.get("language")?.as_str()?)
+}
+
+fn save_language(lang: Lang) -> Result<(), String> {
+    let path = settings_path();
+    let mut v: Value = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| json!({}));
+    v["language"] = json!(lang.code());
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("설정 폴더를 만들지 못했습니다: {e}"))?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default()).map_err(|e| format!("설정을 저장하지 못했습니다: {e}"))
+}
+
+#[derive(Serialize)]
+struct LanguageDto {
+    language: Lang,
+    options: Vec<Value>,
+}
+
+fn language_dto() -> LanguageDto {
+    LanguageDto { language: i18n::current(), options: Lang::ALL.iter().map(|l| json!({ "code": l.code(), "label": l.label() })).collect() }
+}
+
+/// 지금 화면 언어 (콘솔 · 현장 단말 모두)
+#[tauri::command]
+fn get_language() -> LanguageDto {
+    language_dto()
+}
+
+/// 화면 언어를 바꿉니다 (콘솔 설정 전용). 설정 파일에 남기고 두 창에 알립니다.
+/// 화면 글은 프런트의 번역 표가 바꾸고, 이미 쓴 절차서 초안 요약(모델 글)은 그때의 언어 그대로입니다.
+#[tauri::command]
+fn set_language(window: Window, app: AppHandle, language: String) -> Result<LanguageDto, String> {
+    console_only(&window)?;
+    let lang = Lang::parse(&language).ok_or_else(|| format!("모르는 언어입니다: {language}"))?;
+    i18n::set(lang);
+    save_language(lang)?;
+    let _ = app.emit("language_changed", json!({ "language": lang.code() }));
+    Ok(language_dto())
 }
 
 // ───────────────────────── DCS 시뮬레이터 ─────────────────────────
@@ -1583,6 +1651,8 @@ fn load_models(app: AppHandle) {
 
 pub fn run() {
     let salt: Vec<u8> = (0..8).flat_map(|_| random_u32().to_le_bytes()).collect();
+    // 화면 언어: `BLUEPRINT_LANG=en` 이 있으면 그것, 없으면 지난번 설정(settings.json), 없으면 한국어
+    i18n::set(std::env::var("BLUEPRINT_LANG").ok().and_then(|s| Lang::parse(&s)).or_else(saved_language).unwrap_or_default());
     // 시작 도메인: `BLUEPRINT_DOMAIN=aidc` 면 AI 데이터센터, 없으면 발전소 (콘솔 머리의 스위치로 언제든 바꿉니다)
     let start_mode = std::env::var("BLUEPRINT_DOMAIN").ok().and_then(|k| DomainMode::from_key(&k)).unwrap_or_default();
     let ledger = Lattice::embedded_for(start_mode).expect("합성 원장을 읽을 수 없습니다");
@@ -1643,6 +1713,8 @@ pub fn run() {
             verdict_catalog,
             domain_info,
             switch_domain_mode,
+            get_language,
+            set_language,
             field_ready,
             field_sectors,
             field_reset,

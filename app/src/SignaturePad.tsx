@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { useT } from "./i18n";
 
 /** 서명 측정값. 코어 `Signature` 와 같은 이름입니다. */
 export interface SignatureStats {
@@ -28,6 +29,7 @@ function nearlyStraight(points: Point[]): boolean {
 
 /** 터치나 마우스로 서명하는 패드. 획수, 면적, 직선 여부를 `onChange` 로 알려 줍니다. 판정은 코어가 합니다. */
 export function SignaturePad({ onChange }: { onChange: (stats: SignatureStats | null) => void }) {
+  const t = useT();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const strokes = useRef<Point[][]>([]);
   const drawing = useRef(false);
@@ -115,9 +117,9 @@ export function SignaturePad({ onChange }: { onChange: (stats: SignatureStats | 
         }}
       />
       <div className="sign-foot">
-        <span className="muted">손가락이나 마우스로 성함을 적어 주세요.</span>
+        <span className="muted">{t("손가락이나 마우스로 성함을 적어 주세요.", "Sign your name with a finger or mouse.")}</span>
         <button type="button" className="plain" onClick={clear}>
-          지우고 다시 쓰기
+          {t("지우고 다시 쓰기", "Clear and sign again")}
         </button>
       </div>
     </div>

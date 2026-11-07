@@ -1,9 +1,10 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc";
 import mermaid from "mermaid";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { fitRect, usePanZoom, type Size } from "../cctv/stage";
 import { ZoomCtl } from "../cctv/ZoomCtl";
+import { useLang, useT } from "../i18n";
 import type { Context } from "../PlantTopologyView";
 
 let ready = false;
@@ -22,6 +23,8 @@ const MAX_FIT = 1.6;
  *  블록을 누르면 선택 설비가 바뀝니다. 노드마다 `data-kks` 를 달아 CCTV 말풍선이 그 노드에서 지시선을 긋습니다. */
 export function MermaidView({ ctx }: { ctx: Context }) {
   const host = useRef<HTMLDivElement>(null);
+  const say = useT();
+  const lang = useLang();
   const [whole, setWhole] = useState(false);
   const [source, setSource] = useState("");
   const [showSource, setShowSource] = useState(false);
@@ -34,7 +37,7 @@ export function MermaidView({ ctx }: { ctx: Context }) {
     invoke<string>("mermaid_source", { input: { incident: ctx.incident, selected: ctx.selected, mining: ctx.mining, whole } })
       .then(setSource)
       .catch((e) => setError(String(e)));
-  }, [ctx.incident, ctx.selected, ctx.mining, whole]);
+  }, [ctx.incident, ctx.selected, ctx.mining, whole, lang]);
 
   useEffect(() => {
     if (!source || !host.current) return;
@@ -64,7 +67,7 @@ export function MermaidView({ ctx }: { ctx: Context }) {
         });
         setError(null);
       })
-      .catch((e) => setError(`다이어그램을 그리지 못했습니다: ${e}`));
+      .catch((e) => setError(say(`다이어그램을 그리지 못했습니다: ${e}`, `Could not draw the diagram: ${e}`)));
     return () => {
       alive = false;
     };
@@ -73,14 +76,14 @@ export function MermaidView({ ctx }: { ctx: Context }) {
   const bar = ctx.bar
     ? createPortal(
         <div className="view-bar ov-bar mermaid-head">
-          <span className="bar-label">🧭 Mermaid 계통</span>
-          <span className="muted">섹터(Lv2)별 서브그래프 · 상 · 하류 파급 경로 (노드 클릭 시 연동)</span>
+          <span className="bar-label">{say("🧭 Mermaid 계통", "🧭 Mermaid diagram")}</span>
+          <span className="muted">{say("섹터(Lv2)별 서브그래프 · 상 · 하류 파급 경로 (노드 클릭 시 연동)", "Subgraph per sector (Lv2) · upstream/downstream propagation (click a node to sync)")}</span>
           <label className="chip">
             <input type="checkbox" checked={whole} onChange={(e) => setWhole(e.target.checked)} />
-            전체 계통 (끄면 선택 설비 2홉 + 원인 경로)
+            {say("전체 계통 (끄면 선택 설비 2홉 + 원인 경로)", "Whole system (off: 2 hops around the selection + cause path)")}
           </label>
           <button className={`chip ${showSource ? "active" : ""}`} onClick={() => setShowSource((s) => !s)}>
-            {showSource ? "▲" : "▼"} Mermaid.js 원본
+            {showSource ? "▲" : "▼"} {say("Mermaid.js 원본", "Mermaid.js source")}
           </button>
           {error && <span className="error">{error}</span>}
           {showSource && <pre className="mermaid-source vp-glass">{source}</pre>}

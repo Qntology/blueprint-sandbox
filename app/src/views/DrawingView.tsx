@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { fitRect, usePanZoom } from "../cctv/stage";
 import { ZoomCtl } from "../cctv/ZoomCtl";
 import { shortTag, useTerms } from "../domain";
+import { useT } from "../i18n";
 import { SHEET_PX, useDrawingImage } from "../drawings";
 import type { Context, EdgeLag } from "../PlantTopologyView";
 import { equipmentLevel, fixed, fmt, hopDepths, MEDIUM_COLOR, SDS_COLOR, sdsStateAt, sensorsOf, signedSecs, valueAt } from "../plant";
@@ -56,6 +57,7 @@ function midpoint(points: [number, number][]): [number, number] {
  *  가장자리 점프 커넥터(OPC)를 누르면 연결된 도면으로 넘어갑니다. 도면 고르기는 좌상단 도구줄에 있습니다. */
 export function DrawingView({ ctx }: { ctx: Context }) {
   const terms = useTerms();
+  const say = useT();
   const { plant, detail, selected, onSelect, mining, t, drawing, setDrawing } = ctx;
   const a0 = drawing.startsWith("A0:") ? plant.a0.find((a) => `A0:${a.id}` === drawing) : undefined;
   const src = useDrawingImage(a0 || drawing.startsWith("A0:") ? null : drawing);
@@ -95,15 +97,16 @@ export function DrawingView({ ctx }: { ctx: Context }) {
           })}
           {plant.a0.map((a) => (
             <button key={a.id} className={drawing === `A0:${a.id}` ? "chip active a0-chip" : "chip a0-chip"} onClick={() => setDrawing(`A0:${a.id}`)}>
-              {drawing === `A0:${a.id}` ? "● " : ""}A0 종합 · {a.grid.rows}×{a.grid.cols}
+              {drawing === `A0:${a.id}` ? "● " : ""}
+              {say("A0 종합", "A0 composite")} · {a.grid.rows}×{a.grid.cols}
             </button>
           ))}
-          <label className="chip dark-toggle" title="도면을 관제실 톤으로 뒤집어 그립니다 (설비 상태 색은 그대로)">
+          <label className="chip dark-toggle" title={say("도면을 관제실 톤으로 뒤집어 그립니다 (설비 상태 색은 그대로)", "Invert the drawing to the control-room tone (status colors stay)")}>
             <input type="checkbox" checked={ctx.dark} onChange={(e) => ctx.onDark(e.target.checked)} />
-            🌓 어둡게
+            {say("🌓 어둡게", "🌓 Dark")}
           </label>
           {info && !a0 && (
-            <span className="bar-note" title={`[표제란] ${terms.drawing} 도면번호 ${info.id} (${info.rev}) · ${info.title} · 발행 ${info.issued}`}>
+            <span className="bar-note" title={say(`[표제란] ${terms.drawing} 도면번호 ${info.id} (${info.rev}) · ${info.title} · 발행 ${info.issued}`, `[Title block] ${terms.drawing} drawing no. ${info.id} (${info.rev}) · ${info.title} · issued ${info.issued}`)}>
               {info.rev} · {info.title}
             </span>
           )}
@@ -126,7 +129,7 @@ export function DrawingView({ ctx }: { ctx: Context }) {
       {bar}
       <div className="sheet-viewport" ref={pz.bind}>
         <div className={`sheet ${ctx.dark ? "dark" : ""}`} style={pz.style}>
-          {src ? <img src={src} alt={drawing} draggable={false} /> : <div className="sheet-loading">도면을 불러오는 중</div>}
+          {src ? <img src={src} alt={drawing} draggable={false} /> : <div className="sheet-loading">{say("도면을 불러오는 중", "Loading drawing")}</div>}
           {mining && (
             <svg className="pipes" viewBox="0 0 1 1" preserveAspectRatio="none">
               {ctx.flows
@@ -148,7 +151,7 @@ export function DrawingView({ ctx }: { ctx: Context }) {
           {lagLabels.map((l) => (
             <span key={l.key} className={`lag-label ${l.ok ? "ok" : "bad"}`} style={{ left: `${l.at[0] * 100}%`, top: `${l.at[1] * 100}%` }}>
               ⏱️ Δt {l.lag >= 0 ? "+" : ""}
-              {l.lag.toFixed(1)}s{l.hops > 1 ? ` · ${l.hops}홉` : ""} (허용 {fmt(l.range[0])}~{fmt(l.range[1])}s {l.ok ? "✓" : "✗"})
+              {l.lag.toFixed(1)}s{l.hops > 1 ? say(` · ${l.hops}홉`, ` · ${l.hops} hops`) : ""} ({say("허용", "allowed")} {fmt(l.range[0])}~{fmt(l.range[1])}s {l.ok ? "✓" : "✗"})
             </span>
           ))}
           {onSheet.map((e) => {
@@ -174,7 +177,7 @@ export function DrawingView({ ctx }: { ctx: Context }) {
                 {mark && <span className="hit-badge">#{mark.rank}</span>}
                 {/* CCTV 말풍선이 붙은 설비는 말풍선이 같은 내용을 크게 보이므로 작은 칩은 다른 설비에만 */}
                 {track && sds && !ctx.carded.has(e.kks) && (
-                  <span className={`sds-chip ${(e.bbox as Box)[0] > 0.55 ? "flip" : ""}`} style={{ borderColor: SDS_COLOR[sds] ?? "#59606e" }} title={`${track.tag} SDS 상태 전이: ${track.transitions.map(([, c]) => c).join(" → ")}`}>
+                  <span className={`sds-chip ${(e.bbox as Box)[0] > 0.55 ? "flip" : ""}`} style={{ borderColor: SDS_COLOR[sds] ?? "#59606e" }} title={`${track.tag} ${say("SDS 상태 전이", "SDS transitions")}: ${track.transitions.map(([, c]) => c).join(" → ")}`}>
                     <b style={{ color: SDS_COLOR[sds] }}>{sds}</b>
                     {metric && (
                       <i>
@@ -185,8 +188,8 @@ export function DrawingView({ ctx }: { ctx: Context }) {
                     {tl && <Spark tl={tl} tag={track.tag} from={sparkFrom} to={sparkTo} t={t} color={SDS_COLOR[sds] ?? "#4fd1c5"} />}
                   </span>
                 )}
-                {e.kks === ctx.rootKks && <span className="badge root">🔥 근본원인</span>}
-                {e.kks === ctx.alarmKks && <span className="badge alarm">⚠️ 경보</span>}
+                {e.kks === ctx.rootKks && <span className="badge root">{say("🔥 근본원인", "🔥 Root cause")}</span>}
+                {e.kks === ctx.alarmKks && <span className="badge alarm">{say("⚠️ 경보", "⚠️ Alarm")}</span>}
                 <span className="eq-values">
                   {sensorsOf(plant, e.kks)
                     .slice(0, 2)
@@ -218,8 +221,8 @@ export function DrawingView({ ctx }: { ctx: Context }) {
                 style={pct(box)}
                 data-drawing={target}
                 data-other={other?.kks}
-                title={`${c.id} · ${c.label} · 누르면 ${target} 로 이동`}
-                aria-label={out ? `점프 ${target}` : `${target} 인입`}
+                title={say(`${c.id} · ${c.label} · 누르면 ${target} 로 이동`, `${c.id} · ${c.label} · click to go to ${target}`)}
+                aria-label={out ? say(`점프 ${target}`, `Jump ${target}`) : say(`${target} 인입`, `From ${target}`)}
                 onClick={() => {
                   setDrawing(target);
                   if (other) onSelect(other.kks);
@@ -231,9 +234,9 @@ export function DrawingView({ ctx }: { ctx: Context }) {
                 </span>
                 {lag && (
                   <span className="opc-osd">
-                    {out ? "하류" : "상류"} 전파 Δt {lag.lag >= 0 ? "+" : ""}
+                    {out ? say("하류 전파", "Downstream") : say("상류 전파", "Upstream")} Δt {lag.lag >= 0 ? "+" : ""}
                     {lag.lag.toFixed(1)}s {lag.ok ? "✓" : "✗"}
-                    {arrive !== undefined ? ` · 도착 ${signedSecs(arrive, ctx.origin)}` : ""}
+                    {arrive !== undefined ? say(` · 도착 ${signedSecs(arrive, ctx.origin)}`, ` · arrives ${signedSecs(arrive, ctx.origin)}`) : ""}
                   </span>
                 )}
               </button>

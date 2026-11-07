@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { fitRect } from "../cctv/stage";
 import { drawingImage } from "../drawings";
+import { useLang, useT } from "../i18n";
 import type { Context } from "../PlantTopologyView";
 import type { A0Info, A0Tile } from "../types";
 
@@ -12,12 +13,14 @@ const pct = (v: number, total: number) => `${(v / total) * 100}%`;
  *  2차 개선안: 종합 도면은 무대의 빈 자리에 맞춰 크게 그리고, 타일 미니맵은 왼쪽 아래 유리 카드로 늘 떠 있습니다. */
 export function A0View({ ctx, a0 }: { ctx: Context; a0: A0Info }) {
   const [W, H] = a0.pixel_size;
+  const say = useT();
+  const lang = useLang();
   const [urls, setUrls] = useState<Record<string, string>>({});
   const [zoom, setZoom] = useState<A0Tile | null>(null);
 
   useEffect(() => {
     for (const s of a0.sheets) drawingImage(s.drawing).then((url) => setUrls((u) => ({ ...u, [s.drawing]: url }))).catch(() => {});
-  }, [a0]);
+  }, [a0, lang]);
 
   const tileOf = (kks: string | null | undefined) => (kks ? a0.equipment[kks]?.tile ?? null : null);
   const marks = (id: string) => [id === tileOf(ctx.selected) ? "selected" : "", id === tileOf(ctx.rootKks) ? "root" : "", id === tileOf(ctx.alarmKks) ? "alarm" : "", id === zoom?.id ? "zoomed" : ""].join(" ");
@@ -30,27 +33,27 @@ export function A0View({ ctx, a0 }: { ctx: Context; a0: A0Info }) {
     ? createPortal(
         <div className="view-bar ov-bar a0-bar">
           <b>
-            [A0 종합] {a0.id} ({a0.rev})
+            {say("[A0 종합]", "[A0 composite]")} {a0.id} ({a0.rev})
           </b>
           <span className="muted">
-            {W.toLocaleString()} × {H.toLocaleString()} px · {a0.grid.rows}×{a0.grid.cols} 타일 · 겹침 {Math.round(a0.grid.overlap * 100)}%
+            {W.toLocaleString()} × {H.toLocaleString()} px · {a0.grid.rows}×{a0.grid.cols} {say("타일", "tiles")} · {say("겹침", "overlap")} {Math.round(a0.grid.overlap * 100)}%
           </span>
           {ctx.selected && tileOf(ctx.selected) && (
             <span>
-              선택 설비 타일 <b>{tileOf(ctx.selected)}</b>
+              {say("선택 설비 타일", "Selected equipment tile")} <b>{tileOf(ctx.selected)}</b>
             </span>
           )}
           {zoom ? (
             <>
               <span>
-                확대 <b>{zoom.id}</b>
+                {say("확대", "Zoomed")} <b>{zoom.id}</b>
               </span>
               <button className="plain small" onClick={() => setZoom(null)}>
-                전체 보기
+                {say("전체 보기", "Show all")}
               </button>
             </>
           ) : (
-            <span className="muted">타일을 누르면 그 구역으로 확대합니다</span>
+            <span className="muted">{say("타일을 누르면 그 구역으로 확대합니다", "Click a tile to zoom into that area")}</span>
           )}
         </div>,
         ctx.bar,
@@ -80,14 +83,14 @@ export function A0View({ ctx, a0 }: { ctx: Context; a0: A0Info }) {
               data-kks={kks}
               className={`a0-eq ${kks === ctx.selected ? "selected" : ""} ${kks === ctx.rootKks ? "root" : ""} ${kks === ctx.alarmKks ? "alarm" : ""} ${ctx.marks.has(kks) ? "hit" : ""}`}
               style={{ left: `${e.bbox[0] * 100}%`, top: `${e.bbox[1] * 100}%`, width: `${(e.bbox[2] - e.bbox[0]) * 100}%`, height: `${(e.bbox[3] - e.bbox[1]) * 100}%` }}
-              title={`${kks} · 타일 ${e.tile ?? "-"}`}
+              title={`${kks} · ${say("타일", "tile")} ${e.tile ?? "-"}`}
               aria-label={kks}
               onClick={() => ctx.onSelect(kks)}
             />
           ))}
         </div>
       </div>
-      <div className="a0-minimap vp-glass ov-avoid" style={{ gridTemplateColumns: `repeat(${a0.grid.cols}, 1fr)` }} aria-label="A0 타일 미니맵">
+      <div className="a0-minimap vp-glass ov-avoid" style={{ gridTemplateColumns: `repeat(${a0.grid.cols}, 1fr)` }} aria-label={say("A0 타일 미니맵", "A0 tile minimap")}>
         {a0.tiles.map((t) => (
           <button key={t.id} className={`a0-mini ${marks(t.id)}`} onClick={() => setZoom(zoom?.id === t.id ? null : t)}>
             {t.id}

@@ -1,5 +1,7 @@
 import { useEffect, useRef } from "react";
 import { shortTag } from "../domain";
+import { useT } from "../i18n";
+import { tr } from "../i18n/lang";
 import { SHEET_PX, useDrawingImage } from "../drawings";
 import { fixed, fmt, SDS_COLOR, sdsStateAt, sensorsOf, valueAt } from "../plant";
 import type { Detail, Equipment, Metrics, Plant, SdsTrack, Sensor, Timeline } from "../types";
@@ -21,7 +23,7 @@ export interface SearchMark {
   id: string;
 }
 
-const ROLE_TAG: Record<CardRole, string> = { root: "🔥 근본원인", alarm: "⚠️ 경보", selected: "◎ 선택", hit: "🎯 검색" };
+const roleTag = (r: CardRole) => ({ root: tr("🔥 근본원인", "🔥 Root cause"), alarm: tr("⚠️ 경보", "⚠️ Alarm"), selected: tr("◎ 선택", "◎ Selected"), hit: tr("🎯 검색", "🎯 Search") })[r];
 const TAIL = 18; // 설비 상자와 말풍선 사이
 const GAP = 6;
 const EDGE = 6;
@@ -59,7 +61,7 @@ function spots(a: Rect, w: number, h: number): [number, number][] {
 /** 60초 파형 타일 (CAM-WAVE): 재생 시각 t 앞 50초 ~ 뒤 10초, 커서 · 경보 · 트립 한계선 */
 function WaveTile({ tl, sensor, t, color }: { tl: Timeline | null; sensor: Sensor | undefined; t: number; color: string }) {
   const v = sensor && tl ? tl.series[sensor.tag] : undefined;
-  if (!tl || !sensor || !v?.length) return <div className="tile-empty">{sensor ? `계측 대기 · 정상 ${fmt(sensor.normal)} ${sensor.unit}` : "계측 없음"}</div>;
+  if (!tl || !sensor || !v?.length) return <div className="tile-empty">{sensor ? tr(`계측 대기 · 정상 ${fmt(sensor.normal)} ${sensor.unit}`, `No live data · normal ${fmt(sensor.normal)} ${sensor.unit}`) : tr("계측 없음", "No measurement")}</div>;
   const end = tl.t0_ms + (v.length - 1) * tl.period_ms;
   let to = Math.min(end, t + 10_000);
   let from = to - 60_000;
@@ -72,7 +74,7 @@ function WaveTile({ tl, sensor, t, color }: { tl: Timeline | null; sensor: Senso
     const at = tl.t0_ms + i * tl.period_ms;
     if (at >= from && at <= to) pts.push([at, x]);
   });
-  if (pts.length < 2) return <div className="tile-empty">계측 대기</div>;
+  if (pts.length < 2) return <div className="tile-empty">{tr("계측 대기", "No live data")}</div>;
   let lo = Math.min(...pts.map((p) => p[1]));
   let hi = Math.max(...pts.map((p) => p[1]));
   const limits = [sensor.alarm_high, sensor.alarm_low, sensor.trip_high, sensor.trip_low].filter((l): l is number => l !== null);
@@ -101,7 +103,7 @@ function WaveTile({ tl, sensor, t, color }: { tl: Timeline | null; sensor: Senso
 /** 도면 조각 타일 (CAM-SYM): 마스터 도면에서 설비 상자(심볼 · 이름 · KKS)를 타일 비율로 잘라 보입니다 */
 function SymbolTile({ eq, dark }: { eq: Equipment; dark: boolean }) {
   const url = useDrawingImage(eq.drawing);
-  if (!url) return <div className="tile-empty">도면을 불러오는 중</div>;
+  if (!url) return <div className="tile-empty">{tr("도면을 불러오는 중", "Loading drawing")}</div>;
   const [W, H] = SHEET_PX;
   const aspect = 4 / 3;
   const pad = 0.012;
@@ -156,6 +158,7 @@ function primarySensor(plant: Plant, detail: Detail | null, tracks: Map<string, 
 }
 
 function Card({ n, target, plant, detail, t, tracks, metrics, mark, remote, dark, onSelect, onZoom, onInterlock, bind }: CardProps) {
+  const say = useT();
   const eq = plant.equipment.find((e) => e.kks === target.kks);
   if (!eq) return null;
   const tl = detail?.timeline ?? null;
@@ -178,7 +181,7 @@ function Card({ n, target, plant, detail, t, tracks, metrics, mark, remote, dark
         <span className="grow" />
         {target.roles.map((r) => (
           <em key={r} className={`cctv-role ${r}`}>
-            {r === "hit" && mark ? `🎯 #${mark.rank}` : ROLE_TAG[r]}
+            {r === "hit" && mark ? `🎯 #${mark.rank}` : roleTag(r)}
           </em>
         ))}
       </header>
@@ -191,10 +194,11 @@ function Card({ n, target, plant, detail, t, tracks, metrics, mark, remote, dark
         )}
         {metric && <i className="mono">dx/dt {fixed(metric.slope_per_sec_milli / 1000, 2)}/s</i>}
       </div>
-      {remote && <div className="cctv-remote">📍 {remote} 도면 · 점프 커넥터로 이어짐</div>}
+      {remote && <div className="cctv-remote">{say(`📍 ${remote} 도면 · 점프 커넥터로 이어짐`, `📍 On ${remote} · via jump connector`)}</div>}
       {mark && (
         <div className="cctv-why" title={mark.why.join(" · ")}>
-          🎯 #{mark.rank} 적중 · 왜: {mark.why.length ? mark.why.slice(0, 4).join(" · ") : `${mark.kind} ${mark.id}`}
+          {say(`🎯 #${mark.rank} 적중 · 왜: `, `🎯 #${mark.rank} hit · why: `)}
+          {mark.why.length ? mark.why.slice(0, 4).join(" · ") : `${mark.kind} ${mark.id}`}
         </div>
       )}
       <div className="cctv-tiles">
@@ -211,10 +215,10 @@ function Card({ n, target, plant, detail, t, tracks, metrics, mark, remote, dark
       </div>
       <footer className="cctv-foot">
         <button className="vt-btn" onClick={stop(() => onZoom(eq.kks))}>
-          🔍 파형 확대
+          {say("🔍 파형 확대", "🔍 Zoom waveform")}
         </button>
-        <button className="vt-btn" disabled={!onInterlock} onClick={stop(() => onInterlock?.())} title={onInterlock ? "우측 결재 HUD 의 인터록 게이트로" : "인터록이 있는 사건이 아닙니다"}>
-          📋 인터록 이동
+        <button className="vt-btn" disabled={!onInterlock} onClick={stop(() => onInterlock?.())} title={onInterlock ? say("우측 결재 HUD 의 인터록 게이트로", "To the interlock gate in the approval HUD") : say("인터록이 있는 사건이 아닙니다", "This incident has no interlock")}>
+          {say("📋 인터록 이동", "📋 Go to interlock")}
         </button>
       </footer>
     </article>

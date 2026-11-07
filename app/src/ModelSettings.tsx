@@ -1,6 +1,8 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke } from "./ipc";
+import { listen } from "./ipc";
 import { useCallback, useEffect, useState } from "react";
+import { useT } from "./i18n";
+import { tr } from "./i18n/lang";
 
 interface Job {
   running: boolean;
@@ -37,14 +39,19 @@ const size = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.r
 
 function note(m: ModelRow): string {
   if (m.job.running) return m.job.message;
-  if (m.installed) return `${size(m.bytes_on_disk)} 사용 중 (zoro-gravity 와 같은 모델)`;
-  if (m.importable) return "zoro-gravity 모델 폴더에 있습니다. 가져오면 큰 가중치는 하드 링크로 걸려 디스크를 더 쓰지 않습니다.";
-  if (m.bytes_on_disk > 0) return `받다 멈춤 (${size(m.bytes_on_disk)}). 다시 누르면 이어 받습니다.`;
-  return m.repo ? `huggingface.co/${m.repo}` : "내려받을 곳이 없습니다. 직접 변환해서 모델 폴더에 넣으세요.";
+  if (m.installed) return tr(`${size(m.bytes_on_disk)} 사용 중 (zoro-gravity 와 같은 모델)`, `${size(m.bytes_on_disk)} in use (same model as zoro-gravity)`);
+  if (m.importable)
+    return tr(
+      "zoro-gravity 모델 폴더에 있습니다. 가져오면 큰 가중치는 하드 링크로 걸려 디스크를 더 쓰지 않습니다.",
+      "Found in the zoro-gravity model folder. Importing hard-links the large weights, so it uses no extra disk space.",
+    );
+  if (m.bytes_on_disk > 0) return tr(`받다 멈춤 (${size(m.bytes_on_disk)}). 다시 누르면 이어 받습니다.`, `Download stopped (${size(m.bytes_on_disk)}). Press again to resume.`);
+  return m.repo ? `huggingface.co/${m.repo}` : tr("내려받을 곳이 없습니다. 직접 변환해서 모델 폴더에 넣으세요.", "No download source. Convert it yourself and put it in the model folder.");
 }
 
 /** 모델 가져오기 · 다운로드 · 삭제 설정. 모델은 zoro-gravity 와 같아서 먼저 그 폴더에서 가져오고, 없을 때만 내려받습니다. */
 export function ModelSettings({ open, onOpen }: { open: boolean; onOpen: () => void }) {
+  const t = useT();
   const [report, setReport] = useState<ModelReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
@@ -87,22 +94,26 @@ export function ModelSettings({ open, onOpen }: { open: boolean; onOpen: () => v
 
   return (
     <aside className="settings">
-      <h2>모델 관리</h2>
-      <p className="muted path">모델 폴더: {report?.dir}</p>
-      <p className="muted path">가져올 곳 (zoro-gravity): {report?.import_from ?? "없음"}</p>
+      <h2>{t("모델 관리", "Model Management")}</h2>
+      <p className="muted path">
+        {t("모델 폴더:", "Model folder:")} {report?.dir}
+      </p>
+      <p className="muted path">
+        {t("가져올 곳 (zoro-gravity):", "Import source (zoro-gravity):")} {report?.import_from ?? t("없음", "none")}
+      </p>
       <div className="settings-actions">
         <button className="green" disabled={importable.length === 0} onClick={() => importable.forEach((m) => run("import_model", { modelName: m.name }))}>
-          zoro-gravity 에서 가져오기 ({importable.length})
+          {t(`zoro-gravity 에서 가져오기 (${importable.length})`, `Import from zoro-gravity (${importable.length})`)}
         </button>
         <button className="teal" disabled={missing.length === 0} onClick={() => missing.forEach((m) => run("download_model", { modelName: m.name }))}>
-          없는 모델 모두 받기
+          {t("없는 모델 모두 받기", "Download all missing models")}
         </button>
         <button
           className="danger"
           disabled={busy || !models.some((m) => m.bytes_on_disk > 0)}
           onClick={() => (confirming === "all" ? run("delete_all_models") : setConfirming("all"))}
         >
-          {confirming === "all" ? "한 번 더 누르면 모두 삭제" : "모델 모두 삭제"}
+          {confirming === "all" ? t("한 번 더 누르면 모두 삭제", "Press again to delete all") : t("모델 모두 삭제", "Delete all models")}
         </button>
       </div>
       {error && <p className="error">{error}</p>}
@@ -118,11 +129,17 @@ export function ModelSettings({ open, onOpen }: { open: boolean; onOpen: () => v
                 disabled={!m.repo || m.installed || m.job.running}
                 onClick={() => run("download_model", { modelName: m.name })}
               >
-                {m.job.running ? `받는 중 (${m.job.percent}%)` : m.installed ? "받음" : m.repo ? `다운로드 (${size(m.total_bytes)})` : "링크 없음"}
+                {m.job.running
+                  ? t(`받는 중 (${m.job.percent}%)`, `Downloading (${m.job.percent}%)`)
+                  : m.installed
+                    ? t("받음", "Downloaded")
+                    : m.repo
+                      ? t(`다운로드 (${size(m.total_bytes)})`, `Download (${size(m.total_bytes)})`)
+                      : t("링크 없음", "No link")}
               </button>
               {m.bytes_on_disk > 0 && !m.job.running && (
                 <button className="danger" onClick={() => (confirming === m.name ? run("delete_model", { modelName: m.name }) : setConfirming(m.name))}>
-                  {confirming === m.name ? "한 번 더 누르면 삭제" : "삭제"}
+                  {confirming === m.name ? t("한 번 더 누르면 삭제", "Press again to delete") : t("삭제", "Delete")}
                 </button>
               )}
             </span>
@@ -132,7 +149,7 @@ export function ModelSettings({ open, onOpen }: { open: boolean; onOpen: () => v
               <div style={{ width: `${m.job.percent}%` }} />
             </div>
           )}
-          <p className={m.job.error ? "error" : "muted"}>{m.job.error ? `오류: ${m.job.error}` : note(m)}</p>
+          <p className={m.job.error ? "error" : "muted"}>{m.job.error ? t(`오류: ${m.job.error}`, `Error: ${m.job.error}`) : note(m)}</p>
         </article>
       ))}
     </aside>

@@ -305,7 +305,12 @@ fn draft_for(db: &Lattice, candidate: Verdict, tag: Option<&str>, substantive: &
     let template = template_summary(db, candidate, tag, causal, now_value, root_value);
     let facts: Vec<String> = substantive.facts.iter().filter(|(k, _)| k != "적용 규칙").map(|(k, v)| format!("{k}: {v}")).collect();
     let source: Vec<String> = facts.iter().cloned().chain(std::iter::once(template.clone())).collect();
-    Some(draft_aop(writer, &db.terms().drafting_system(), aop, &source, &template))
+    // 영어 화면이면 글쓰기 모델에게 영어 지시문을 줍니다 (사실 줄 · 템플릿은 한국어 그대로, 템플릿은 화면이 번역 표로 옮김)
+    let system = match crate::i18n::current() {
+        crate::i18n::Lang::En => crate::i18n::drafting_system_en(db.domain()).to_string(),
+        crate::i18n::Lang::Ko => db.terms().drafting_system(),
+    };
+    Some(draft_aop(writer, &system, aop, &source, &template))
 }
 
 /// Stage 5 기록
