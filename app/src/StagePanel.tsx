@@ -1,6 +1,7 @@
 import { invoke } from "./ipc";
 import { useEffect, useState } from "react";
 import { useTerms } from "./domain";
+import { eng, useEngineer } from "./engineer";
 import { useT } from "./i18n";
 import { tr } from "./i18n/lang";
 import type { DrawerKey } from "./OfficerView";
@@ -64,10 +65,9 @@ export function StageBar({ detail, onOpen, lanes }: { detail: Detail | null; onO
             onClick={() => onOpen(ns[0] as DrawerKey)}
             title={ns
               .map((n, i) =>
-                t(
-                  `Stage ${n}. ${ss[i]?.name ?? fallback(n)}: ${ss[i]?.summary ?? "-"} (${duration(ss[i]?.ms ?? 0)})`,
-                  `Stage ${n}. ${ss[i]?.name ?? fallback(n)}: ${ss[i]?.summary ?? "-"} (${duration(ss[i]?.ms ?? 0)})`,
-                ),
+                n === 5 && detail?.drafting
+                  ? t(`Stage 5. ${ss[i]?.name ?? fallback(n)}: Zoro-1 이 초안을 쓰는 중 (지금은 사실 줄 템플릿)`, `Stage 5. ${ss[i]?.name ?? fallback(n)}: Zoro-1 is drafting (fact-line template for now)`)
+                  : `Stage ${n}. ${ss[i]?.name ?? fallback(n)}: ${ss[i]?.summary ?? "-"} (${duration(ss[i]?.ms ?? 0)})`,
               )
               .concat(t(`레인 ${l.count}건${l.wait > 0 ? ` · 최대 대기 ${mmss(l.wait)}` : ""}`, `Lane: ${l.count}${l.wait > 0 ? ` · Max wait ${mmss(l.wait)}` : ""}`))
               .join("\n")}
@@ -76,7 +76,7 @@ export function StageBar({ detail, onOpen, lanes }: { detail: Detail | null; onO
               Stage {ns.join("·")}. {name}
             </strong>
             <em>
-              <span>{ss.map((s) => `[${s ? STAGE_LABEL[s.status] : t("대기", "Waiting")}]`).join(" ")}</span>
+              <span>{ss.map((s, i) => `[${ns[i] === 5 && detail?.drafting ? t("✍️ 작성 중", "✍️ Drafting") : s ? STAGE_LABEL[s.status] : t("대기", "Waiting")}]`).join(" ")}</span>
               <span className={`lane-badge ${l.wait > 0 ? "hold" : ""}`}>
                 {t(`${l.count}건`, `${l.count}`)}
                 {l.wait > 0 ? ` · ⏳ ${mmss(l.wait)}` : ""}
@@ -110,13 +110,14 @@ function Bars({ asked, catalog, highlight }: { asked: Asked; catalog: Record<str
 function Scan({ detail }: { detail: Detail }) {
   const terms = useTerms();
   const t = useT();
+  const engineer = useEngineer();
   const stages = detail.analysis.stages;
   if (detail.reports.length === 0) {
     return (
       <p className="callout">
         {t(
-          "이 사건은 현장 스캔이 없는 신호 알람이라 문서 모델(SigLIP2 · gocr)을 GPU 에 올리지 않고 바로 Zoro-1 판단으로 갔습니다 (SharedResidency: 한 번에 한 모델).",
-          "This incident is a signal alarm with no field scan, so the document models (SigLIP2 · gocr) were not loaded onto the GPU and it went straight to the Zoro-1 verdict (SharedResidency: one model at a time).",
+          `이 사건은 현장 스캔이 없는 신호 알람이라 문서 모델(SigLIP2 · gocr)을 GPU 에 올리지 않고 바로 Zoro-1 판단으로 갔습니다 (${engineer ? "SharedResidency: " : ""}한 번에 한 모델).`,
+          `This incident is a signal alarm with no field scan, so the document models (SigLIP2 · gocr) were not loaded onto the GPU and it went straight to the Zoro-1 verdict (${engineer ? "SharedResidency: " : ""}one model at a time).`,
         )}
       </p>
     );
@@ -221,7 +222,6 @@ function Truth({ detail, supervisor }: { detail: Detail; supervisor: string }) {
   const terms = useTerms();
   const t = useT();
   const a = detail.analysis;
-  const [checked, setChecked] = useState<Record<number, boolean>>({});
   const [names, setNames] = useState<string | null>(null);
   return (
     <div className="two-col">
@@ -303,13 +303,15 @@ function Truth({ detail, supervisor }: { detail: Detail; supervisor: string }) {
             </>
           )}
         </dl>
-        <h4>{t(`[Gate 2 검출 사항 · ${terms.supervisor} 확인 체크리스트]`, `[Gate 2 Findings · ${terms.supervisor} Checklist]`)}</h4>
-        {(detail.notes.length ? detail.notes : [a.reason]).map((n, i) => (
-          <label key={i} className="check">
-            <input type="checkbox" checked={!!checked[i]} onChange={(e) => setChecked((c) => ({ ...c, [i]: e.target.checked }))} />
-            {n}
-          </label>
-        ))}
+        {/* 예전 체크리스트는 어디에도 보내지 않고 닫으면 사라져(확정 조건도 아님) 목록으로 바꿨습니다 (UI 단순화 U9).
+            검출 사항을 본 확인은 결재 HUD 의 확정 · 반려 결정 하나로 남습니다 (감사 기록). */}
+        <h4>{t("[Gate 2 검출 사항]", "[Gate 2 Findings]")}</h4>
+        <ul className="findings">
+          {(detail.notes.length ? detail.notes : [a.reason]).map((n, i) => (
+            <li key={i}>{n}</li>
+          ))}
+        </ul>
+        <p className="muted">{t(`검출 사항을 본 뒤 ${terms.supervisor} 결정은 오른쪽 결재 HUD 에서 합니다.`, `After reviewing the findings, the ${terms.supervisor} decides in the approval HUD on the right.`)}</p>
       </section>
       <section>
         <h4>{t("[작업자 권한 및 계통 연결망 (가림 처리)]", "[Worker Permissions & System Links (masked)]")}</h4>
@@ -353,6 +355,7 @@ function Truth({ detail, supervisor }: { detail: Detail; supervisor: string }) {
 
 function Decision({ detail, catalog }: { detail: Detail; catalog: Record<string, VerdictInfo> }) {
   const t = useT();
+  const engineer = useEngineer();
   const a = detail.analysis;
   const sub = a.substantive;
   const asked = sub?.decided.asked ?? [];
@@ -363,12 +366,17 @@ function Decision({ detail, catalog }: { detail: Detail; catalog: Record<string,
     <div className="two-col">
       <section>
         <div className="timeline-strip">
-          {t(
-            "[동작 원리] 백본이 정제된 사실(근무자 정보 제외)만 읽고, jev_head 가 선택지 위치(닫는 따옴표)의 은닉 상태로 점수를 매깁니다 (0-Generation)",
-            "[How it works] The backbone reads only cleaned facts (worker info excluded), and jev_head scores each option from the hidden state at its position (the closing quote) (0-Generation)",
-          )}
+          {engineer
+            ? t(
+                "[동작 원리] 백본이 정제된 사실(근무자 정보 제외)만 읽고, jev_head 가 선택지 위치(닫는 따옴표)의 은닉 상태로 점수를 매깁니다 (0-Generation)",
+                "[How it works] The backbone reads only cleaned facts (worker info excluded), and jev_head scores each option from the hidden state at its position (the closing quote) (0-Generation)",
+              )
+            : t(
+                "[동작 원리] 모델은 정제된 사실(근무자 정보 제외)만 읽고 선택지마다 점수를 매겨 고릅니다 (글을 새로 쓰지 않음)",
+                "[How it works] The model reads only cleaned facts (worker info excluded) and scores each option to choose one (it writes no new text)",
+              )}
         </div>
-        <h4>{t("[모델에 입력된 표준 JSON 사실 (PointerPrompt)]", "[Standard JSON Facts Given to the Model (PointerPrompt)]")}</h4>
+        <h4>{t(`[모델에 입력된 표준 JSON 사실${engineer ? " (PointerPrompt)" : ""}]`, `[Standard JSON Facts Given to the Model${engineer ? " (PointerPrompt)" : ""}]`)}</h4>
         <dl className="props">
           {(sub?.facts ?? []).map(([k, v]) => (
             <div key={k} className="sensor-line">
@@ -409,8 +417,8 @@ function Decision({ detail, catalog }: { detail: Detail; catalog: Record<string,
         ))}
         <div className="callout">
           {t(
-            `📌 [판정 결합 규칙 (verdict.rs)] 판정은 규칙이 정합니다 (${ruleLabel}). 모델이 같은 쪽을 고르면 축별 최솟값이 확신도가 됩니다:`,
-            `📌 [Verdict Combination Rule (verdict.rs)] The rules set the verdict (${ruleLabel}). If the model picks the same side, the lowest per-axis score becomes the confidence:`,
+            `📌 [판정 결합 규칙${engineer ? " (verdict.rs)" : ""}] 판정은 규칙이 정합니다 (${ruleLabel}). 모델이 같은 쪽을 고르면 축별 최솟값이 확신도가 됩니다:`,
+            `📌 [Verdict Combination Rule${engineer ? " (verdict.rs)" : ""}] The rules set the verdict (${ruleLabel}). If the model picks the same side, the lowest per-axis score becomes the confidence:`,
           )}{" "}
           <b>{sub?.decided.judgement.confidence != null ? sub.decided.judgement.confidence.toFixed(3) : t("없음", "none")}</b>
           {t(
@@ -509,6 +517,7 @@ export function InterlockPanel({ detail, supervisor, onChanged, compact = false,
 function Draft({ detail, supervisor }: { detail: Detail; supervisor: string }) {
   const terms = useTerms();
   const t = useT();
+  useEngineer(); // 코드 이름 꼬리(eng)가 설정을 따라 다시 그려지게
   const d = detail.analysis.draft;
   return (
     <div className="two-col">
@@ -517,9 +526,11 @@ function Draft({ detail, supervisor }: { detail: Detail; supervisor: string }) {
           {t("[듀얼 헤드] 판단과 같은 몸통에 임베딩 표를 더 올려 글을 씁니다", "[Dual Head] Writes text by adding an embedding table to the same trunk as the verdict")}{" "}
           {d
             ? `(${
-                d.by_model
-                  ? t(`모델 · ${duration(d.ms)} · ${d.attempts}회`, `model · ${duration(d.ms)} · ${d.attempts} ${d.attempts === 1 ? "attempt" : "attempts"}`)
-                  : t("템플릿", "template")
+                detail.drafting
+                  ? t("✍️ 모델이 쓰는 중 · 지금은 템플릿", "✍️ model drafting · template for now")
+                  : d.by_model
+                    ? t(`모델 · ${duration(d.ms)} · ${d.attempts}회`, `model · ${duration(d.ms)} · ${d.attempts} ${d.attempts === 1 ? "attempt" : "attempts"}`)
+                    : t("템플릿", "template")
               })`
             : ""}
         </div>
@@ -552,8 +563,8 @@ function Draft({ detail, supervisor }: { detail: Detail; supervisor: string }) {
               {t("검증 상태: ", "Check status: ")}
               {d.problems.length
                 ? t(
-                    `모델 초안 불일치 ${d.problems.length}건 → 사실 줄 템플릿으로 대체 (G4_INTERCEPT_DOC_CORRUPTION)`,
-                    `${d.problems.length} model draft ${d.problems.length === 1 ? "mismatch" : "mismatches"} → replaced with fact-line template (G4_INTERCEPT_DOC_CORRUPTION)`,
+                    `모델 초안 불일치 ${d.problems.length}건 → 사실 줄 템플릿으로 대체${eng(" (G4_INTERCEPT_DOC_CORRUPTION)")}`,
+                    `${d.problems.length} model draft ${d.problems.length === 1 ? "mismatch" : "mismatches"} → replaced with fact-line template${eng(" (G4_INTERCEPT_DOC_CORRUPTION)")}`,
                   )
                 : t("✓ 원문 수치 100% 일치", "✓ Source figures 100% match")}
             </p>
@@ -615,14 +626,16 @@ const TITLES = (): Record<string, string> => ({
   "1": tr("🔍 [Stage 1 & 2 상세] SigLIP2 시각 앵커 조각 계획 & gocr + Lattice 대장 교정 결과", "🔍 [Stage 1 & 2 Detail] SigLIP2 Visual-Anchor Crop Plan & gocr + Lattice Register Correction"),
   "2": tr("🔍 [Stage 1 & 2 상세] SigLIP2 시각 앵커 조각 계획 & gocr + Lattice 대장 교정 결과", "🔍 [Stage 1 & 2 Detail] SigLIP2 Visual-Anchor Crop Plan & gocr + Lattice Register Correction"),
   "3": tr("⚖️ [Stage 3 상세] Gate 1 형식 심사 & Gate 2 3중 진실 정합성 교차 대조", "⚖️ [Stage 3 Detail] Gate 1 Format Review & Gate 2 Triple-Truth Cross-Check"),
-  "4": tr("🧠 [Stage 4 상세] Gate 3 마인드맵 파급 분석 & Zoro-1 포인터 판단 (jev_head)", "🧠 [Stage 4 Detail] Gate 3 Mind Map Propagation Analysis & Zoro-1 Pointer Verdict (jev_head)"),
+  "4": tr(`🧠 [Stage 4 상세] Gate 3 마인드맵 파급 분석 & Zoro-1 포인터 판단${eng(" (jev_head)")}`, `🧠 [Stage 4 Detail] Gate 3 Mind Map Propagation Analysis & Zoro-1 Pointer Verdict${eng(" (jev_head)")}`),
   "5": tr("✍️ [Stage 5 상세] Zoro-1 글쓰기 조치 절차서 초안 · Factcheck 수치 검증 (결재는 오른쪽 HUD)", "✍️ [Stage 5 Detail] Zoro-1 Action Procedure Draft · Factcheck Figure Check (approve in the right HUD)"),
   archive: tr("🗄️ 보관 문서 (Gate 5)", "🗄️ Archived Record (Gate 5)"),
 });
 
-/** 결재 (오른쪽 결재 HUD 한 곳, UI 단순화 U1): 표준 조치 요약 · 공동 결재 · [재점검 지시] [조치확정],
- *  [더 보기] 에 반려 · 고위험 예외승인(오경보) · 근거 절차서 번호 · 증빙 장수 · 재점검 메모.
- *  확정 막힘(현장 대기 · 선행 절차 · 공동 결재)은 단추가 미리 막고 백엔드 가드레일이 한 번 더 막습니다.
+/** 결재 (오른쪽 결재 HUD 한 곳, UI 단순화 U1): 표준 조치 요약 · 공동 결재 · 근거 절차서 번호 · [재점검 지시] [조치확정],
+ *  [더 보기] 에 반려 · 고위험 예외승인(오경보) · 증빙 장수 · 재점검 메모.
+ *  확정은 의도 하나(`confirm`)만 보내고 고위험 절차 승인 갈래는 백엔드가 정합니다 (P1). 근거 절차서 번호는 도장 찍기 방지 대조라
+ *  미리 채우지 않습니다: 초안 전문에서 번호를 보고 사람이 칩니다 (Gate 3 이 초안 번호와 대조).
+ *  확정 막힘(현장 대기 · 선행 절차 · 공동 결재 · 번호)은 단추가 미리 막고 백엔드 가드레일이 한 번 더 막습니다.
  *  시연 모드에는 가드레일을 일부러 건드려 보는 시험 단추가 붙습니다 (영상 · E2E). */
 export function QuickApproval({
   detail,
@@ -644,7 +657,7 @@ export function QuickApproval({
   const awaiting = detail.state === "awaiting_field";
   const [cosign, setCosign] = useState(false);
   const [more, setMore] = useState(false);
-  const [ref, setRef] = useState(d?.aop_id ?? "");
+  const [ref, setRef] = useState("");
   const [scans, setScans] = useState(0);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
@@ -652,16 +665,17 @@ export function QuickApproval({
   useEffect(() => {
     setCosign(false);
     setMore(false);
-    setRef(detail.analysis.draft?.aop_id ?? "");
+    setRef("");
     setScans(0);
     setNote("");
     setReply(null);
-  }, [detail.id]); // eslint-disable-line react-hooks/exhaustive-deps
-  const act = async (action: string) => {
+  }, [detail.id]);
+  /** `over.cosign` 은 시험 단추(공동 결재 없이 확정 시도)가 체크 상태와 상관없이 보낼 때 */
+  const act = async (action: string, over: { cosign?: boolean } = {}) => {
     setBusy(true);
     try {
       const r = await invoke<{ ok: boolean; message: string; finalized: boolean }>("decide_incident", {
-        input: { id: detail.id, supervisor_id: supervisor, action, team_lead_cosign: cosign, procedure_ref: ref, evidence_scans: scans, note },
+        input: { id: detail.id, supervisor_id: supervisor, action, team_lead_cosign: over.cosign ?? cosign, procedure_ref: ref.trim(), evidence_scans: scans, note },
       });
       setReply(r.message);
       onDecided(r.message, r.ok, r.finalized);
@@ -672,15 +686,20 @@ export function QuickApproval({
       setBusy(false);
     }
   };
-  const confirmAction = d?.high_risk ? "approve_procedure" : "confirm";
+  const needCosign = !!d?.high_risk && !cosign;
+  const needRef = !!d?.high_risk && !ref.trim();
+  // 모델 초안을 뒤에서 쓰는 중이면 (P6) 지금 보이는 것은 사실 줄 템플릿이고, 확정은 초안이 나온 뒤에 (보관 문서에 들어갈 글)
+  const drafting = !!detail.drafting;
   return (
     <div className="quick-approval">
       <h4 className="qa-head">
         <span>
-          {t(
-            `[표준 조치 요약 ${d ? (d.problems.length ? "(Fact ✗ 템플릿)" : "(Fact ✓)") : ""}]`,
-            `[Standard Action Summary${d ? (d.problems.length ? " (Fact ✗ template)" : " (Fact ✓)") : ""}]`,
-          )}
+          {drafting
+            ? t("[표준 조치 요약 (✍️ Zoro-1 초안 작성 중 · 템플릿 표시)]", "[Standard Action Summary (✍️ Zoro-1 drafting · showing template)]")
+            : t(
+                `[표준 조치 요약 ${d ? (d.problems.length ? "(Fact ✗ 템플릿)" : "(Fact ✓)") : ""}]`,
+                `[Standard Action Summary${d ? (d.problems.length ? " (Fact ✗ template)" : " (Fact ✓)") : ""}]`,
+              )}
         </span>
         <button className="plain small qa-draft" onClick={onOpenDraft}>
           {t("📄 초안 전문", "📄 Full draft")}
@@ -703,10 +722,16 @@ export function QuickApproval({
         </p>
       )}
       {d?.high_risk && (
-        <label className="check cosign">
-          <input type="checkbox" checked={cosign} onChange={(e) => setCosign(e.target.checked)} />
-          {t(`파트장 공동 결재 (${d.aop_id}) · 고위험: ${d.risk_actions.join(", ")}`, `Team Lead co-sign (${d.aop_id}) · High-risk: ${d.risk_actions.join(", ")}`)}
-        </label>
+        <>
+          <label className="check cosign">
+            <input type="checkbox" checked={cosign} onChange={(e) => setCosign(e.target.checked)} />
+            {t(`파트장 공동 결재 · 고위험: ${d.risk_actions.join(", ")}`, `Team Lead co-sign · High-risk: ${d.risk_actions.join(", ")}`)}
+          </label>
+          <label className="field qa-ref-row">
+            {t("근거 절차서 번호 (초안의 번호를 직접 입력)", "Procedure no. (type the draft's number)")}
+            <input className="qa-ref" value={ref} spellCheck={false} placeholder={t("초안의 절차서 번호", "Procedure no. from the draft")} onChange={(e) => setRef(e.target.value)} />
+          </label>
+        </>
       )}
       <div className="actions">
         <button className="plain recheck" disabled={busy} onClick={() => act("recheck")}>
@@ -715,29 +740,27 @@ export function QuickApproval({
         <button className="plain qa-more-toggle" aria-expanded={more} onClick={() => setMore((m) => !m)}>
           {more ? t("접기 ▴", "Less ▴") : t("더 보기 ▾", "More ▾")}
         </button>
-        <button className="danger-fill confirm" disabled={busy || !!pending || awaiting || (!!d?.high_risk && !cosign)} onClick={() => act(confirmAction)}>
+        <button className="danger-fill confirm" disabled={busy || !!pending || awaiting || drafting || needCosign || needRef} onClick={() => act("confirm")}>
           {awaiting
             ? t("⏳ 현장 대기", "⏳ Awaiting Field Check")
             : pending
               ? t(`🔒 Step ${pending.no} 필요`, `🔒 Step ${pending.no} required`)
-              : d?.high_risk && !cosign
-                ? t("🔒 공동 결재 필요", "🔒 Co-sign required")
-                : t("🚨 조치확정", "🚨 Confirm Action")}
+              : drafting
+                ? t("✍️ 초안 작성 중", "✍️ Drafting")
+                : needCosign
+                  ? t("🔒 공동 결재 필요", "🔒 Co-sign required")
+                  : needRef
+                    ? t("🔒 절차서 번호 필요", "🔒 Procedure no. required")
+                    : t("🚨 조치확정", "🚨 Confirm Action")}
         </button>
       </div>
       {more && (
         <div className="qa-more">
           {d?.high_risk && (
-            <>
-              <label className="field">
-                {t("근거 절차서 번호", "Procedure ref. no.")}
-                <input className="qa-ref" value={ref} onChange={(e) => setRef(e.target.value)} />
-              </label>
-              <label className="field">
-                {t("오경보 입증 현장 증빙 스캔 (장)", "False-alarm field evidence scans (pages)")}
-                <input className="qa-scans" type="number" min={0} value={scans} onChange={(e) => setScans(Number(e.target.value))} />
-              </label>
-            </>
+            <label className="field">
+              {t("오경보 입증 현장 증빙 스캔 (장)", "False-alarm field evidence scans (pages)")}
+              <input className="qa-scans" type="number" min={0} value={scans} onChange={(e) => setScans(Number(e.target.value))} />
+            </label>
           )}
           <label className="field">
             {t("현장 재점검 요청 메모", "Field recheck request note")}
@@ -768,12 +791,12 @@ export function QuickApproval({
         <div className="qa-tests">
           <span className="muted">{t("가드레일 시험", "Guardrail tests")}</span>
           {d?.high_risk && (
-            <button className="plain small qa-test-cosign" disabled={busy} onClick={() => act("confirm")}>
+            <button className="plain small qa-test-cosign" disabled={busy} onClick={() => act("confirm", { cosign: false })}>
               {t("(시험) 공동 결재 없이 확정 시도", "(Test) Try confirming without co-sign")}
             </button>
           )}
           {pending && (
-            <button className="plain small qa-test-order" disabled={busy} onClick={() => act(confirmAction)}>
+            <button className="plain small qa-test-order" disabled={busy} onClick={() => act("confirm")}>
               {t("(시험) 선행 절차를 건너뛰고 확정 시도", "(Test) Try confirming without prerequisite steps")}
             </button>
           )}
@@ -791,6 +814,7 @@ export function QuickApproval({
 
 export function StageDrawer({ which, detail, archive, catalog, supervisor, onClose }: { which: DrawerKey; detail: Detail | null; archive: ArchiveDoc | null; catalog: Record<string, VerdictInfo>; supervisor: string; onClose: () => void }) {
   const t = useT();
+  useEngineer(); // 제목의 코드 이름 꼬리(eng)
   return (
     <div className="drawer">
       <header>

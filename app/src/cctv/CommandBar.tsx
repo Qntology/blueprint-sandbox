@@ -1,6 +1,7 @@
 // 자연어 질의 커맨드 바 (2차 개선안 2: logis-center 방식 검색을 noto-sandbox 하단 허브의 `.command-bar` · `.dropup` · `.cmd-toast` 로).
 // 백엔드 `search` 명령이 한국어 · 영어 질의를 그대로 읽습니다 (Stanza 품사 · 원형, 임베딩 경로, NMS 조각: docs/search.md).
 import { useRef, useState, type KeyboardEvent, type RefObject } from "react";
+import { useEngineer } from "../engineer";
 import { useT, type T } from "../i18n";
 import { tr } from "../i18n/lang";
 import type { Plant } from "../types";
@@ -250,6 +251,7 @@ export function CommandBar(props: {
 export function SearchDropup({ run, onClose, onSelect, onPick, onInterlock, interlockKks }: { run: SearchRun; onClose: () => void; onSelect: (kks: string) => void; onPick: (id: string) => void; onInterlock: () => void; interlockKks: Set<string> }) {
   const r = run.result;
   const t = useT();
+  const engineer = useEngineer();
   return (
     <section className="search-results dropup vp-glass ov-avoid" aria-label={t("질의 분석 · 검색 결과", "Query analysis · results")}>
       <div className="search-head">
@@ -264,7 +266,7 @@ export function SearchDropup({ run, onClose, onSelect, onPick, onInterlock, inte
           </span>
         ))}
         {run.context && <span className="cond ctx">{t(`🛠 문맥 ${run.context}`, `🛠 Context ${run.context}`)}</span>}
-        {r.engine && (
+        {r.engine && engineer && (
           <span className="cond ctx" title={t("이번 검색에 쓴 분석 모델 (모델 설정에서 가져오기)", "Analysis models used for this search (import them in Model Settings)")}>
             🧠 {r.engine}
           </span>

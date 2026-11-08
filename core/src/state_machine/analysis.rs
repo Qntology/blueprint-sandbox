@@ -25,7 +25,7 @@ use crate::interlock::{self, InterlockState};
 use crate::lattice::Lattice;
 use crate::plant::fmt_value;
 use crate::sds::{SdsSnapshot, SdsTrigger, TriggerKind};
-use crate::stages::{record, StageRecord, StageStatus};
+use crate::stages::{record, StageNote, StageRecord, StageStatus};
 use crate::timeseries::{metrics, ttf_conservative, Telemetry, TimeSeriesMetrics, BASELINE_SECS, SLOPE_SAMPLES};
 use crate::verdict::{OutcomeClass, Verdict};
 
@@ -130,24 +130,17 @@ pub fn analyze(db: &Lattice, incident: &Incident, brains: Brains<'_>, sds_id: &s
     let read: Vec<_> = incident.reports.iter().filter_map(|r| r.timings).collect();
     let corrections: usize = incident.reports.iter().map(|r| r.corrections.len()).sum();
     if read.is_empty() {
-        let why = if incident.reports.is_empty() { "스캔 없음 (신호 알람은 문서 모델을 띄우지 않음)" } else { "현장 수치 직접 입력" };
-        stages.push(record(1, 0.0, StageStatus::Skipped, why));
+        let why = if incident.reports.is_empty() { StageNote::NoScan } else { StageNote::ManualEntry };
+        stages.push(record(1, 0.0, StageStatus::Skipped, why.clone()));
         stages.push(record(2, 0.0, StageStatus::Skipped, why));
     } else {
         let crops: usize = read.iter().map(|t| t.crops).sum();
         let dropped: usize = read.iter().map(|t| t.dropped).sum();
         let blank: usize = read.iter().map(|t| t.blank).sum();
         let skipped: usize = read.iter().map(|t| t.skipped).sum();
-        let mut summary = format!("조각 {crops}개 판독 · 안내문 {dropped}개 버림");
-        if blank > 0 {
-            summary.push_str(&format!(" · 빈 조각 {blank}개"));
-        }
-        if skipped > 0 {
-            summary.push_str(&format!(" · 마스터와 같은 조각 {skipped}개 건너뜀"));
-        }
-        stages.push(record(1, read.iter().map(|t| t.layout_ms + t.siglip2_ms).sum(), StageStatus::Done, summary));
-        let summary = if corrections > 0 { format!("대장 대조로 오독 {corrections}건 교정") } else { "판독 완료 · 교정 없음".to_string() };
-        stages.push(record(2, read.iter().map(|t| t.ocr_ms).sum(), if corrections > 0 { StageStatus::Corrected } else { StageStatus::Done }, summary));
+        stages.push(record(1, read.iter().map(|t| t.layout_ms + t.siglip2_ms).sum(), StageStatus::Done, StageNote::Read { crops, dropped, blank, skipped }));
+        let note = if corrections > 0 { StageNote::Corrected(corrections) } else { StageNote::ReadClean };
+        stages.push(record(2, read.iter().map(|t| t.ocr_ms).sum(), if corrections > 0 { StageStatus::Corrected } else { StageStatus::Done }, note));
     }
 
     // Gate 1: 현장 문서 형식 · 신호 무결성
@@ -156,7 +149,7 @@ pub fn analyze(db: &Lattice, incident: &Incident, brains: Brains<'_>, sds_id: &s
             FieldFormal::Pass => codes.push(Verdict::G1SignValid.code().to_string()),
             FieldFormal::SignatureRetry { reason } => {
                 codes.push(Verdict::G1SignInvalidRetry.code().to_string());
-                stages.push(record(3, rules.elapsed().as_secs_f64() * 1e3, StageStatus::Blocked, reason.clone()));
+                stages.push(record(3, rules.elapsed().as_secs_f64() * 1e3, StageStatus::Blocked, StageNote::Text(reason.clone())));
                 return Ok(placeholder(route, trigger, stages, codes, sds_id, Next::FieldRetry, reason, Verdict::G1SignInvalidRetry));
             }
             FieldFormal::PermitHold { reason } => {
@@ -218,21 +211,22 @@ pub fn analyze(db: &Lattice, incident: &Incident, brains: Brains<'_>, sds_id: &s
     };
     let rule_summary = match (&vote, &moc, drift.as_ref()) {
         (_, Some(m), _) => match &m.outcome {
-            MocOutcome::Verified => "MOC 원장 일치".to_string(),
-            MocOutcome::Contradiction { .. } => "MOC 원장 불일치 · 잠금".to_string(),
-            MocOutcome::Hold { .. } => "MOC 승인 · 권한 확인 필요".to_string(),
+            MocOutcome::Verified => StageNote::MocVerified,
+            MocOutcome::Contradiction { .. } => StageNote::MocContradiction,
+            MocOutcome::Hold { .. } => StageNote::MocHold,
         },
-        (Some(v), _, Some(DriftFinding::Isolated { channel, .. })) => format!("{} 채널 {channel} 편차{}", v.logic, if field_checks.iter().any(|f| f.matches_dcs) { " · 현장 일치" } else { "" }),
-        (Some(v), _, _) => format!("{} 보팅 일치", v.logic),
-        _ if flatline => "값 고정 (동결) 검출".to_string(),
-        _ if signal.as_ref().is_some_and(|s| matches!(s.state, SignalState::SpikeFiltered { .. })) => "순간 잡음 걸러 냄".to_string(),
-        _ => "신호 정상 · 원장 대조 완료".to_string(),
+        (Some(v), _, Some(DriftFinding::Isolated { channel, .. })) => StageNote::ChannelDrift { logic: v.logic.to_string(), channel: channel.to_string(), field_agrees: field_checks.iter().any(|f| f.matches_dcs) },
+        (Some(v), _, _) => StageNote::VoteAgrees { logic: v.logic.to_string() },
+        _ if flatline => StageNote::Flatline,
+        _ if signal.as_ref().is_some_and(|s| matches!(s.state, SignalState::SpikeFiltered { .. })) => StageNote::SpikeFiltered,
+        _ => StageNote::SignalOk,
     };
     stages.push(record(3, rules_ms, if next == Next::Locked { StageStatus::Blocked } else if notes.is_empty() { StageStatus::Done } else { StageStatus::Alert }, rule_summary));
+    let label = candidate.label().to_string();
     let model_summary = match (confidence, brains.model.is_some()) {
-        (_, false) => format!("{} (규칙만, 모델 없음)", candidate.label()),
-        (Some(p), true) => format!("{} 확신 {p:.2}", candidate.label()),
-        (None, true) => format!("{} (모델 이견 · 확신도 없음)", candidate.label()),
+        (_, false) => StageNote::RulesOnly { label },
+        (Some(p), true) => StageNote::Confident { label, p },
+        (None, true) => StageNote::NoConfidence { label },
     };
     stages.push(record(4, model_ms, gate_status, model_summary));
 
@@ -318,14 +312,15 @@ fn draft_stage(draft: Option<&AopDraft>, next: &Next, has_moc: bool) -> StageRec
     match draft {
         Some(d) => {
             let status = if *next == Next::AwaitingField || d.high_risk { StageStatus::Waiting } else { StageStatus::Done };
-            let summary = match (d.by_model, d.problems.is_empty()) {
-                (true, _) => format!("{} 초안 · 숫자 대조 통과{}", d.aop_id, if d.high_risk { " · 공동결재 대기" } else { "" }),
-                (false, true) => format!("{} 템플릿 (글쓰기 모델 없음)", d.aop_id),
-                (false, false) => format!("{} 모델 초안 수치 불일치 {}건 → 템플릿", d.aop_id, d.problems.len()),
+            let aop = d.aop_id.clone();
+            let note = match (d.by_model, d.problems.is_empty()) {
+                (true, _) => StageNote::DraftModel { aop, high_risk: d.high_risk },
+                (false, true) => StageNote::DraftTemplate { aop },
+                (false, false) => StageNote::DraftMismatch { aop, problems: d.problems.len() },
             };
-            record(5, d.ms, status, summary)
+            record(5, d.ms, status, note)
         }
-        None => record(5, 0.0, if *next == Next::Locked { StageStatus::Blocked } else { StageStatus::Skipped }, if has_moc { "절차서 없음 (변경 반영 심사)" } else { "절차서 없음" }),
+        None => record(5, 0.0, if *next == Next::Locked { StageStatus::Blocked } else { StageStatus::Skipped }, StageNote::NoProcedure { moc: has_moc }),
     }
 }
 
@@ -401,7 +396,7 @@ fn judge(c: &Judging<'_>, model: Option<&dyn DecisionModel>) -> Result<(Substant
 #[allow(clippy::too_many_arguments)]
 fn placeholder(route: Route, trigger: SdsTrigger, mut stages: Vec<StageRecord>, codes: Vec<String>, sds_id: &str, next: Next, reason: String, candidate: Verdict) -> Analysis {
     for n in (stages.len() as u8 + 1)..=5 {
-        stages.push(record(n, 0.0, StageStatus::Skipped, "앞 단계에서 멈춤"));
+        stages.push(record(n, 0.0, StageStatus::Skipped, StageNote::Stopped));
     }
     let sds = SdsSnapshot { sds_id: sds_id.to_string(), trigger_kind: trigger.kind.code().to_string(), gate_state_vector: codes, decomposed_confidences: Vec::new(), min_confidence: None, center_ms: trigger.at_ms };
     Analysis {

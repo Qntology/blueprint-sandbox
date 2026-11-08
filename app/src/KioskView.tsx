@@ -86,6 +86,17 @@ interface FieldReply {
   message: string | null;
 }
 
+/** 주제어실이 현장 확인을 기다리는 사건 (첫 화면 목록, UI 단순화 P4). 설비 · 위치 · 요청 메모만 오고 내부 수치 · 판정 코드는 오지 않습니다. */
+interface FieldRequest {
+  id: string;
+  kks: string;
+  tag: string | null;
+  name: string;
+  place: string;
+  note: string;
+  since: string;
+}
+
 const STEP_OF: Record<Phase, number> = { start: 0, scanning: 0, form: 1, excuse: 1, sent: 2, finished: 2 };
 
 /** 현장 순시 · 정비 운전원 단말 (기획 Part 8-2 2절). 내부 판정 코드 · 확신도 · 마인드맵은 이 화면에 오지 않습니다. */
@@ -138,12 +149,21 @@ export function KioskView() {
   // 스캔이 서류 종류를 정했으면 종류 칩은 접어 두고, 비워 둬도 되는 센서 태그 칸은 [더 보기] 로 (UI 단순화 K3)
   const [kindOpen, setKindOpen] = useState(false);
   const [showTag, setShowTag] = useState(false);
+  // 주제어실의 현장 확인 요청 목록과 고른 요청 (P4). 고르면 설비 코드 · 센서 태그를 채웁니다.
+  const [requests, setRequests] = useState<FieldRequest[]>([]);
+  const [target, setTarget] = useState<FieldRequest | null>(null);
   const receiptRef = useRef<string | null>(null);
+  const loadRequests = () => {
+    invoke<FieldRequest[]>("field_requests")
+      .then(setRequests)
+      .catch(() => {});
+  };
 
-  // 구역 이름 · 용어는 백엔드 글이라 받을 때의 화면 언어로 옵니다 (번역은 invoke 감싸기). 언어가 바뀌면 다시 받습니다.
+  // 구역 이름 · 용어 · 요청 메모는 백엔드 글이라 받을 때의 화면 언어로 옵니다 (번역은 invoke 감싸기). 언어가 바뀌면 다시 받습니다.
   useEffect(() => {
     invoke<SectorChoice[]>("field_sectors").then(setSectors);
     invoke<DomainInfo>("domain_info").then(setDomain);
+    loadRequests();
   }, [lang]);
 
   useEffect(() => {
@@ -160,10 +180,13 @@ export function KioskView() {
       setNotice(e.payload.notice);
       if (e.payload.done) setPhase("finished");
     });
+    // 사건이 바뀔 때마다 (현장 대기 시작 · 재점검 요청 · 확정) 요청 목록을 다시 받습니다
+    const stopRequests = listen("field_requests_changed", loadRequests);
     return () => {
       void stopDomain.then((f) => f());
       void stopState.then((f) => f());
       void stopCase.then((f) => f());
+      void stopRequests.then((f) => f());
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -172,6 +195,11 @@ export function KioskView() {
     const timer = window.setTimeout(reset, RESET_SECONDS * 1000);
     return () => window.clearTimeout(timer);
   }, [phase]);
+
+  // 고른 요청이 목록에서 사라지면 (보고가 붙음 · 확정 · 세션 초기화) 고른 표시만 풉니다. 채운 설비 코드는 그대로 둡니다.
+  useEffect(() => {
+    if (target && !requests.some((r) => r.id === target.id)) setTarget(null);
+  }, [requests, target]);
 
   useEffect(() => {
     if (phase !== "form" && phase !== "excuse") return;
@@ -212,10 +240,25 @@ export function KioskView() {
     setHold(false);
     setKindOpen(false);
     setShowTag(false);
+    setTarget(null);
     setScanImage(null);
     setScanSize(null);
     setBoxes({});
     setRaw({});
+    loadRequests();
+  }
+
+  /** 요청을 고르면 그 설비 코드 · 센서 태그를 채웁니다. 다시 누르면 고른 것을 풉니다. */
+  function pick(r: FieldRequest) {
+    // 빈 글로 남기면 스캔 값보다 앞서므로 (scan 의 병합 순서) 칸을 아예 지웁니다
+    const without = (v: Values) => Object.fromEntries(Object.entries(v).filter(([k]) => k !== "kks" && k !== "tag"));
+    if (target?.id === r.id) {
+      setTarget(null);
+      setValues(without);
+      return;
+    }
+    setTarget(r);
+    setValues((v) => ({ ...without(v), kks: r.kks, ...(r.tag ? { tag: r.tag } : {}) }));
   }
 
   async function scan() {
@@ -401,6 +444,20 @@ export function KioskView() {
         </section>
       ) : phase === "start" ? (
         <section className="kiosk-card start">
+          {requests.length > 0 && (
+            <div className="field-requests" role="list" aria-label={t("현장 확인 요청", "Field check requests")}>
+              <h3>{t(`📋 ${terms.control_room} 현장 확인 요청 ${requests.length}건 — 맡을 건을 누르면 설비 코드를 채웁니다`, `📋 Field check requests from the ${terms.control_room}: ${requests.length} — tap one to fill in its equipment code`)}</h3>
+              {requests.map((r) => (
+                <button key={r.id} role="listitem" className={`field-request ${target?.id === r.id ? "active" : ""}`} data-request={r.id} onClick={() => pick(r)}>
+                  <span className="fr-where">
+                    <b>{r.place}</b> · {r.name} <span className="mono">{r.kks}</span>
+                  </span>
+                  <span className="fr-note">{r.note}</span>
+                  <em className="fr-meta">{t(`요청 ${r.since} · 접수 번호 ${r.id}${target?.id === r.id ? " · 선택됨 (다시 누르면 풂)" : ""}`, `Requested ${r.since} · Receipt No. ${r.id}${target?.id === r.id ? " · selected (tap again to clear)" : ""}`)}</em>
+                </button>
+              ))}
+            </div>
+          )}
           <h2>{aidc ? t("현장 점검표, 매니폴드 압력계 사진, 또는 Red-line 변경도(MEP · MOP)를 스캐너에 넣어 주세요", "Place a field inspection sheet, a manifold pressure gauge photo, or a Red-line change drawing (MEP · MOP) in the scanner") : t("현장 점검표, 아날로그 게이지 사진, 또는 수기 수정 도면(Red-line P&ID)을 스캐너에 넣어 주세요", "Place a field inspection sheet, an analog gauge photo, or a hand-marked drawing (Red-line P&ID) in the scanner")}</h2>
           <p className="lead">{t("도면과 계기판 수치를 자동으로 읽어 칸을 채워 드립니다. 스캔할 도면이 없어도 현장 수치를 입력할 수 있습니다.", "We read the drawing and gauge values and fill in the form for you. No drawing to scan? You can still enter field values.")}</p>
           {error && <p className="error">{error}</p>}
@@ -433,6 +490,11 @@ export function KioskView() {
               `Please check the ${kind === "redline" ? "equipment change (Red-line)" : "inspection details"}${sector ? ` for ${sector.building} ${sector.label}` : ""}`,
             )}
           </h2>
+          {target && (
+            <p className="note request-note">
+              {t(`📋 ${terms.control_room} 요청 (접수 번호 ${target.id}): ${target.note}`, `📋 ${terms.control_room} request (Receipt No. ${target.id}): ${target.note}`)}
+            </p>
+          )}
           {docs.length > 0 && (
             <div className="chips">
               {docs.map((d, i) => (

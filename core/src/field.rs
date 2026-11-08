@@ -98,7 +98,9 @@ fn report_of(db: &Lattice, form: &FieldForm, kind: FieldKind, now: DateTime<Utc>
         // 태그를 적지 않았으면 설비의 첫 센서로 봅니다.
         None => db.sensors_of(&kks).first().map(|s| s.tag.clone()),
     };
-    let worker = db.person(&form.worker_id).or_else(|| db.person_named(&form.worker_name)).ok_or_else(|| FieldError::Form("점검자 사번을 확인해 주세요".into()))?;
+    // 사번으로만 찾습니다. 예전에는 모르는 사번이면 이름으로 찾아 원장 사번으로 조용히 바꿔 접수해, 이름만 알면 접수가 됐습니다
+    // (UI 단순화 K2). 스캔에서 사번을 잘못 읽었으면 스캔 단계가 원장 사번으로 고치고 단말에 "교정됨" 으로 보입니다 (extract.rs).
+    let worker = db.person(&form.worker_id.trim().to_uppercase()).ok_or_else(|| FieldError::Form("점검자 사번을 원장에서 찾지 못했습니다. 사번을 다시 확인해 주세요".into()))?;
     if !form.worker_name.trim().is_empty() && worker.name != form.worker_name.trim() {
         return Err(FieldError::Form("점검자 이름과 사번이 맞지 않습니다".into()));
     }
@@ -288,8 +290,19 @@ mod tests {
         let mut wrong = gauge(26.0, t);
         wrong.worker_name = "김태현".into();
         assert!(matches!(submit(&mut e, &db, &wrong, None, t), Err(FieldError::Form(_))));
+        // 모르는 사번은 이름이 원장에 있어도 원장 사번으로 바꿔 받지 않습니다 (K2)
+        let mut unknown_id = gauge(26.0, t);
+        unknown_id.worker_id = "E999".into();
+        assert!(matches!(submit(&mut e, &db, &unknown_id, None, t), Err(FieldError::Form(m)) if m.contains("사번")));
+        let mut no_id = gauge(26.0, t);
+        no_id.worker_id = String::new();
+        assert!(matches!(submit(&mut e, &db, &no_id, None, t), Err(FieldError::Form(_))));
         let mut unsigned = gauge(26.0, t);
         unsigned.signature = None;
         assert!(matches!(submit(&mut e, &db, &unsigned, None, t), Err(FieldError::Retry(_))));
+        // 소문자로 친 사번은 같은 사번입니다
+        let mut lower = gauge(26.0, t);
+        lower.worker_id = "e205".into();
+        assert!(!matches!(submit(&mut e, &db, &lower, None, t), Err(FieldError::Form(_))));
     }
 }

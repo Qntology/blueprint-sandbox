@@ -9,6 +9,7 @@ import { RightRail } from "./cctv/RightRail";
 import { HUD_W, TOP_INSET, useElementSize, type Insets } from "./cctv/stage";
 import { causalTraces } from "./cctv/traces";
 import { DEFAULT_SUPERVISOR, DOMAIN_ICON, PLANT_TERMS, PLANT_TERMS_EN, TermsContext, type DomainInfo, type DomainMode } from "./domain";
+import { setEngineer, useEngineer } from "./engineer";
 import { ModelSettings } from "./ModelSettings";
 import { PhysicsPanel } from "./PhysicsPanel";
 import { fmt } from "./plant";
@@ -85,6 +86,8 @@ export function OfficerView() {
   const [dark, setDark] = useState(() => readPref(DARK_KEY) === "1");
   // 시연 · 시험 도구 (시나리오 주입 · 물리엔진 · 가드레일 시험 단추): 운영 화면에서는 설정에서 숨깁니다
   const [demo, setDemo] = useState(() => readPref(DEMO_KEY) !== "0");
+  // 엔지니어 보기 (코드 이름 함께 보이기, 기본 끔): 모듈 변수라 상세 서랍 제목 같은 React 밖 글도 따라갑니다
+  const engineer = useEngineer();
   const [resetArmed, setResetArmed] = useState(false);
   const [barSlot, setBarSlot] = useState<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement>(null);
@@ -306,7 +309,8 @@ export function OfficerView() {
   );
 
   async function inject(id: string) {
-    setBusy(say(`시나리오 ${id} 주입 중 (Zoro-1 판단 · 글쓰기)`, `Injecting scenario ${id} (Zoro-1 judgment · drafting)`));
+    // 주입은 판단까지만 기다립니다. 모델 초안은 사건이 열린 뒤 뒤에서 채워집니다 (P6)
+    setBusy(say(`시나리오 ${id} 주입 중 (Zoro-1 판단)`, `Injecting scenario ${id} (Zoro-1 judgment)`));
     setNotice(null);
     setPopover(null);
     try {
@@ -667,6 +671,17 @@ export function OfficerView() {
                 </button>
                 <button className={demo ? "seg" : "seg active"} onClick={() => setDemoPref(false)}>
                   {say("숨기기", "Hide")}
+                </button>
+              </div>
+            </div>
+            <div className="lang-row engineer-row" role="group" aria-label={say("엔지니어 보기", "Engineer view")}>
+              <span title={say("결재 · 판단 화면에 코드 이름(jev_head · verdict.rs · G4_… 등)을 함께 보입니다", "Shows code names (jev_head · verdict.rs · G4_… etc.) on the approval and verdict screens")}>{say("엔지니어 보기 (코드 이름)", "Engineer view (code names)")}</span>
+              <div className="domain-switch ov-pill">
+                <button className={engineer ? "seg active" : "seg"} data-engineer="on" onClick={() => setEngineer(true)}>
+                  {say("켜기", "On")}
+                </button>
+                <button className={engineer ? "seg" : "seg active"} data-engineer="off" onClick={() => setEngineer(false)}>
+                  {say("끄기", "Off")}
                 </button>
               </div>
             </div>

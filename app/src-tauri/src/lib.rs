@@ -20,7 +20,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use blueprint_core::ai::accel;
 use blueprint_core::ai::document::{Baseline, DocumentReader, PageReading};
 use blueprint_core::ai::siglip2::delta::{DeltaParams, MasterSet};
-use blueprint_core::case::{DeviationExcuse, FieldKind, ReadTimings, Signature};
+use blueprint_core::case::{Correction, DeviationExcuse, FieldKind, ReadTimings, Signature};
 use blueprint_core::domain::DomainMode;
 use blueprint_core::i18n::{self, Lang};
 use blueprint_core::extract::{code_field, extract, DocKind, Extracted, PageText};
@@ -39,6 +39,7 @@ use blueprint_core::policy::{AutomationPolicy, OperatingMode};
 use blueprint_core::privacy::{mask_id, mask_name, salted_hash};
 use blueprint_core::scenario::ScenarioSet;
 use blueprint_core::state_machine::gate3_substantive::Justification;
+use blueprint_core::state_machine::gate4_5_finalize::check_field_text;
 use blueprint_core::state_machine::staged;
 use blueprint_core::state_machine::{Engine, EngineAccess, Outcome, SupervisorDecision};
 use blueprint_core::store::SessionStatus;
@@ -164,6 +165,8 @@ struct Desk {
     live: Mutex<Option<Live>>,
     /// 현장 단말이 결과를 기다리는 접수 번호
     field_case: Mutex<Option<String>>,
+    /// 모델 초안을 뒤에서 쓰는 중인 사건 (P6). 콘솔은 그동안 템플릿을 보이고 [조치확정] 을 잠급니다.
+    drafting: Mutex<BTreeSet<String>>,
     /// 지금 현장 운전원이 넣은 문서에서 읽은 값 (화면을 거치지 않고 접수로 갑니다)
     field_scans: Mutex<Vec<Extracted>>,
     field_timings: Mutex<Option<ReadTimings>>,
@@ -624,6 +627,8 @@ fn scenario_list(window: Window, desk: State<'_, Desk>) -> Result<Vec<ScenarioDt
 
 fn notify_console(app: &AppHandle) {
     let _ = app.emit_to(CONSOLE, "incident_changed", json!({}));
+    // 단말 첫 화면의 현장 확인 요청 목록도 다시 받게 합니다 (P4)
+    let _ = app.emit_to(FIELD, "field_requests_changed", json!({}));
 }
 
 /// 시나리오를 재생해 알람을 넣습니다 (콘솔 창 전용). 알람이 없는 시나리오(Red-line)는 계측만 바꾸고 현장 보고를 기다립니다.
@@ -640,9 +645,41 @@ fn inject_scenario(window: Window, app: AppHandle, desk: State<'_, Desk>, id: St
         notify_console(&app);
         return Ok(None);
     }
-    let result = staged::open(&*desk, &db, "INC", Utc::now(), false, |id| s.incident(&set, id)).map(|(id, _)| id);
+    // 사건을 판단까지 먼저 열고 (AOP 초안은 사실 줄 템플릿) 모델 초안은 뒤에서 다시 써 채웁니다 (UI 단순화 P6, 물리엔진 모드와 같은 나눔).
+    // 예전에는 판단(3.6 ~ 5.2 s)과 글쓰기(6.4 ~ 17 s)를 한 호출에서 끝내 콘솔이 그만큼 사건을 못 봤습니다.
+    // 자동화 모드(자동 확정이 템플릿을 보관해 버림)와 글쓰기 모델이 없을 때(나눌 것이 없음)는 예전처럼 한 번에 합니다.
+    // BLUEPRINT_DEFER_DRAFT=0 이면 늘 한 번에 (전후 비교 측정용).
+    let defer = std::env::var("BLUEPRINT_DEFER_DRAFT").map_or(true, |v| v != "0") && {
+        let engine = lock(&desk.engine);
+        engine.policy.mode() != OperatingMode::Auto && engine.minds().writer.is_some()
+    };
+    let t0 = Instant::now();
+    let result = staged::open(&*desk, &db, "INC", Utc::now(), defer, |id| s.incident(&set, id)).map(|(id, _)| id);
+    eprintln!("[주입] {} {} {:.1} s", s.id, if defer { "판단 (초안은 뒤에서)" } else { "판단 · 글쓰기" }, t0.elapsed().as_secs_f32());
+    if let (true, Ok(incident)) = (defer, &result) {
+        lock(&desk.drafting).insert(incident.clone());
+        redraft_later(&app, incident.clone());
+    }
     notify_console(&app);
     result.map(Some).map_err(|e| format!("{e:#}"))
+}
+
+/// 주입한 사건의 AOP 초안을 글쓰기 모델로 다시 씁니다 (판정은 다시 묻지 않음). GPU 잠금을 쥐므로 그동안 다음 판단 · 스캔은 기다립니다.
+/// 그사이 사건이 확정 · 재분석되었으면 결과를 버립니다 (`staged::redraft`).
+fn redraft_later(app: &AppHandle, id: String) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let desk = app.state::<Desk>();
+        let db = desk.db();
+        let t0 = Instant::now();
+        let done = staged::redraft(&*desk, &db, &id);
+        lock(&desk.drafting).remove(&id);
+        match done {
+            Ok(applied) => eprintln!("[주입] {id} 초안 {} {:.1} s", if applied { "반영" } else { "버림 (그사이 사건이 바뀜)" }, t0.elapsed().as_secs_f32()),
+            Err(e) => eprintln!("[주입] {id} 초안을 다시 쓰지 못했습니다 (템플릿 유지): {e:#}"),
+        }
+        notify_console(&app);
+    });
 }
 
 // ───────────────────────── 사건 목록 · 상세 ─────────────────────────
@@ -777,6 +814,8 @@ struct DetailDto {
     signals: Vec<SdsTrack>,
     scenario: Option<String>,
     sim_time: String,
+    /// 모델 초안을 뒤에서 쓰는 중 (P6): 지금 초안은 사실 줄 템플릿입니다
+    drafting: bool,
 }
 
 fn timeline(t: &Telemetry, now_ms: i64) -> TimelineDto {
@@ -817,7 +856,16 @@ fn incident_detail(window: Window, desk: State<'_, Desk>, id: String) -> Result<
             signed: r.signature.is_some(),
             permit_confirmed: r.permit_confirmed,
             excuse: r.excuse.as_ref().map(|e| e.label()),
-            corrections: json!(r.corrections),
+            // 근무자 이름 · 사번 교정은 머리줄처럼 가립니다 (실명 열람은 request_unmask 로만, 감사 기록)
+            corrections: json!(r
+                .corrections
+                .iter()
+                .map(|c| match c.field.as_str() {
+                    "서명자 이름" => Correction { raw: mask_name(&c.raw), fixed: mask_name(&c.fixed), ..c.clone() },
+                    "사번" => Correction { raw: mask_id(&c.raw), fixed: mask_id(&c.fixed), ..c.clone() },
+                    _ => c.clone(),
+                })
+                .collect::<Vec<_>>()),
             uncertain: r.uncertain.clone(),
         })
         .collect();
@@ -845,6 +893,7 @@ fn incident_detail(window: Window, desk: State<'_, Desk>, id: String) -> Result<
         signals,
         scenario: s.incident.scenario.clone(),
         sim_time: plant::local(s.incident.received_at).format("%H:%M:%S").to_string(),
+        drafting: lock(&desk.drafting).contains(&id),
     })
 }
 
@@ -987,17 +1036,28 @@ fn decide_incident(window: Window, app: AppHandle, desk: State<'_, Desk>, input:
     if input.supervisor_id.trim().is_empty() {
         return Err("교대감독 사번을 머리에 적어 주세요".to_string());
     }
-    let decision = match input.action.as_str() {
-        "confirm" => SupervisorDecision::Confirm,
-        "approve_procedure" => SupervisorDecision::ApproveHighRisk(Justification::ApplyProcedure { team_lead_cosign: input.team_lead_cosign.unwrap_or(false), procedure_ref: input.procedure_ref.clone().unwrap_or_default() }),
-        "approve_false_positive" => SupervisorDecision::ApproveHighRisk(Justification::ProveFalsePositive { evidence_scans: input.evidence_scans.unwrap_or(0) }),
-        "cancel" => SupervisorDecision::ApproveHighRisk(Justification::CancelMistake),
-        "recheck" => SupervisorDecision::RequestFieldRecheck { note: input.note.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "현장 계기를 다시 확인해 주세요".into()) },
-        "reject" => SupervisorDecision::Reject,
-        other => return Err(format!("모르는 결정입니다: {other}")),
-    };
+    let apply_procedure = || SupervisorDecision::ApproveHighRisk(Justification::ApplyProcedure { team_lead_cosign: input.team_lead_cosign.unwrap_or(false), procedure_ref: input.procedure_ref.clone().unwrap_or_default() });
     let result = {
         let mut engine = lock(&desk.engine);
+        let decision = match input.action.as_str() {
+            // 확정 의도 하나 (UI 단순화 P1): 화면은 확정 · 공동 결재 · 근거 절차서 번호만 보내고, 고위험 절차 승인 갈래는 여기서 정합니다.
+            // 공동 결재 없이 누른 확정과 현장 확인을 기다리는 사건의 확정은 그대로 확정으로 보내 가드레일(도장 찍기 · 현장 확인 전)이 막게 합니다.
+            "confirm" => {
+                let procedure = engine.store.active(&input.id).is_some_and(|s| s.analysis.high_risk() && s.status != SessionStatus::AwaitingField);
+                if procedure && input.team_lead_cosign == Some(true) {
+                    apply_procedure()
+                } else {
+                    SupervisorDecision::Confirm
+                }
+            }
+            // 예전 화면 · CDP 스크립트가 보내던 갈래 (같은 판정)
+            "approve_procedure" => apply_procedure(),
+            "approve_false_positive" => SupervisorDecision::ApproveHighRisk(Justification::ProveFalsePositive { evidence_scans: input.evidence_scans.unwrap_or(0) }),
+            "cancel" => SupervisorDecision::ApproveHighRisk(Justification::CancelMistake),
+            "recheck" => SupervisorDecision::RequestFieldRecheck { note: input.note.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "현장 계기를 다시 확인해 주세요".into()) },
+            "reject" => SupervisorDecision::Reject,
+            other => return Err(format!("모르는 결정입니다: {other}")),
+        };
         engine.confirm(&input.id, input.supervisor_id.trim(), decision, Utc::now())
     };
     notify_console(&app);
@@ -1318,6 +1378,43 @@ fn field_sectors(window: Window, desk: State<'_, Desk>) -> Result<Vec<SectorChoi
     Ok(desk.db().sectors().iter().map(|s| SectorChoice { key: s.key.clone(), building: s.building.clone(), label: s.label.clone(), kks: s.kks.clone(), blurb: s.blurb.clone() }).collect())
 }
 
+/// 현장 확인 요청 한 건 (단말 첫 화면 목록, UI 단순화 P4). 설비 · 위치 · 요청 메모만 보내고 내부 수치 · 판정 코드는 넣지 않습니다.
+#[derive(Debug, Serialize)]
+struct FieldRequest {
+    /// 접수 번호 (사건 번호)
+    id: String,
+    kks: String,
+    /// 알람이 난 센서 태그 (단말의 선택 칸을 채움)
+    tag: Option<String>,
+    name: String,
+    place: String,
+    note: String,
+    since: String,
+}
+
+/// 현장 확인을 기다리는 사건 목록 (단말 첫 화면). 예전에는 단말이 자기가 보낸 접수 번호 하나만 기다려 [처음으로] 를 누르면
+/// 재점검 요청이 오지 않았고, 경보 사건의 현장 확인 요청은 단말에 아예 보이지 않았습니다.
+#[tauri::command]
+fn field_requests(window: Window, desk: State<'_, Desk>) -> Result<Vec<FieldRequest>, String> {
+    field_only(&window)?;
+    let db = desk.db();
+    let engine = lock(&desk.engine);
+    // 현장 보고가 붙을 수 있는 사건만 (field.rs: 계기 · 수치 보고는 알람 사건에 붙고, 현장 보고 사건에는 새 사건으로 열림)
+    let mut waiting: Vec<_> = engine.store.sessions().filter(|s| s.status == SessionStatus::AwaitingField && s.incident.alarm.is_some()).collect();
+    waiting.sort_by(|a, b| b.opened_at.cmp(&a.opened_at));
+    Ok(waiting
+        .into_iter()
+        .map(|s| {
+            let kks = s.analysis.route.kks.clone();
+            let eq = db.equipment(&kks);
+            let place = eq.and_then(|e| db.sectors().iter().find(|r| r.key == e.sector)).map(|r| format!("{} {}", r.building, r.label)).unwrap_or_default();
+            // 주제어실 메모도 현장으로 가는 글이라 내부 정보 검사를 거칩니다 (걸리면 기본 문구)
+            let note = s.field_request.clone().filter(|n| check_field_text(n, &[]).is_ok()).unwrap_or_else(|| "현장 계기 실측값을 확인해 주세요".to_string());
+            FieldRequest { id: s.incident.id.clone(), kks, tag: s.analysis.route.tag.clone(), name: eq.map(|e| e.name.clone()).unwrap_or_default(), place, note, since: plant::local(s.opened_at).format("%H:%M").to_string() }
+        })
+        .collect())
+}
+
 #[tauri::command]
 fn field_reset(window: Window, desk: State<'_, Desk>) -> Result<(), String> {
     field_only(&window)?;
@@ -1449,6 +1546,7 @@ fn scan_field_documents(window: Window, desk: State<'_, Desk>) -> Result<ScanRep
                 f if f == code_label => "kks",
                 "센서 태그" => "tag",
                 "서명자 이름" => "worker_name",
+                "사번" => "worker_id",
                 _ => "moc_no",
             });
         }
@@ -1469,7 +1567,7 @@ fn scan_field_documents(window: Window, desk: State<'_, Desk>) -> Result<ScanRep
             ("reading", x.reading.map(one)),
             ("old_value", x.old_value.map(one)),
             ("worker_name", raw_of("서명자 이름").or_else(|| x.worker_name.clone())),
-            ("worker_id", x.worker_id.clone()),
+            ("worker_id", raw_of("사번").or_else(|| x.worker_id.clone())),
             ("taken_at", x.taken_at.map(|t| plant::local(t).format("%H:%M").to_string())),
         ];
         for (key, needle) in needles {
@@ -1628,7 +1726,8 @@ fn notify_field_case(app: &AppHandle, desk: &Desk, id: &str) {
         let engine = lock(&desk.engine);
         match engine.store.archive().iter().find(|a| a.incident_id == id) {
             Some(a) => (a.field_notice.clone(), true),
-            None => match engine.store.active(id).and_then(|s| s.field_request.clone()) {
+            // 재점검 메모도 현장으로 가는 글이라 내부 정보 검사를 거칩니다 (걸리면 기본 문구, 요청 목록과 같게)
+            None => match engine.store.active(id).and_then(|s| s.field_request.clone()).map(|n| if check_field_text(&n, &[]).is_ok() { n } else { "현장 계기 실측값을 확인해 주세요".to_string() }) {
                 Some(note) => (format!("{} 재점검 요청 (접수 번호 {id})\n{note}", desk.db().terms().control_room), false),
                 None => return,
             },
@@ -1738,6 +1837,7 @@ pub fn run() {
         device: Mutex::new(None),
         live: Mutex::new(None),
         field_case: Mutex::new(None),
+        drafting: Mutex::new(BTreeSet::new()),
         field_scans: Mutex::new(Vec::new()),
         field_timings: Mutex::new(None),
         physics: Mutex::new(physics_mode::PhysicsState::default()),
@@ -1788,6 +1888,7 @@ pub fn run() {
             field_ready,
             field_sectors,
             field_reset,
+            field_requests,
             scan_field_documents,
             submit_field_report
         ])

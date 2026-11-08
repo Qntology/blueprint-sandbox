@@ -180,7 +180,7 @@ fn main() -> Result<()> {
             println!("      초안: {}", d.summary);
         }
         for st in &a.stages {
-            println!("      Stage {} {} {:.1}ms {:?} {}", st.stage, st.name, st.ms, st.status, st.summary);
+            println!("      Stage {} {} {:.1}ms {:?} {}", st.stage, st.name(blueprint_core::i18n::Lang::Ko), st.ms, st.status, st.summary());
         }
         results.push(json!({
             "id": s.id,

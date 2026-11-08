@@ -406,6 +406,8 @@ export interface Detail {
   signals: SdsTrack[];
   scenario: string | null;
   sim_time: string;
+  /** 모델 초안을 뒤에서 쓰는 중 (UI 단순화 P6): 지금 `analysis.draft` 는 사실 줄 템플릿이고 [조치확정] 은 잠깁니다 */
+  drafting?: boolean;
 }
 
 export interface SdsTrack {

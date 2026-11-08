@@ -192,7 +192,7 @@ fn a_redraft_writes_again_without_asking_the_model_and_is_dropped_when_the_case_
     let d = draft(&desk);
     assert!(d.by_model && d.problems.is_empty(), "{d:?}");
     let stage5 = desk.engine.lock().unwrap().store.active(&id).unwrap().analysis.stages.iter().find(|x| x.stage == 5).cloned().unwrap();
-    assert!(stage5.summary.contains("초안"), "{stage5:?}");
+    assert!(stage5.summary().contains("초안"), "{stage5:?}");
 
     // 다시 쓰는 사이 세션이 다시 열리면(현장 보고 재분석과 같음) 옛 입력으로 쓴 초안은 버립니다.
     let job = desk.engine.lock().unwrap().redraft_job(&id).unwrap().unwrap();

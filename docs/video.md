@@ -46,7 +46,10 @@ python scripts\e2e\edit_video.py --lang en --rec out/rec/master_en --out out/vid
 ```
 
 UI 단순화(2026-11-09, [ui-simplify-plan.md](ui-simplify-plan.md)) 뒤 장면은 같은 ID 로 화면만 바뀌었습니다: 결재 · 가드레일 시험은 오른쪽 결재 HUD
-(Stage 5 서랍은 초안 읽기 전용), 레인은 파이프라인 카드, P1 의 무효 서명은 단말이 보내기 전에 막습니다(`p1.g1_retry`). 이 화면으로는 아직 다시 찍지 않았습니다.
+(Stage 5 서랍은 초안 읽기 전용), 레인은 파이프라인 카드, P1 의 무효 서명은 단말이 보내기 전에 막습니다(`p1.g1_retry`).
+더해진 장면: `p2.ref` (공동 결재 + 근거 절차서 번호를 초안 전문에서 읽어 침), `p1.request` · `d1.request` (단말 첫 화면의 현장 확인 요청을 골라 설비 코드를 채움).
+record.js 는 설정의 **엔지니어 보기**를 켜고 찍습니다 (기획 문구의 코드 이름 `jev_head` · `PointerPrompt` · `verdict.rs` 가 보이게, 운영 기본은 끔).
+주입한 알람 사건의 초안은 사건이 열린 뒤 뒤에서 채워지므로(P6), 일찍 연 Stage 5 서랍에는 "✍️ 초안 작성 중" 과 템플릿이 보일 수 있습니다.
 
 손으로 하던 순서 (참고):
 

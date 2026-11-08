@@ -353,7 +353,10 @@ async function p2(c) {
   await sleep(2500);
   mark("p2.reject", { text: await replyText(c) });
   await hold(3000);
+  // 공동 결재 + 근거 절차서 번호: 번호는 미리 채워 두지 않아 초안 전문에서 읽고 칩니다 (UI 단순화 P1, 도장 찍기 방지)
   await cosign(c);
+  mark("p2.ref", { text: await hud(c, "input.qa-ref").inputValue().catch(() => "") });
+  await hold(2500);
   await tryGuard(c, "order");
   await waitText(c, L("먼저 끝내야 확정", "before confirming"), 60000).catch(() => {});
   mark("p2.g3_order", { text: await replyText(c) });
@@ -392,9 +395,18 @@ async function replyText(c) {
   return t.slice(0, 500);
 }
 
-async function kioskScan(f, file, id) {
+/** `request` 면 단말 첫 화면의 현장 확인 요청(UI 단순화 P4)을 먼저 골라 설비 코드를 채웁니다 (경보 사건의 현장 대기 · 재점검) */
+async function kioskScan(f, file, id, request = false) {
   placeScan(file);
   await fieldReset(f);
+  if (request) {
+    const item = f.locator(".field-request").first();
+    await item.waitFor({ timeout: 30000 });
+    await hold(1500);
+    await click(f, item);
+    mark(`${id}.request`, { text: (await item.innerText().catch(() => "")).slice(0, 300) });
+    await hold(2500);
+  }
   await click(f, f.locator("button", { hasText: L("도면/계기 스캔", "Scan Drawing/Gauge") }));
   mark(`${id}.scan_start`);
   await f.waitForSelector(".form-grid", { timeout: 300000 });
@@ -434,7 +446,7 @@ async function p1(c, f) {
   src("f");
   mark("p1.kiosk");
   await hold(2000);
-  await kioskScan(f, "P1_gauge.png", "p1");
+  await kioskScan(f, "P1_gauge.png", "p1", true);
   const reading = f.locator(".field-card", { hasText: L("현장 실측치", "Field Reading") });
   if (await reading.count()) {
     await click(f, reading.locator("button.step", { hasText: "+0.1" }));
@@ -766,7 +778,7 @@ async function d1(c, f) {
   mark("d1.awaiting", { incident: await incidentId() });
   await hold(2000);
   src("f");
-  await kioskScan(f, "D1_gauge.png", "d1");
+  await kioskScan(f, "D1_gauge.png", "d1", true);
   const kks = await f.locator(".field-card", { hasText: L("자산코드", "Asset code") }).locator("input").inputValue().catch(() => "");
   mark("d1.form", { kks });
   await hold(2000);
@@ -892,6 +904,8 @@ async function end(c, f) {
   await app.waitEngine(c);
   if (AUDIT) for (const p of [c, f]) await p.evaluate(() => (window.__i18nAudit = true));
   await setLanguage(EN ? "en" : "ko");
+  // 시연 영상은 엔지니어 보기(코드 이름 함께)로 찍습니다 (UI 단순화 U7: 운영 기본은 끔)
+  await app.setEngineer(c, true);
   await snap("verdict_catalog", "verdict_catalog");
   const casts = [new Cast(c, "c"), new Cast(f, "f")];
   for (const k of casts) await k.start();

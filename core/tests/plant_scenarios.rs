@@ -306,7 +306,7 @@ fn p6_a_frozen_sensor_goes_to_instrument_maintenance() {
     let a = &e.store.active(&id).unwrap().analysis;
     assert_eq!(a.draft.as_ref().unwrap().aop_id, "AOP-COM-IC02");
     assert!(!a.draft.as_ref().unwrap().by_model, "글쓰기 모델이 없으면 템플릿입니다");
-    assert!(a.stages[3].summary.contains("규칙만"));
+    assert!(a.stages[3].summary().contains("규칙만"));
 }
 
 #[test]
@@ -347,7 +347,7 @@ fn an_invented_number_in_the_aop_falls_back_to_the_template() {
     assert!(!d.by_model);
     assert!(d.problems.iter().any(|p| p.contains("700.0")), "{:?}", d.problems);
     assert!(d.summary.contains("10LAB20AA102"), "템플릿은 사실 줄로 만듭니다: {}", d.summary);
-    assert!(a.stages[4].summary.contains("템플릿"));
+    assert!(a.stages[4].summary().contains("템플릿"));
 }
 
 #[test]

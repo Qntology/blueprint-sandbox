@@ -543,6 +543,10 @@ fn resolve_worker(db: &Lattice, name: Option<String>, id: Option<String>, out: &
     match (by_id, by_name) {
         (Some(a), Some(b)) if a.id != b.id => out.uncertain.push("점검자와 사번이 다른 사람입니다".to_string()),
         (Some(p), _) | (None, Some(p)) => {
+            // 읽은 사번이 원장에 없고 이름으로 찾았으면 사번을 고친 것으로 남깁니다 (단말에 "교정됨" · 스캔 원문으로 보임, K2)
+            if let Some(raw) = id.as_deref().filter(|i| by_id.is_none() && *i != p.id) {
+                out.corrections.push(Correction { field: "사번".into(), distance: edit_distance(raw, &p.id), raw: raw.to_string(), fixed: p.id.clone() });
+            }
             out.worker_id = Some(p.id.clone());
             out.worker_name = Some(p.name.clone());
             return;
@@ -749,6 +753,16 @@ mod tests {
         assert_eq!(x.sector, Some(Sector::Feedwater));
         assert!(x.corrections.iter().any(|c| c.field == "MOC 번호"));
         assert!(x.corrections.iter().any(|c| c.raw == "10LABI0AP001" && c.fixed == "10LAB10AP001"));
+    }
+
+    #[test]
+    fn a_misread_employee_id_is_fixed_from_the_name_and_shown_as_a_correction() {
+        // 사번 E205 를 E2O5 로 읽었고 이름(이승민)은 원장에 있습니다. 원장 사번으로 고치되 조용히 바꾸지 않고 교정으로 남깁니다 (K2).
+        let table = "<table><tr><td>점검 일시</td><td>2026-11-04 14:21:05</td></tr><tr><td>점검자</td><td>이승민</td></tr><tr><td>사번</td><td>E2O5</td></tr>\
+                     <tr><td>설비 KKS</td><td>10MAA10ST001</td></tr><tr><td>현장 실측치</td><td>26.0</td></tr><tr><td>단위</td><td>MPa</td></tr></table>";
+        let x = extract(&page(vec![PageCrop { title: true, ..crop("현장 계기 점검표", 0.99) }, crop(table, 0.97)], true), &db());
+        assert_eq!(x.worker_id.as_deref(), Some("E205"));
+        assert!(x.corrections.iter().any(|c| c.field == "사번" && c.raw == "E2O5" && c.fixed == "E205"), "{:?}", x.corrections);
     }
 
     #[test]

@@ -101,11 +101,17 @@ fn analyze_call(app: AppHandle, call: OpenCall) {
                 }
             }
         };
+        // 모델 초안을 뒤에서 쓰는 동안 콘솔이 "초안 작성 중" 을 보이고 [조치확정] 을 잠급니다 (주입한 사건과 같게, UI 단순화 P6)
+        let writing = id.clone().filter(|_| lock(&desk.engine).minds().writer.is_some());
+        if let Some(id) = &writing {
+            lock(&desk.drafting).insert(id.clone());
+        }
         notify_console(&app);
         let _ = app.emit("physics_update", ());
         if let Some(id) = id {
             // 판정은 다시 묻지 않고 글만 다시 씁니다.
             let done = staged::redraft(desk, &db, &id);
+            lock(&desk.drafting).remove(&id);
             if let Err(e) = done {
                 lock(&desk.physics).note = Some(format!("AOP 초안을 다시 쓰지 못했습니다 (템플릿 유지): {e:#}"));
             }

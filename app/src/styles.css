@@ -443,6 +443,9 @@ button.ov-pill:hover, .ov-pill[aria-expanded="true"] { background: var(--glass-s
 .axis { padding: 6px; border: 1px dashed var(--line); border-radius: 6px; display: flex; flex-direction: column; gap: 4px; }
 .trace { display: flex; flex-direction: column; gap: 2px; font-size: 12px; max-height: 260px; overflow: auto; }
 .facts { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+.findings { display: flex; flex-direction: column; gap: 4px; margin: 0; padding-left: 18px; font-size: 13px; }
+.quick-approval .qa-ref-row { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+.quick-approval .qa-ref-row input { font-family: Consolas, monospace; letter-spacing: 0.02em; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .aop { white-space: pre-wrap; font: 13px/1.6 "Malgun Gothic", sans-serif; padding: 10px; background: #0f131a; border: 1px solid var(--line); border-radius: 6px; }
 
@@ -478,6 +481,15 @@ body.theme-field { background: #eef1f5; color: #1f2328; }
 .kiosk-card.hold { border-color: #e08a00; }
 .lead { font-size: 17px; color: #5b6573; }
 .start-actions { display: flex; gap: 16px; }
+/* 현장 확인 요청 목록 (단말 첫 화면, UI 단순화 P4): 요청이 있으면 위에서부터 쌓고, 고른 요청은 파란 테두리 */
+.kiosk-card.start:has(.field-requests) { justify-content: flex-start; }
+.field-requests { align-self: stretch; display: flex; flex-direction: column; gap: 8px; text-align: left; }
+.field-requests h3 { font-size: 16px; color: #5b6573; }
+.field-request { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; padding: 14px 16px; color: #1f2328; background: #f7f9fc; border: 1px solid #c8ced6; border-left: 5px solid #e08a00; border-radius: 8px; text-align: left; font-size: 17px; }
+.field-request.active { border-color: #0b6bcb; border-left-color: #0b6bcb; background: #eef5ff; }
+.field-request .fr-note { font-size: 15px; }
+.field-request .fr-meta { font-style: normal; font-size: 12px; color: #5b6573; }
+.request-note { font-size: 15px; }
 button.big { padding: 20px 40px; font-size: 21px; border-radius: 8px; }
 .choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
 .choice { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 18px; color: #1f2328; background: #fff; border: 1px solid #c8ced6; border-radius: 8px; text-align: left; font-size: 17px; }

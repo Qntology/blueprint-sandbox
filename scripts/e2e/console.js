@@ -90,7 +90,17 @@ async function p2(c) {
   await shot(c, "P2-5-drawing-plain");
   await mining.check();
   await stage(c, 4);
+  // 엔지니어 보기(U7): 기본(끔)은 코드 이름 없이, 켜면 jev_head · PointerPrompt · verdict.rs 가 함께 보입니다
+  const drawerText = () => c.locator(".drawer").innerText();
+  const CODE_NAMES = ["jev_head", "PointerPrompt", "verdict.rs"];
+  const plain = await drawerText();
+  assert(!CODE_NAMES.some((w) => plain.includes(w)), `엔지니어 보기를 끈 Stage 4 서랍에 코드 이름이 보입니다: ${CODE_NAMES.filter((w) => plain.includes(w)).join(", ")}`);
   await shot(c, "P2-6-stage4");
+  await app.setEngineer(c, true);
+  const coded = await drawerText();
+  assert(CODE_NAMES.every((w) => coded.includes(w)), "엔지니어 보기를 켠 Stage 4 서랍에 코드 이름이 없습니다");
+  await shot(c, "P2-6b-stage4-engineer");
+  await app.setEngineer(c, false);
   await closeDrawer(c);
   // 시계열 · SDS: 허브 Drop-up 하나 (예전 SDS 분석기 서랍과 합침)
   await c.locator(".charts-toggle").click();
@@ -130,6 +140,14 @@ async function p1(c, f) {
   await shot(c, "P1-1-awaiting");
   placeScan("P1_gauge.png");
   await fieldReset(f);
+  // 현장 확인 요청 목록 (UI 단순화 P4): 경보 사건이 현장 대기에 들어가면 단말 첫 화면에 뜨고, 고르면 설비 코드를 채웁니다.
+  // 내부 수치 · 판정 코드는 목록에도 오지 않습니다.
+  const request = f.locator(".field-request").first();
+  await request.waitFor({ timeout: 30000 });
+  await noLeak(f, "현장 확인 요청 목록");
+  await request.click();
+  await f.locator(".field-request.active").waitFor({ timeout: 5000 });
+  await shot(f, "P1-1b-field-request");
   await f.locator("button", { hasText: L("도면/계기 스캔", "Scan Drawing/Gauge") }).click();
   await f.waitForSelector(".form-grid", { timeout: 300000 });
   await noLeak(f, "점검표 확인");
@@ -621,6 +639,8 @@ async function plant(c, f) {
   await app.waitEngine(c);
   if (AUDIT) for (const p of [c, f]) await p.evaluate(() => (window.__i18nAudit = true));
   await app.setLanguage(c, f, EN ? "en" : "ko");
+  // 운영자 화면(엔지니어 보기 끔)으로 돕니다. 지난 실행이 켜 두었어도 같은 상태에서 시작합니다.
+  await app.setEngineer(c, false);
   const calls0 = await c.evaluate(() => ({ ...(window.__ipcCalls || {}) }));
   const t0 = Date.now();
   for (const id of ONLY) {

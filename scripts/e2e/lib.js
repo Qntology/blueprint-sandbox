@@ -125,10 +125,22 @@ function make(opts = {}) {
   // ── 결재 HUD (오른쪽): 인터록 게이트 · 공동 결재 · 조치확정 · 더 보기 · 시험 단추 ──
   const qa = (page) => page.locator(".approval-hud .quick-approval");
 
+  /** 파트장 공동 결재 + 근거 절차서 번호. 번호는 도장 찍기 방지 대조라 미리 채워 두지 않으므로 (UI 단순화 P1)
+   *  사람처럼 [📄 초안 전문] 에서 번호를 읽고 결재 HUD 에 칩니다. 이미 쳐 두었으면 그대로 둡니다. */
   async function cosign(page) {
     const box = qa(page).locator("label.cosign input");
     await box.waitFor({ timeout: 30000 });
     if (!(await box.isChecked())) await box.check();
+    const ref = qa(page).locator("input.qa-ref");
+    if ((await ref.count()) === 0 || (await ref.inputValue()).trim()) return;
+    await click(page, qa(page).locator("button.qa-draft"));
+    const text = await page.locator(".drawer pre.aop").innerText({ timeout: 30000 });
+    const no = text.match(/\(((?:AOP|EOP)-[A-Z0-9-]+)\s/)?.[1];
+    if (!no) throw new Error(`초안 전문에서 절차서 번호를 찾지 못했습니다: ${text.slice(0, 200)}`);
+    await sleep(600);
+    await closeDrawer(page);
+    await click(page, ref);
+    await page.keyboard.type(no, { delay: 60 });
   }
 
   async function confirm(page) {
@@ -214,6 +226,13 @@ function make(opts = {}) {
     await sleep(1500);
   }
 
+  /** 엔지니어 보기 (코드 이름 함께 보이기, UI 단순화 U7). 기본은 끔이고 녹화는 켜고 찍습니다 */
+  async function setEngineer(c, on) {
+    await openPopover(c, "settings");
+    await click(c, c.locator(`.settings-popover .engineer-row [data-engineer="${on ? "on" : "off"}"]`));
+    await closePopover(c, "settings");
+  }
+
   /** 도메인은 설정 팝오버에서 바꿉니다 (사건 · 감사를 비우는 드문 조작이라 머리에서 내렸습니다) */
   async function switchDomain(c, f, to, timeout = 120000) {
     await tidy(c);
@@ -258,6 +277,7 @@ function make(opts = {}) {
     tidy,
     deselect,
     setLanguage,
+    setEngineer,
     switchDomain,
   };
 }

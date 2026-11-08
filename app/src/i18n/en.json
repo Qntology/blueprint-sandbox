@@ -20,30 +20,21 @@
   "조치 절차서 초안 검증": "Action procedure draft verified",
   "현장 단말 내부 정보 차단": "Internal info blocked from the field terminal",
   "초안 수치 불일치 차단": "Draft figure mismatch blocked",
-  "단위 설비 단독 고장 (고위험) (모델 이견 · 확신도 없음)": "Single-unit fault (high risk) (model dissent · no confidence)",
   "알람 유입": "Alarm Intake",
   "GravityOCR 문서 인식": "GravityOCR Document Recognition",
   "SigLIP2 도면 · 점검표 크롭": "SigLIP2 Drawing · Sheet Crop",
-  "SigLIP2 크롭": "SigLIP2 Crop",
-  "gocr 판독 + 대장 교정": "gocr Reading + Register Correction",
-  "Zoro-1 글쓰기": "Zoro-1 Writing",
   "Zoro-1 판단": "Zoro-1 Verdict",
   "Zoro-1 판단 · 글쓰기": "Zoro-1 Verdict · Writing",
-  "신호 정상 · 원장 대조 완료": "Signal normal · ledger check done",
   "교대감독 최종결재 대기": "Awaiting the shift supervisor's final approval",
   "처리 완료": "Done",
   "확정 가능": "Ready to confirm",
-  "판독 완료 · 교정 없음": "Read · no corrections",
   "자동 교정 후 통과": "Passed after auto-correction",
-  "스캔 없음 (신호 알람은 문서 모델을 띄우지 않음)": "No scan (signal alarms don't load the document models)",
   "스캔 문서 단일 오독": "Single misread in the scanned document",
   "보조 모드: 교대감독이 확정합니다": "Assist Mode: the shift supervisor confirms",
   "가드레일이 차단 (감사 기록)": "Blocked by guardrail (audit logged)",
   "무입증 고위험 승인 시도": "Unproven high-risk approval attempt",
   "절차 위반 시도": "Procedure violation attempt",
   "무증빙 기준치 변경 잠금 · 기술책임자 확인": "Unevidenced reference change locked · technical lead to check",
-  "MOC 원장 일치": "MOC ledger match",
-  "MOC 원장 불일치 · 잠금": "MOC ledger mismatch · locked",
   "MOP 원장 일치": "MOP ledger match",
   "MOP 원장 불일치 · 잠금": "MOP ledger mismatch · locked",
   "기준치 오버레이 반영": "Reference overlay applied",
@@ -92,7 +83,6 @@
   "변경관리 승인 원장 일치": "MOC approved-ledger match",
   "단일 계측기 드리프트": "single-instrument drift",
   "단일 설비 국소 이상": "single-equipment local fault",
-  "절차서 없음 (변경 반영 심사)": "No procedure (change review)",
   "앞 조건과 함께 맞는 항목이 없어 힌트로 내림 (정답을 지우지 않게)": "Nothing matches together with the earlier conditions, so this was demoted to a hint (so the answer is not erased)",
   "유형 지시어 없음 → 설비(기본) · 계측": "no type cue → equipment (default) · measurement",
   "중앙 계측값과 현장 실측치 사이에 편차가 있어 현장 상황 확인이 필요합니다": "There is a deviation between the central reading and the field reading, so the field situation needs checking",
@@ -107,7 +97,6 @@
   "걸러 낸 계측이 정상 범위입니다": "the filtered measurement is within the normal range",
   "계측기 동결": "instrument freeze",
   "계측팀 정비 배정 (판정에서 제외)": "Assigned to I&C maintenance (excluded from the verdict)",
-  "값 고정 (동결) 검출": "Fixed value (freeze) detected",
   "걸러낸 값으로 판정 (자동 해소)": "Judged on the filtered value (auto-resolved)",
   "경보 한계 이내 여부": "within the alarm limit",
   "상류 설비 정상 여부": "upstream equipment normal",
@@ -144,8 +133,10 @@
   "설비 KKS 코드를 대장에서 찾지 못했습니다. 코드를 다시 확인해 주세요": "The equipment KKS code is not in the register. Please check the code again",
   "센서 태그를 대장에서 찾지 못했습니다": "The sensor tag is not in the register",
   "센서 태그가 설비 코드와 맞지 않습니다": "The sensor tag does not belong to the equipment code",
-  "점검자 사번을 확인해 주세요": "Please check the inspector's employee ID",
+  "점검자 사번을 원장에서 찾지 못했습니다. 사번을 다시 확인해 주세요": "The inspector's employee ID is not in the register. Please check the ID again",
   "점검자 이름과 사번이 맞지 않습니다": "The inspector's name does not match the employee ID",
+  "사번": "Employee ID",
+  "현장 계기 실측값을 확인해 주세요": "Please check the field gauge reading",
   "점검자와 사번이 다른 사람입니다": "The inspector and the employee ID belong to different people",
   "현장 실측치를 적어 주세요": "Please enter the field reading",
   "Red-line 의 변경번호(MOC)를 적어 주세요": "Please enter the Red-line's change no. (MOC)",
@@ -294,24 +285,16 @@
   "조치 절차서 초안 검증": "Action procedure draft verified",
   "현장 단말 내부 정보 차단": "Internal info blocked from the field terminal",
   "초안 수치 불일치 차단": "Draft figure mismatch blocked",
-  "단위 설비 단독 고장 (고위험) (모델 이견 · 확신도 없음)": "Single-unit fault (high risk) (model dissent · no confidence)",
   "GravityOCR 문서 인식": "GravityOCR Document Recognition",
   "SigLIP2 도면 · 점검표 크롭": "SigLIP2 Drawing · Sheet Crop",
-  "SigLIP2 크롭": "SigLIP2 Crop",
-  "gocr 판독 + 대장 교정": "gocr Reading + Register Correction",
-  "Zoro-1 글쓰기": "Zoro-1 Writing",
   "Zoro-1 판단 · 글쓰기": "Zoro-1 Verdict · Writing",
-  "신호 정상 · 원장 대조 완료": "Signal normal · ledger check done",
   "교대감독 최종결재 대기": "Awaiting the shift supervisor's final approval",
-  "판독 완료 · 교정 없음": "Read · no corrections",
   "자동 교정 후 통과": "Passed after auto-correction",
-  "스캔 없음 (신호 알람은 문서 모델을 띄우지 않음)": "No scan (signal alarms don't load the document models)",
   "스캔 문서 단일 오독": "Single misread in the scanned document",
   "보조 모드: 교대감독이 확정합니다": "Assist Mode: the shift supervisor confirms",
   "가드레일이 차단 (감사 기록)": "Blocked by guardrail (audit logged)",
   "무입증 고위험 승인 시도": "Unproven high-risk approval attempt",
   "무증빙 기준치 변경 잠금 · 기술책임자 확인": "Unevidenced reference change locked · technical lead to check",
-  "MOC 원장 불일치 · 잠금": "MOC ledger mismatch · locked",
   "MOP 원장 불일치 · 잠금": "MOP ledger mismatch · locked",
   "기준치 오버레이 반영": "Reference overlay applied",
   "선행 절차를 모두 확인했습니다. 확정할 수 있습니다": "All prerequisite steps confirmed. Ready to confirm",
@@ -350,7 +333,6 @@
   "변경관리 승인 원장 일치": "MOC approved-ledger match",
   "단일 계측기 드리프트": "single-instrument drift",
   "단일 설비 국소 이상": "single-equipment local fault",
-  "절차서 없음 (변경 반영 심사)": "No procedure (change review)",
   "앞 조건과 함께 맞는 항목이 없어 힌트로 내림 (정답을 지우지 않게)": "Nothing matches together with the earlier conditions, so this was demoted to a hint (so the answer is not erased)",
   "유형 지시어 없음 → 설비(기본) · 계측": "no type cue → equipment (default) · measurement",
   "중앙 계측값과 현장 실측치 사이에 편차가 있어 현장 상황 확인이 필요합니다": "There is a deviation between the central reading and the field reading, so the field situation needs checking",
@@ -361,7 +343,6 @@
   "100MW AI 데이터센터": "100MW AI Data Center",
   "걸러 낸 계측이 정상 범위입니다": "the filtered measurement is within the normal range",
   "계측팀 정비 배정 (판정에서 제외)": "Assigned to I&C maintenance (excluded from the verdict)",
-  "값 고정 (동결) 검출": "Fixed value (freeze) detected",
   "걸러낸 값으로 판정 (자동 해소)": "Judged on the filtered value (auto-resolved)",
   "경보 한계 이내 여부": "within the alarm limit",
   "상류 설비 정상 여부": "upstream equipment normal",
@@ -390,8 +371,9 @@
   "설비 KKS 코드를 대장에서 찾지 못했습니다. 코드를 다시 확인해 주세요": "The equipment KKS code is not in the register. Please check the code again",
   "센서 태그를 대장에서 찾지 못했습니다": "The sensor tag is not in the register",
   "센서 태그가 설비 코드와 맞지 않습니다": "The sensor tag does not belong to the equipment code",
-  "점검자 사번을 확인해 주세요": "Please check the inspector's employee ID",
+  "점검자 사번을 원장에서 찾지 못했습니다. 사번을 다시 확인해 주세요": "The inspector's employee ID is not in the register. Please check the ID again",
   "점검자 이름과 사번이 맞지 않습니다": "The inspector's name does not match the employee ID",
+  "현장 계기 실측값을 확인해 주세요": "Please check the field gauge reading",
   "점검자와 사번이 다른 사람입니다": "The inspector and the employee ID belong to different people",
   "현장 실측치를 적어 주세요": "Please enter the field reading",
   "Red-line 의 변경번호(MOC)를 적어 주세요": "Please enter the Red-line's change no. (MOC)",
@@ -897,36 +879,8 @@
    "embedding granite-97m"
   ],
   [
-   "(\\S+) 초안 · 숫자 대조 통과 · 공동결재 대기",
-   "$1 draft · figure check passed · awaiting co-sign"
-  ],
-  [
-   "(\\S+) 초안 · 숫자 대조 통과",
-   "$1 draft · figure check passed"
-  ],
-  [
-   "(\\S+) 초안 · 숫자 불일치 · 템플릿 대체",
-   "$1 draft · figure mismatch · template used"
-  ],
-  [
    "^절차서: ",
    "Procedure: "
-  ],
-  [
-   "조각 (\\d+)개 판독",
-   "$1 crops read"
-  ],
-  [
-   "안내문 (\\d+)개 버림",
-   "$1 guide dropped"
-  ],
-  [
-   "빈 조각 (\\d+)개",
-   "$1 blank"
-  ],
-  [
-   "마스터와 같은 조각 (\\d+)개 건너뜀",
-   "$1 same as master skipped"
   ],
   [
    "처리 결과 안내 \\(접수 번호 (\\S+)\\)",
@@ -1117,10 +1071,6 @@
    "Gate $1~$2 Format"
   ],
   [
-   "Gate (\\d)~(\\d) 원장 대조",
-   "Gate $1~$2 Ledger Check"
-  ],
-  [
    "Gate (\\d) 정합성 \\(현장 대기\\)",
    "Gate $1 Consistency (awaiting field)"
   ],
@@ -1129,20 +1079,12 @@
    "Gate $1 consistency review"
   ],
   [
-   "Gate (\\d) \\+ Zoro-1 판단",
-   "Gate $1 + Zoro-1 Verdict"
-  ],
-  [
    "Gate (\\d) 마인드맵 \\+ Zoro-1",
    "Gate $1 Mind Map + Zoro-1"
   ],
   [
    "Gate (\\d)~(\\d) (AOP|EOP) 초안 · Factcheck",
    "Gate $1~$2 $3 Draft · Factcheck"
-  ],
-  [
-   "Zoro-1 (AOP|EOP) 초안",
-   "Zoro-1 $1 Draft"
   ],
   [
    "^(.+) 중 (.+) 만 판단$",
@@ -1179,14 +1121,6 @@
   [
    "^제출한 설비 변경 내용이 승인 기록과 확인되어 (.+?) 기준치에 반영되었습니다\\.$",
    "The equipment change you submitted matched the approval record and was applied to the $1 reference values."
-  ],
-  [
-   "대장 대조로 오독 1건 교정",
-   "1 misread corrected against the register"
-  ],
-  [
-   "대장 대조로 오독 (\\d+)건 교정",
-   "$1 misreads corrected against the register"
   ],
   [
    "대장으로 교정 (\\d+)건",
@@ -1247,14 +1181,6 @@
   [
    "채널 ([A-C]) 단독 편차 \\(현장 확인 대기\\)",
    "channel $1 deviates alone (awaiting field check)"
-  ],
-  [
-   "(\\d)oo(\\d) 채널 ([A-C]) 편차 · 현장 일치",
-   "$1oo$2 channel $3 deviation · field agrees"
-  ],
-  [
-   "(\\d)oo(\\d) 채널 ([A-C]) 편차",
-   "$1oo$2 channel $3 deviation"
   ],
   [
    "\\(설계 한계 ([\\d.,]+ ?\\S+)\\)",
@@ -1505,14 +1431,6 @@
    "(the model draft had $1 figure mismatch(es), so the template summary was used)"
   ],
   [
-   "(\\S+) 모델 초안 수치 불일치 (\\d+)건 → 템플릿",
-   "$1 model draft: $2 figure mismatch(es) → template"
-  ],
-  [
-   "(\\S+) 템플릿 \\(글쓰기 모델 없음\\)",
-   "$1 template (no writer model)"
-  ],
-  [
    "원문에 없는 숫자: ",
    "Number not in the source: "
   ],
@@ -1539,14 +1457,6 @@
   [
    "\\(스캔 시각\\)",
    "(at scan time)"
-  ],
-  [
-   "(\\S+) 보팅 일치",
-   "$1 voting agrees"
-  ],
-  [
-   "\\(규칙만, 모델 없음\\)",
-   "(rules only, no model)"
   ],
   [
    "문서를 읽지 못했습니다\\. (.+?)에 알려 주세요\\.",
@@ -1611,10 +1521,6 @@
   [
    "(\\d+)개",
    "$1"
-  ],
-  [
-   "확신 ([\\d.]+)",
-   "conf. $1"
   ],
   [
    "확신도 ([\\d.]+%)",
@@ -1874,30 +1780,21 @@
   "조치 절차서 초안 검증": "Action procedure draft verified",
   "현장 단말 내부 정보 차단": "Internal info blocked from the field terminal",
   "초안 수치 불일치 차단": "Draft figure mismatch blocked",
-  "단위 설비 단독 고장 (고위험) (모델 이견 · 확신도 없음)": "Single-unit fault (high risk) (model dissent · no confidence)",
   "알람 유입": "Alarm Intake",
   "GravityOCR 문서 인식": "GravityOCR Document Recognition",
   "SigLIP2 도면 · 점검표 크롭": "SigLIP2 Drawing · Sheet Crop",
-  "SigLIP2 크롭": "SigLIP2 Crop",
-  "gocr 판독 + 대장 교정": "gocr Reading + Register Correction",
-  "Zoro-1 글쓰기": "Zoro-1 Writing",
   "Zoro-1 판단": "Zoro-1 Verdict",
   "Zoro-1 판단 · 글쓰기": "Zoro-1 Verdict · Writing",
-  "신호 정상 · 원장 대조 완료": "Signal normal · ledger check done",
   "교대감독 최종결재 대기": "Awaiting the shift supervisor's final approval",
   "처리 완료": "Done",
   "확정 가능": "Ready to confirm",
-  "판독 완료 · 교정 없음": "Read · no corrections",
   "자동 교정 후 통과": "Passed after auto-correction",
-  "스캔 없음 (신호 알람은 문서 모델을 띄우지 않음)": "No scan (signal alarms don't load the document models)",
   "스캔 문서 단일 오독": "Single misread in the scanned document",
   "보조 모드: 교대감독이 확정합니다": "Assist Mode: the shift supervisor confirms",
   "가드레일이 차단 (감사 기록)": "Blocked by guardrail (audit logged)",
   "무입증 고위험 승인 시도": "Unproven high-risk approval attempt",
   "절차 위반 시도": "Procedure violation attempt",
   "무증빙 기준치 변경 잠금 · 기술책임자 확인": "Unevidenced reference change locked · technical lead to check",
-  "MOC 원장 일치": "MOC ledger match",
-  "MOC 원장 불일치 · 잠금": "MOC ledger mismatch · locked",
   "MOP 원장 일치": "MOP ledger match",
   "MOP 원장 불일치 · 잠금": "MOP ledger mismatch · locked",
   "기준치 오버레이 반영": "Reference overlay applied",
@@ -1946,7 +1843,6 @@
   "변경관리 승인 원장 일치": "MOC approved-ledger match",
   "단일 계측기 드리프트": "single-instrument drift",
   "단일 설비 국소 이상": "single-equipment local fault",
-  "절차서 없음 (변경 반영 심사)": "No procedure (change review)",
   "앞 조건과 함께 맞는 항목이 없어 힌트로 내림 (정답을 지우지 않게)": "Nothing matches together with the earlier conditions, so this was demoted to a hint (so the answer is not erased)",
   "유형 지시어 없음 → 설비(기본) · 계측": "no type cue → equipment (default) · measurement",
   "중앙 계측값과 현장 실측치 사이에 편차가 있어 현장 상황 확인이 필요합니다": "There is a deviation between the central reading and the field reading, so the field situation needs checking",
@@ -1961,7 +1857,6 @@
   "걸러 낸 계측이 정상 범위입니다": "the filtered measurement is within the normal range",
   "계측기 동결": "instrument freeze",
   "계측팀 정비 배정 (판정에서 제외)": "Assigned to I&C maintenance (excluded from the verdict)",
-  "값 고정 (동결) 검출": "Fixed value (freeze) detected",
   "걸러낸 값으로 판정 (자동 해소)": "Judged on the filtered value (auto-resolved)",
   "경보 한계 이내 여부": "within the alarm limit",
   "상류 설비 정상 여부": "upstream equipment normal",
@@ -1997,8 +1892,9 @@
   "설비 KKS 코드를 대장에서 찾지 못했습니다. 코드를 다시 확인해 주세요": "The equipment KKS code is not in the register. Please check the code again",
   "센서 태그를 대장에서 찾지 못했습니다": "The sensor tag is not in the register",
   "센서 태그가 설비 코드와 맞지 않습니다": "The sensor tag does not belong to the equipment code",
-  "점검자 사번을 확인해 주세요": "Please check the inspector's employee ID",
+  "점검자 사번을 원장에서 찾지 못했습니다. 사번을 다시 확인해 주세요": "The inspector's employee ID is not in the register. Please check the ID again",
   "점검자 이름과 사번이 맞지 않습니다": "The inspector's name does not match the employee ID",
+  "현장 계기 실측값을 확인해 주세요": "Please check the field gauge reading",
   "점검자와 사번이 다른 사람입니다": "The inspector and the employee ID belong to different people",
   "현장 실측치를 적어 주세요": "Please enter the field reading",
   "Red-line 의 변경번호(MOC)를 적어 주세요": "Please enter the Red-line's change no. (MOC)",

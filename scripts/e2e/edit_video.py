@@ -944,6 +944,7 @@ CAP = {
     "p2.stage5": ("Stage 5 — 절차서 초안 · Factcheck (결재는 오른쪽 결재 HUD)", "고위험 조치(감발)가 든 AOP-103-FW02 라 파트장 공동 결재가 필요합니다", "Stage 5 — draft · factcheck (approve in the right HUD)", "AOP-103-FW02 contains a high-risk action (load reduction), so a team-lead co-sign is required"),
     "p2.g3_rubber": ("가드레일 ① 공동 결재 없이 확정 → 차단 (G3_INTERCEPT_RUBBER_STAMP)", "{text}", "Guardrail ① confirm without co-sign → blocked (G3_INTERCEPT_RUBBER_STAMP)", "{text}"),
     "p2.reject": ("가드레일 ② 증빙 없이 반려 → 차단", "{text}", "Guardrail ② reject without evidence → blocked", "{text}"),
+    "p2.ref": ("공동 결재 + 근거 절차서 번호 {text}", "번호는 미리 채우지 않습니다. 초안 전문에서 읽어 직접 치면 Gate 3 이 초안 번호와 대조합니다 (도장 찍기 방지)", "Co-sign + procedure no. {text}", "The number is not pre-filled: read it in the full draft and type it; Gate 3 checks it against the draft (anti rubber-stamp)"),
     "p2.g3_order": ("가드레일 ③ 선행 절차를 건너뛰고 확정 → 차단 (G3_INTERCEPT_INTERLOCK_ORDER)", "{text}", "Guardrail ③ skip prerequisite steps → blocked (G3_INTERCEPT_INTERLOCK_ORDER)", "{text}"),
     "p2.step2": ("인터록 Step 2 — 바이패스 개도 65% 현장 값 확인", "Step 1 은 DCS 계측으로 이미 통과, Step 2 를 채우면 Step 3 만 남습니다", "Interlock Step 2 — bypass opening 65% field value", "Step 1 already passed on DCS data; after Step 2 only Step 3 remains"),
     "p2.step3": ("인터록 Step 3 — LOTO 무전 확인 (사번 날인)", "순서대로 모두 확인되어 확정 잠금이 풀립니다", "Interlock Step 3 — LOTO radio confirmation (ID stamp)", "All steps confirmed in order; the confirm lock opens"),
@@ -952,6 +953,7 @@ CAP = {
     "p1.g2_block": ("가드레일 — 현장 확인 전 확정 → 차단 (G2_FIELD_RECHECK_REQUIRED)", "{text}", "Guardrail — confirm before the field check → blocked (G2_FIELD_RECHECK_REQUIRED)", "{text}"),
     "p1.recheck": ("현장 재점검 요청", "{text}", "Field recheck requested", "{text}"),
     "p1.kiosk": ("현장 단말 — 계기 점검표 스캔", "흔들린 손글씨(궁서) 점검표 · ±0.8° 기울기 · 잡음", "Field terminal — gauge sheet scan", "Shaky handwritten sheet · ±0.8° skew · scan noise"),
+    "p1.request": ("단말 첫 화면의 현장 확인 요청 — 주제어실 재점검 메모", "요청을 누르면 설비 코드 · 센서 태그가 채워집니다 (내부 수치 · 판정 코드는 오지 않음)", "Field check requests on the terminal start screen — the control room's recheck note", "Tapping a request fills in the equipment code and sensor tag (no internal values or verdict codes)"),
     "p1.scan_done": ("원터치 대조 카드 — 스캔 조각 {crops}개", "SigLIP2 가 고른 조각을 gocr 가 읽어 칸을 채웠습니다. 카드마다 스캔 원문 조각이 붙습니다", "One-touch check cards — {crops} scan crops", "gocr read the crops SigLIP2 chose and filled the fields; each card shows its source crop"),
     "p1.stepper": ("장갑 스테퍼", "장갑을 낀 채 ±0.1 단추로 실측치를 고칩니다", "Glove stepper", "Adjust the reading with ±0.1 buttons while wearing gloves"),
     "p1.sign_line": ("서명을 한 획 직선으로", "서명 규칙: 획 2회 이상 · 면적 15% 이상 · 직선 아님", "A one-stroke straight-line signature", "Signature rule: 2+ strokes · 15%+ of the pad · not a straight line"),
@@ -1003,6 +1005,7 @@ CAP = {
     "d2.interlock": ("CDU 우회밸브 인터록 3단계 확인", "", "CDU bypass interlock: 3 steps confirmed", ""),
     "d2.archive": ("NOC 결재 → 보관 문서 {archive}", "", "NOC approval → archived record {archive}", ""),
     "d1.awaiting": ("D1: 매니폴드 공급 압력 채널 A 만 0.8 bar — 현장 대기", "", "D1: manifold supply pressure channel A alone at 0.8 bar — awaiting field", ""),
+    "d1.request": ("현장 엔지니어 단말 — 현장 확인 요청 고르기", "주제어실이 기다리는 자산을 고르면 자산코드가 채워집니다", "Field engineer terminal — pick a field check request", "Picking the asset the control room is waiting on fills in its asset code"),
     "d1.scan_done": ("현장 엔지니어 단말 — 점검표 스캔 조각 {crops}개", "", "Field engineer terminal — {crops} scan crops", ""),
     "d1.form": ("자산코드 {kks} 읽음", "", "Asset code {kks} read", ""),
     "d1.sent": ("소명 포함 전송", "", "Sent with justification", ""),
@@ -1181,7 +1184,7 @@ def build(story):
     # PART 3 전처리
     S.card(divider_card("PART 3", L("도면 전처리 — SigLIP2 크롭 · 델타 · 심볼", "Drawing preprocessing — SigLIP2 crops · delta · symbols"), L("현장 스캔이 들어오면 SigLIP2 가 어디를 읽을지 고르고(4종 채택 · 안내문 · 빈 띠 버림), 마스터와 견줘 바뀐 곳만 gocr 로 읽습니다", "For each field scan SigLIP2 picks where to read (4 kinds kept, guides and blank bands dropped) and gocr reads only what changed versus the master")), 5, "div3")
     p3 = P(3, "도면 전처리", "Preprocessing")
-    S.beats(p3, L("현장 단말", "Field terminal"), ["p1.kiosk", "p1.scan_done"])
+    S.beats(p3, L("현장 단말", "Field terminal"), ["p1.kiosk", "p1.request", "p1.scan_done"])
     plan, read, sym, timing = scan_events(S, "p1.scan_start", "p1.scan_done")
     if plan:
         S.model(12, p3, L("P1 계기 점검표 — SigLIP2 영역 경쟁 → gocr", "P1 gauge sheet — SigLIP2 region arena → gocr"), L("파랑 제목 · 초록 입력란 · 보라 표 · 주황 서명만 남기고, 안내문(회색 X)과 글자 없는 띠(붉은 줄)는 gocr 에 넣지 않습니다", "Only blue title, green form, purple table and orange sign crops remain; guides (gray X) and blank bands (red line) never reach gocr"),
@@ -1219,7 +1222,7 @@ def build(story):
     S.beats(p4, L("관제 콘솔", "Control console"), ["p2.open"], full_lead=("p2.open",))
     S.beats(p4, L("관제 콘솔", "Control console"), ["p2.replay", "p2.charts", "p2.mining", "p2.lanes", "p2.mermaid", "p2.mindmap", "p2.q_pressure", "p2.q_stuck", "p2.q_typo", "p2.q_flow", "p2.stage3"], real=("p2.replay",))
     S.beats(p4, L("관제 콘솔 · 현장 단말", "Console · field terminal"), ["p1.awaiting", "p1.truth"])
-    S.beats(p4, L("데이터센터 콘솔", "Data center console"), ["aidc.switch", "d2.open", "d2.replay", "d2.q_stuck", "d2.q_gpu", "d2.q_typo", "d2.q_mop", "d1.awaiting", "d1.scan_done", "d1.form", "d1.truth"], real=("d2.replay",))
+    S.beats(p4, L("데이터센터 콘솔", "Data center console"), ["aidc.switch", "d2.open", "d2.replay", "d2.q_stuck", "d2.q_gpu", "d2.q_typo", "d2.q_mop", "d1.awaiting", "d1.request", "d1.scan_done", "d1.form", "d1.truth"], real=("d2.replay",))
     S.beats(p4, L("물리엔진 · 자율 대응", "Physics engine · autonomous response"), ["phys.start", "phys.inject", "phys.chain", "phys.tier1"])
     w = S.window("phys.chain", "phys.tier1")
     if w:
@@ -1262,7 +1265,7 @@ def build(story):
             S.model(8, p6, L("자유 서술 소명 → 표준 코드 (Zoro-1 글쓰기)", "Free-text justification → standard code (Zoro-1 writer)"), L("현장 글을 정해진 소명 코드 중 하나로 분류합니다. 코드 밖의 답은 받지 않습니다", "Sorts the field text into one of the fixed justification codes; anything else is rejected"),
                     writer_painter({"aop_id": "", "summary": e["detail"].get("text", ""), "numbers": [], "problems": [], "attempts": 1, "by_model": True}, e, L("지시문: 현장 소명 → 표준 코드", "Instruction: field justification → standard code")), "m.excuse", active={"zoro_w"})
     S.beats(p6, L("관제 콘솔", "Control console"), ["p1.unmask", "p1.kiosk_done"])
-    S.beats(p6, L("결재 HUD", "Approval HUD"), ["p2.stage5", "p2.g3_rubber", "p2.reject", "p2.g3_order", "p2.step2", "p2.step3", "p2.archive"])
+    S.beats(p6, L("결재 HUD", "Approval HUD"), ["p2.stage5", "p2.g3_rubber", "p2.reject", "p2.ref", "p2.g3_order", "p2.step2", "p2.step3", "p2.archive"])
     for sid, note in (("P2", L("AOP-103-FW02 원인 진단 요약 (발전소)", "AOP-103-FW02 root-cause summary (power plant)")), ("D2", L("EOP-103-CDU02 원인 진단 요약 (데이터센터)", "EOP-103-CDU02 root-cause summary (data center)"))):
         det = S.snap(f"{sid}-detail-final") or S.snap(f"{sid}-detail")
         if det and det.get("analysis", {}).get("draft"):
