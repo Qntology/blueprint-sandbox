@@ -9,6 +9,7 @@
 //! - `state_machine`: Gate 0 ~ 5 파이프라인 (`Engine`)
 //! - `drafting` · `factcheck`: Zoro-1 이 쓰는 AOP 초안과 숫자 · 코드 1:1 대조
 //! - `policy` · `audit` · `privacy` · `store`: 자동화 정책 · 감사 로그 · 비식별 · 세션과 보관
+//! - `search` · `nlp`: 한국어 · 영어 자연어 검색 (규칙 · Stanza 품사 · 원형 · 임베딩 경로 · NMS 조각 접지)
 //! - `stages` · `mining` · `mermaid` · `scenario` · `field`: 콘솔 화면용 단계 기록 · 프로세스 마이닝 · Mermaid 원본 · 합성 시나리오 · 현장 단말 접수
 
 pub mod ai;
@@ -30,6 +31,7 @@ pub mod lattice;
 pub mod mermaid;
 pub mod mining;
 pub mod mitigation;
+pub mod nlp;
 pub mod physics;
 pub mod plant;
 pub mod policy;

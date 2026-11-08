@@ -37,19 +37,31 @@ interface Alert {
 
 const size = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.round(b / 1e6)} MB`);
 
+/** 모델마다 가져올 곳: 판단 · 인식 · 크롭은 zoro-gravity, 검색 임베딩은 logis-center, Stanza 는 stanza-onnx-export 변환본 */
+const SOURCE: Record<string, [string, string]> = {
+  embed: ["logis-center", "logis-center"],
+  stanza: ["stanza-onnx-export 변환본 (BLUEPRINT_STANZA_FROM)", "stanza-onnx-export output (BLUEPRINT_STANZA_FROM)"],
+};
+const source = (m: ModelRow) => tr(...(SOURCE[m.name] ?? ["zoro-gravity", "zoro-gravity"]));
+
 function note(m: ModelRow): string {
   if (m.job.running) return m.job.message;
-  if (m.installed) return tr(`${size(m.bytes_on_disk)} 사용 중 (zoro-gravity 와 같은 모델)`, `${size(m.bytes_on_disk)} in use (same model as zoro-gravity)`);
+  if (m.installed) return tr(`${size(m.bytes_on_disk)} 사용 중 (${source(m)} 와 같은 모델)`, `${size(m.bytes_on_disk)} in use (same model as ${source(m)})`);
   if (m.importable)
     return tr(
-      "zoro-gravity 모델 폴더에 있습니다. 가져오면 큰 가중치는 하드 링크로 걸려 디스크를 더 쓰지 않습니다.",
-      "Found in the zoro-gravity model folder. Importing hard-links the large weights, so it uses no extra disk space.",
+      `${source(m)} 에 있습니다. 가져오면 큰 가중치는 하드 링크로 걸려 디스크를 더 쓰지 않습니다.`,
+      `Found in ${source(m)}. Importing hard-links the large weights, so it uses no extra disk space.`,
     );
   if (m.bytes_on_disk > 0) return tr(`받다 멈춤 (${size(m.bytes_on_disk)}). 다시 누르면 이어 받습니다.`, `Download stopped (${size(m.bytes_on_disk)}). Press again to resume.`);
+  if (m.name === "stanza")
+    return tr(
+      "공개 저장소가 없습니다. stanza-onnx-export 로 en · ko 를 변환한 뒤 `blueprint-models import stanza <onnx_final>` 로 가져오세요. 없어도 검색은 규칙 줄기로 돕니다.",
+      "No public repository. Convert en · ko with stanza-onnx-export, then run `blueprint-models import stanza <onnx_final>`. Search still works with rule stems without it.",
+    );
   return m.repo ? `huggingface.co/${m.repo}` : tr("내려받을 곳이 없습니다. 직접 변환해서 모델 폴더에 넣으세요.", "No download source. Convert it yourself and put it in the model folder.");
 }
 
-/** 모델 가져오기 · 다운로드 · 삭제 설정. 모델은 zoro-gravity 와 같아서 먼저 그 폴더에서 가져오고, 없을 때만 내려받습니다. */
+/** 모델 가져오기 · 다운로드 · 삭제 설정. 판단 · 인식 · 크롭 모델은 zoro-gravity 와, 검색 임베딩은 logis-center 와 같아서 먼저 그 폴더에서 가져오고, 없을 때만 내려받습니다. */
 export function ModelSettings({ open, onOpen }: { open: boolean; onOpen: () => void }) {
   const t = useT();
   const [report, setReport] = useState<ModelReport | null>(null);
@@ -103,7 +115,7 @@ export function ModelSettings({ open, onOpen }: { open: boolean; onOpen: () => v
       </p>
       <div className="settings-actions">
         <button className="green" disabled={importable.length === 0} onClick={() => importable.forEach((m) => run("import_model", { modelName: m.name }))}>
-          {t(`zoro-gravity 에서 가져오기 (${importable.length})`, `Import from zoro-gravity (${importable.length})`)}
+          {t(`가져오기 (${importable.length})`, `Import (${importable.length})`)}
         </button>
         <button className="teal" disabled={missing.length === 0} onClick={() => missing.forEach((m) => run("download_model", { modelName: m.name }))}>
           {t("없는 모델 모두 받기", "Download all missing models")}

@@ -26,6 +26,7 @@ use blueprint_core::i18n::{self, Lang};
 use blueprint_core::extract::{code_field, extract, DocKind, Extracted, PageText};
 use blueprint_core::interlock::Evidence;
 use blueprint_core::issues;
+use blueprint_core::search::{search_with, SearchModels};
 use blueprint_core::audit::AuditCategory;
 use blueprint_core::tiling;
 use blueprint_core::field::{self, FieldError, FieldForm, FieldState};
@@ -42,7 +43,7 @@ use blueprint_core::state_machine::staged;
 use blueprint_core::state_machine::{Engine, EngineAccess, Outcome, SupervisorDecision};
 use blueprint_core::store::SessionStatus;
 use blueprint_core::timeseries::Telemetry;
-use blueprint_models::{app_dir, delete_model as remove_model, download, entry, import_from, import_source, models_dir, status, CATALOG};
+use blueprint_models::{app_dir, delete_model as remove_model, download, entry, import_auto, import_source, models_dir, status, CATALOG};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -168,6 +169,8 @@ struct Desk {
     field_timings: Mutex<Option<ReadTimings>>,
     /// 물리엔진 · 자율 대응 모드 (Part 8-5)
     physics: Mutex<physics_mode::PhysicsState>,
+    /// 자연어 검색 모델 (Stanza en · ko · 임베딩, 모두 CPU). 시작 때 따로 읽고, 없으면 규칙 · 글자 경로만으로 찾습니다.
+    search_models: Mutex<Option<Arc<SearchModels>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -295,30 +298,40 @@ fn check_model_status(window: Window, jobs: State<'_, Jobs>) -> Result<ModelRepo
     Ok(ModelReport { dir: models_dir().display().to_string(), import_from: import_source().map(|p| p.display().to_string()), models })
 }
 
-/// zoro-gravity 모델 폴더에서 모델 하나를 가져옵니다 (큰 가중치는 하드 링크).
+/// 검색 모델이면 다시 읽습니다
+fn search_model_changed(app: &AppHandle, name: &str) {
+    if matches!(name, "embed" | "stanza") {
+        reload_search_models(app);
+    }
+}
+
+/// 모델 하나를 그 모델의 가져올 곳에서 가져옵니다 (zoro · gocr · siglip2 ← zoro-gravity, embed ← logis-center, stanza ← 변환본 폴더).
 #[tauri::command(async)]
 fn import_model(window: Window, app: AppHandle, model_name: String) -> Result<String, String> {
     console_only(&window)?;
     let model = entry(&model_name).ok_or_else(|| format!("모르는 모델입니다: {model_name}"))?;
-    let source = import_source().ok_or("가져올 곳을 모릅니다 (BLUEPRINT_IMPORT_FROM)")?;
-    let r = import_from(&source, model.name).map_err(|e| format!("{e:#}"))?;
+    let r = import_auto(model.name).map_err(|e| format!("{e:#}"))?;
     let _ = app.emit_to(CONSOLE, "download_complete", json!({ "model": model.name }));
     notify_field(&app);
+    search_model_changed(&app, model.name);
     Ok(format!("링크 {}개 · 복사 {}개 · 그대로 {}개", r.linked.len(), r.copied.len(), r.kept.len()))
 }
 
-/// 없는 모델은 먼저 zoro-gravity 에서 가져오고, 그래도 없으면 설정을 열고 내려받으라고 알립니다.
+/// 없는 모델은 먼저 가져올 곳에서 가져오고, 그래도 없으면 설정을 열고 내려받으라고 알립니다 (검색용 모델은 선택이라 알리지 않음).
 #[tauri::command]
 fn ensure_models(window: Window, app: AppHandle) -> Result<(), String> {
     console_only(&window)?;
-    if let Some(source) = import_source() {
-        for s in status().iter().filter(|s| s.importable) {
-            if let Err(e) = import_from(&source, s.entry.name) {
-                eprintln!("[모델] {} 가져오기 실패: {e:#}", s.entry.name);
-            }
+    let mut search_changed = false;
+    for s in status().iter().filter(|s| s.importable) {
+        match import_auto(s.entry.name) {
+            Ok(_) => search_changed |= matches!(s.entry.name, "embed" | "stanza"),
+            Err(e) => eprintln!("[모델] {} 가져오기 실패: {e:#}", s.entry.name),
         }
     }
-    for s in status().iter().filter(|s| !s.installed && s.entry.repo.is_some()) {
+    if search_changed {
+        reload_search_models(&app);
+    }
+    for s in status().iter().filter(|s| !s.installed && s.entry.repo.is_some() && s.entry.required) {
         let alert = json!({ "action": "open_settings", "model": s.entry.name, "message": format!("{} 모델을 내려받습니다", s.entry.label) });
         app.emit_to(CONSOLE, "app_error_alert", alert).map_err(|e| e.to_string())?;
     }
@@ -352,11 +365,15 @@ fn download_model(window: Window, app: AppHandle, jobs: State<'_, Jobs>, model_n
             job.running = false;
             job.error = error.clone();
         }
+        let done = error.is_none();
         let _ = match error {
             Some(error) => app.emit_to(CONSOLE, "download_error", json!({ "model": model.name, "error": error })),
             None => app.emit_to(CONSOLE, "download_complete", json!({ "model": model.name })),
         };
         notify_field(&app);
+        if done {
+            search_model_changed(&app, model.name);
+        }
     });
     Ok(())
 }
@@ -371,6 +388,9 @@ fn delete_models(app: &AppHandle, jobs: &Jobs, names: &[&'static str]) -> Result
         jobs.remove(name);
     }
     notify_field(app);
+    if names.iter().any(|n| matches!(*n, "embed" | "stanza")) {
+        reload_search_models(app);
+    }
     Ok(())
 }
 
@@ -1021,7 +1041,28 @@ fn record_interlock(window: Window, app: AppHandle, desk: State<'_, Desk>, input
     Ok(DecisionReply { ok, message, finalized: false })
 }
 
+/// 검색 모델(Stanza · 임베딩)을 백그라운드에서 다시 읽습니다 (시작 때 · 가져오기 · 내려받기 · 지우기 뒤).
+/// 다 읽으면 지금 원장으로 한 번 찾아서 검색 표 · 개념 뱅크를 임베딩해 둡니다 (첫 질의가 기다리지 않게).
+fn reload_search_models(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let t = std::time::Instant::now();
+        let models = Arc::new(SearchModels::load_default());
+        eprintln!("[검색] {} · {:?} ({:.1} s)", models.summary(), models.notes, t.elapsed().as_secs_f32());
+        let desk = app.state::<Desk>();
+        *lock(&desk.search_models) = Some(models.clone());
+        if models.embedder.is_some() {
+            let db = desk.db();
+            let corpus = blueprint_core::search::Corpus::build(&db, None, None);
+            let t = std::time::Instant::now();
+            let _ = search_with(&db, &corpus, "준비", Some(&models));
+            eprintln!("[검색] 검색 표 · 개념 뱅크 임베딩 {:.1} s", t.elapsed().as_secs_f32());
+        }
+    });
+}
+
 /// 자연어 검색 (콘솔 창 전용). 원장 · 진행 중 사건 · 보관 문서를 찾고, 계측 조건은 지금 값(물리엔진 · 재생 중 시나리오)으로 봅니다.
+/// 한국어 · 영어 질의를 그대로 받습니다 (예전에는 영어 화면이 i18n/query.ts 로 한국어 낱말로 옮겨 보냈습니다).
 #[tauri::command(async)]
 fn search(window: Window, desk: State<'_, Desk>, query: String) -> Result<blueprint_core::search::SearchResult, String> {
     console_only(&window)?;
@@ -1034,8 +1075,15 @@ fn search(window: Window, desk: State<'_, Desk>, query: String) -> Result<bluepr
     };
     let db = desk.db();
     let corpus = blueprint_core::search::Corpus::build(&db, live.as_ref().map(|(t, at)| (t, *at)), engine.as_ref().map(|e| &e.store));
-    let mut result = blueprint_core::search::search(&db, &corpus, &query);
-    if engine.is_none() {
+    // 검색 표를 만들었으면 엔진 잠금을 바로 놓습니다. 임베딩 캐시가 빈 첫 검색은 몇 초 걸려 그동안 분석을 막지 않게
+    let had_engine = engine.is_some();
+    drop(engine);
+    let models = lock(&desk.search_models).clone();
+    let mut result = search_with(&db, &corpus, &query, models.as_deref());
+    if models.is_none() {
+        result.notes.push("검색 모델(Stanza · 임베딩)을 읽는 중이라 이번 검색은 규칙 · 글자 경로만 썼습니다".into());
+    }
+    if !had_engine {
         result.notes.push("엔진이 사건을 분석 중이라 이번 검색에는 진행 중 사건 · 보관 문서가 빠졌습니다".into());
     }
     Ok(result)
@@ -1674,6 +1722,7 @@ pub fn run() {
         field_scans: Mutex::new(Vec::new()),
         field_timings: Mutex::new(None),
         physics: Mutex::new(physics_mode::PhysicsState::default()),
+        search_models: Mutex::new(None),
     };
     tauri::Builder::default()
         .manage(Jobs::default())
@@ -1681,6 +1730,7 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             std::thread::spawn(move || load_models(handle));
+            reload_search_models(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

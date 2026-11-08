@@ -22,7 +22,7 @@
 | Part 8-4 A0 · 시계열 질의 · 인터록 | `tiling.rs`, `tsdb.rs`, `interlock.rs`, `A0View.tsx` | 구현. A0 4×4 타일 판독 · 전역 좌표 · 중복 병합, 정적 시드 + 60초 링버퍼 질의(촬영 시각 값 · 구간 요약 · 변곡 시차), 절차서 선행 절차 3단계(깊이 순서 강제 · 미완료 확정 차단) | A0 실측: 타일 35/35 · 251 s, 원장 상자 빠른 확인 35/35 · 33 s (300 DPI: 타일 566 s · 상자 30 s), 상자 하나 재확인 2.2 s, 인터록 순서 위반 차단 |
 | Part 8-5 물리엔진 · 자율 대응 | `physics.rs`, `mitigation.rs`, `PhysicsPanel.tsx` | 구현. 급수 계통 100 ms 물리엔진 · 고장 주입 · SDS 상태 추적 · Tier 1 우회 개방(자동화 모드 ∧ 규칙 ∧ 네 기준 ≥ 0.95, 명령은 시뮬레이터에만) | 폐루프 시험: 밸브 고착 → 사건 → 자동 우회 → 과열기 고점 트립 전 |
 | Part 8-6 이슈 분해 | `issues.rs`, `SidePanel.tsx` | 구현. 단일 · 절차 · 복합 이슈 카탈로그(A-1 ~ C-3)와 하위 이슈 분해 트리 | P2 = 복합(C-1 + B-3), P1 = 단일(A-1), P4 = 단일(A-2) |
-| 자연어 검색 (logis-center 방식) | `search.rs`, `cctv/CommandBar.tsx` | 구현. 유형 먼저(머리 낱말 규칙) · 조건 대조 후 힌트로 내림 · 전체 질의 경로 RRF · 구제 · 식별자 교정 · 질적 상태(높음 · 고착 · 비정상 …, 지금 계측이 있을 때만 필터) · "왜 찾았나" | 계측 없음 17개 MRR 0.941 · Hit@1 15/17, P2 재생 계측 7개 MRR 0.929 · Hit@1 6/7 ([docs/search.md](docs/search.md)) |
+| 자연어 검색 (logis-center 방식, 한국어 · 영어) | `search/` (`lexicon` · `analyze` · `nms` · `models`), `nlp/stanza.rs`, `ai/embed.rs`, `cctv/CommandBar.tsx` | 구현. 유형 먼저(머리 낱말 규칙) · 조건 대조 후 힌트로 내림 · 전체 질의 경로 RRF · 구제 · 식별자 교정 · 질적 상태(높음 · 고착 · 비정상 …, 지금 계측이 있을 때만 필터) · "왜 찾았나". 영어 질의를 엔진이 그대로 읽음(영어 낱말 목록 · en.json 영어 이름). 선택 모델: Stanza 품사 · 원형(ONNX, 다시 검증한 변환본) → 조사 · 어미를 뗀 줄기 · 원형, granite 임베딩 → 질의 벡터 경로 · NMS 조각(낱말 창 → 원장 설비 · 센서) | 한국어 17개 MRR 0.941, 영어 17개 0.971, 데이터센터 한 · 영 0.900, 뜻풀이 질의 0.31 → 0.48 (한국어) · 0.61 → 0.68 (영어) 임베딩으로 ([docs/search.md](docs/search.md)) |
 | 개선안: 설비 심볼 · KKS 없는 판독 | `symbols.rs`, `identify.rs`, `gen_pid_drawings.py` 심볼 범례 | 구현. 상자 오른쪽 위 심볼 10종, 잉크 연결 요소 후보 + SigLIP2 그림 사전(`symbol_dict.bin`, `crop_probe.bin` 과 별도), 이름 · 위치 · 계기 태그 · 항목 · 좌표 · 심볼 단서로 KKS 없이 설비 판독(애매하면 사람) | 시험 표본 191/200 맞음 · 틀림 0, 마스터 심볼 32/32 찾음 · 31 분류, 명판 훼손 L1 35/35 · L2 34/35 · L3 32/35 · 틀림 0 ([docs/powerplant-symbol-plan.md](docs/powerplant-symbol-plan.md)) |
 | 시계열 · SDS 고도화 | `timeseries.rs`, `sds.rs`, `physics.rs` | 구현. 신호 모양(SDS 상태 코드) · 고장 코드(`VALVE_STUCK_LOW`) · CUSUM · 2차 TTF · 한 표본 튐 막기 · 변화 시작 시차 · 회복 히스테리시스 | CUSUM 1.5σ 탐지 98.8 % (띠 51.5 %) · 같은 오경보 수준, P5 순간 잡음은 열지 않음 |
 | 개선안: CCTV형 통합 관제판 | `OfficerView.tsx`, `cctv/` (`CamPanel` · `Docks` · `RightRail`), `views/*` 오버레이, `mermaid.rs` 배지, `ai/siglip2/delta.rs` · `ink.rs` 전처리 | 구현. 가운데 6:4 (CAM-01 3-Way 도면 / CAM-02 시계열 · CAM-03 SDS 로직 차트 상시 도킹), 우측 병목 · 인터록 신호등 · 결재 통합, 단계 바 + 마이닝 레인 한 줄, 도면 설비마다 SDS 상태 칩 · 기울기 · 미니 파형, 원인 배관 Δt, 마인드맵 변곡 링, 현장 단말 스캔 조각 대조 카드 · 장갑 스테퍼, 델타 판독 전처리(고정 안내문 자리 잘라 내기 · 유채색 잉크 · 도각 평행 이동 맞춤) | 단위 시험 (도각 7 · 5 px 밀림 맞춤, 흑백 선 위 붉은 수정선, 안내문 자리 잘라 내기), 앱 E2E `CCTV` · [docs/cctv-console-plan.md](docs/cctv-console-plan.md) |
@@ -52,8 +52,8 @@ run\windows\rocm.bat symbol_probe --save
 python scripts\gen_pid_drawings.py --a0-delta
 run\windows\rocm.bat delta_probe out\delta_probe.json
 
-:: 모델 없이: 자연어 검색 평가, SDS 트리거 이전 · 지금 비교
-cargo run -p blueprint-core --example search_eval
+:: 자연어 검색 평가 (한국어 · 영어 · 뜻풀이를 규칙만 · +Stanza · +임베딩 세 가지로. 검색 모델이 없으면 규칙만), SDS 트리거 이전 · 지금 비교
+cargo run -p blueprint-core --release --example search_eval
 cargo run -p blueprint-core --release --example sds_eval
 ```
 
@@ -80,10 +80,12 @@ cargo run -p blueprint-core --release --example sds_eval
 ### 모델
 
 모델은 zoro-gravity 와 같습니다. 앱을 켜면 없는 모델을 `%LOCALAPPDATA%\zorogravity\models` 에서 가져오고(큰 가중치는 하드 링크, 작은 파일은 복사), 거기에도 없으면 Hugging Face 에서 내려받습니다.
+검색용 두 모델은 선택입니다 (없으면 검색이 규칙 · 글자 경로만 씁니다). 임베딩은 logis-center 가 받아 둔 것을 가져오고, Stanza 는 공개 저장소가 없어 [stanza-onnx-export](https://github.com/Qntology/stanza-onnx-export) 로 en · ko 를 변환한 폴더에서 가져옵니다.
 
 ```bat
 cargo run -p blueprint-models -- status
 cargo run -p blueprint-models -- import
+cargo run -p blueprint-models -- import stanza ..\stanza-onnx-export\onnx_final
 ```
 
 | 모델 | 내려받는 곳 | 크기 |
@@ -91,6 +93,8 @@ cargo run -p blueprint-models -- import
 | `zoro` | [Qntology/zoro-1-gguf](https://huggingface.co/Qntology/zoro-1-gguf) | 5.2 GB |
 | `gocr` | [Qntology/GravityOCR-KO-gguf](https://huggingface.co/Qntology/GravityOCR-KO-gguf) | 1.6 GB |
 | `siglip2` | [Qntology/siglip2-so400m-patch16-naflex-gguf](https://huggingface.co/Qntology/siglip2-so400m-patch16-naflex-gguf) | 1.7 GB |
+| `embed` (검색, 선택) | [ibm-granite/granite-embedding-97m-multilingual-r2](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2) (logis-center 에서 가져옴) | 0.22 GB |
+| `stanza` (검색, 선택) | 없음 — stanza-onnx-export 변환본 `onnx_final/{en,ko}` | 0.33 GB |
 
 ## 콘솔 화면 (기획 Part 8-1 · 8-1B · 8-2, 개선안 CCTV형 통합 관제판 → 2차 개선안 풀스크린 오버레이)
 
@@ -129,11 +133,13 @@ blueprint-sandbox/
 │   ├── src/mining.rs       간선 흐름 · 병목 · 의사결정 레인
 │   ├── src/mermaid.rs      Mermaid 원본
 │   ├── src/i18n.rs         화면 언어 (한국어 · English) · 영어 절차서 글쓰기 지시문
+│   ├── src/search/         자연어 검색 (파서 · 경로 · RRF, 한 · 영 낱말 목록, 품사 · 원형 분석, NMS 조각, 모델 묶음)
+│   ├── src/nlp/stanza.rs   Stanza 품사 · 원형 ONNX 실행기 (tract), src/ai/embed.rs 검색 임베딩 (granite, candle CPU)
 │   ├── fixtures/           synthetic_db.json · plant_scenarios.json · aidc_db.json · aidc_scenarios.json · drawings/ (PID · MEP · NET · SLD, en/ 영어 그림)
 │   ├── examples/           실제 모델 측정 (plant_probe · symbol_probe · a0_probe), 모델 없는 평가 (search_eval · sds_eval)
 │   └── tests/plant_scenarios.rs P1 ~ P7 E2E
-├── tools/model-settings/   blueprint-models: 모델 폴더 · zoro-gravity 가져오기 · 다운로드
-├── app/                    Tauri + React: 관제 콘솔 · 현장 단말 (src/i18n: 화면 언어 · 영어 번역 표 · 영어 질의 변환)
+├── tools/model-settings/   blueprint-models: 모델 폴더 · 가져오기 (zoro-gravity · logis-center · stanza 변환본) · 다운로드
+├── app/                    Tauri + React: 관제 콘솔 · 현장 단말 (src/i18n: 화면 언어 · 영어 번역 표)
 ├── scripts/                생성기 · ROCm/CUDA 환경 · 실행 공용 · e2e/ (console.js E2E · record.js 촬영 · edit_video.py 편집) · i18n/ (번역 표 만들기)
 ├── run/                    백엔드별 실행 스크립트
 └── docs/                   기획 · 합성 데이터 · 엔진 · 검증
@@ -141,4 +147,4 @@ blueprint-sandbox/
 
 ## 라이선스
 
-Apache-2.0 ([LICENSE](LICENSE)). 모델 라이선스는 zoro-gravity 와 같습니다 (zoro · siglip2 Apache-2.0, gocr MIT).
+Apache-2.0 ([LICENSE](LICENSE)). 모델 라이선스는 zoro-gravity 와 같습니다 (zoro · siglip2 Apache-2.0, gocr MIT). 검색 임베딩 granite-embedding-97m-multilingual-r2 · Stanza 모델은 Apache-2.0 입니다.

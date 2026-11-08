@@ -11,10 +11,12 @@
 //! - `speculative`: 자기 추측 디코딩 (같은 가중치의 블록 초안 + 자기회귀 검증)
 //! - `zoro`: 판단 백본, `gocr`: 문서 인식, `siglip2`: 읽을 곳 고르기
 //! - `ocr`: 비전 → 언어 단계 전환, `document`: 문서 한 장 읽기
+//! - `embed`: 검색용 문장 임베딩 (granite-embedding-97m-multilingual-r2, CPU)
 
 pub mod accel;
 pub mod attention;
 pub mod document;
+pub mod embed;
 pub mod gguf_model;
 pub mod gocr;
 pub mod jev_head;

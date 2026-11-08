@@ -25,10 +25,14 @@ tokenizers = { version = "0.23.2", default-features = false, features = ["onig"]
 zeroize = "1"
 # 모델 폴더(AppData) 위치만 씁니다. 다운로드와 가져오기는 앱이 합니다.
 blueprint-models = { path = "../tools/model-settings", default-features = false }
+# 검색 질의의 Stanza 품사 · 원형 (stanza-onnx-export 의 ONNX). 순수 Rust 실행기라 런타임 DLL 이 없습니다.
+tract-onnx = { version = "0.23", optional = true }
 
 [features]
 # AMD GPU 기본 경로. Vulkan 은 SDK 없이 드라이버의 vulkan-1.dll 만 있으면 됩니다.
-default = ["vulkan"]
+default = ["vulkan", "stanza"]
+# 검색 질의 품사 · 원형 (Stanza ONNX). 끄면 규칙 줄기만 씁니다.
+stanza = ["dep:tract-onnx"]
 vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
 # ROCm/HIP. HIP SDK(hipcc, amdhip64, rocblas)가 설치돼 있어야 합니다.
 rocm = ["dep:candle-rocm", "candle-core/rocm", "candle-nn/rocm"]
