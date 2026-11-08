@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { shortTag, useTerms } from "../domain";
+import { shortTag } from "../domain";
 import { useT } from "../i18n";
 import { clock, fixed, fmt, SDS_COLOR, sdsStateAt, signedSecs } from "../plant";
 import type { Detail, Plant } from "../types";
@@ -9,10 +9,10 @@ import { causalTraces, originOf } from "./traces";
 
 export { originOf };
 
-/** 개선안 Part 3 좌측: 상류(역류) → 원인(D 0) → 하류(경보) 파형을 한 시간축에 겹쳐 그리고, 60초 링버퍼 지표(변곡 · 기울기 · 가속도 · TTF)를 붙입니다.
- *  하단 타임 스크러버의 시각 t 가 커서로 따라옵니다. 2차 개선안부터는 하단 허브의 [📈 차트] Drop-up 안에 있습니다. */
+/** 개선안 Part 3 좌측: 상류(역류) → 원인(D 0) → 하류(경보) 파형을 한 시간축에 겹쳐 그리고, 60초 링버퍼 지표(변곡 · 기울기 · 가속도 · EWMA · TTF)를 붙입니다.
+ *  하단 타임 스크러버의 시각 t 가 커서로 따라옵니다. 2차 개선안부터는 하단 허브의 [📈 시계열 · SDS] Drop-up 안에 있고,
+ *  예전 SDS 분석기 서랍의 표(EWMA)도 여기로 합쳤습니다. 경보 센서의 트립 잔여(TTF) 머리 숫자는 타임머신 배지 한 곳에만 보입니다. */
 export function TimeSeriesDock({ detail, plant, t }: { detail: Detail; plant: Plant; t: number }) {
-  const terms = useTerms();
   const say = useT();
   const a = detail.analysis;
   const root = a.substantive?.causal?.root ?? null;
@@ -25,9 +25,8 @@ export function TimeSeriesDock({ detail, plant, t }: { detail: Detail; plant: Pl
   }));
   const from = Math.max(detail.timeline.t0_ms, origin - 12_000);
   const to = Math.min(Math.max(detail.timeline.now_ms, origin + 10_000) + 8_000, detail.timeline.t0_ms + 150_000);
-  const ttf = a.trigger.ttf_secs ?? a.substantive?.ttf_secs ?? null;
   return (
-    <CamPanel cam="CAM-02" title={say("📈 시계열 로직 차트 (상류 → 원인 → 하류 · Δt · 기울기 · TTF)", "📈 Time-Series Logic Chart (upstream → cause → downstream · Δt · slope · TTF)")} info={`t ${signedSecs(t, origin)}${ttf !== null ? say(` · ${terms.trip} 잔여 ${ttf.toFixed(0)}s`, ` · ${ttf.toFixed(0)}s to ${terms.trip}`) : ""}`}>
+    <CamPanel cam="CAM-02" title={say("📈 시계열 로직 차트 (상류 → 원인 → 하류 · Δt · 기울기 · TTF)", "📈 Time-Series Logic Chart (upstream → cause → downstream · Δt · slope · TTF)")} info={`t ${signedSecs(t, origin)}`}>
       <div className="dock-split">
         <div className="dock-chart">
           {traces.length ? (
@@ -48,6 +47,7 @@ export function TimeSeriesDock({ detail, plant, t }: { detail: Detail; plant: Pl
               <th>{say("변곡", "Inflection")}</th>
               <th>{say("기울기/s", "Slope/s")}</th>
               <th>{say("가속도", "Accel.")}</th>
+              <th>EWMA</th>
               <th>TTF</th>
             </tr>
           </thead>
@@ -58,6 +58,7 @@ export function TimeSeriesDock({ detail, plant, t }: { detail: Detail; plant: Pl
                 <td>{m.inflection_at_ms ? signedSecs(m.inflection_at_ms, origin) : "-"}</td>
                 <td>{fixed(m.slope_per_sec_milli / 1000, 2)}</td>
                 <td>{fixed(m.accel_milli / 1000, 2)}</td>
+                <td>{fmt(m.ewma_milli / 1000)}</td>
                 <td>{m.estimated_ttf_secs !== null ? `${m.estimated_ttf_secs}s` : "-"}</td>
               </tr>
             ))}

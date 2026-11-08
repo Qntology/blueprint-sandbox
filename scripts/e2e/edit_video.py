@@ -932,7 +932,7 @@ CAP = {
                   "Time-machine replay from the origin", "Inflections light up upstream valve → pump discharge → superheater (SDS state transitions)"),
     "p2.charts": ("허브 Drop-up: CAM-02 시계열 · CAM-03 SDS 로직 차트", "재생 시각까지의 파형과 축별 SDS 판정", "Hub drop-up: CAM-02 time series · CAM-03 SDS logic chart", "Waveforms up to the replay time and per-axis SDS checks"),
     "p2.mining": ("프로세스 마이닝 — 흐름 · 병목 겹치기", "배관 유량 비율 · 병목 · 근본 원인 물결을 도면 위에", "Process mining — flow · bottleneck overlay", "Pipe flow ratios, bottlenecks and root-cause ripples on the drawing"),
-    "p2.lanes": ("마이닝 레인 — 단계별 체류 · 병목", "사건 대기열의 Gate 별 레인", "Mining lanes — per-gate dwell and bottlenecks", "Gate lanes in the incident queue"),
+    "p2.lanes": ("마이닝 레인 — 단계별 체류 · 병목", "파이프라인 카드마다 Gate 별 레인 건수 · 최대 대기", "Mining lanes — per-gate dwell and bottlenecks", "Gate lane counts and longest waits on each pipeline card"),
     "p2.mermaid": ("Mermaid 의 Δt 라벨", "인과 경로 간선에 전파 시차와 허용 범위가 붙습니다", "Δt labels in Mermaid", "Causal edges carry the propagation lag and its allowance"),
     "p2.mindmap": ("마인드맵 유리 핀", "변곡을 지난 노드에 시각 핀이 꽂힙니다", "Glass pins on the mind map", "Nodes past their inflection get a time pin"),
     "p2.stage3": ("Stage 3 — Gate 1~2 원장 대조", "신호 · 원장 · 보팅을 맞춰 봅니다", "Stage 3 — Gate 1~2 ledger check", "Signal, ledger and voting are cross-checked"),
@@ -941,7 +941,7 @@ CAP = {
     "p2.q_stuck": ("'{q}' → {code}", "{why}", "'{q}' → {code}", "{why}"),
     "p2.q_typo": ("오타 + 상태 — '{q}' → {code}", "{why}", "Typo + state — '{q}' → {code}", "{why}"),
     "p2.q_flow": ("수치 조건 — '{q}' → {code}", "{why}", "Numeric condition — '{q}' → {code}", "{why}"),
-    "p2.stage5": ("Stage 5 — 절차서 초안 · Factcheck · 결재", "고위험 조치(감발)가 든 AOP-103-FW02 라 파트장 공동 결재가 필요합니다", "Stage 5 — draft · factcheck · approval", "AOP-103-FW02 contains a high-risk action (load reduction), so a team-lead co-sign is required"),
+    "p2.stage5": ("Stage 5 — 절차서 초안 · Factcheck (결재는 오른쪽 결재 HUD)", "고위험 조치(감발)가 든 AOP-103-FW02 라 파트장 공동 결재가 필요합니다", "Stage 5 — draft · factcheck (approve in the right HUD)", "AOP-103-FW02 contains a high-risk action (load reduction), so a team-lead co-sign is required"),
     "p2.g3_rubber": ("가드레일 ① 공동 결재 없이 확정 → 차단 (G3_INTERCEPT_RUBBER_STAMP)", "{text}", "Guardrail ① confirm without co-sign → blocked (G3_INTERCEPT_RUBBER_STAMP)", "{text}"),
     "p2.reject": ("가드레일 ② 증빙 없이 반려 → 차단", "{text}", "Guardrail ② reject without evidence → blocked", "{text}"),
     "p2.g3_order": ("가드레일 ③ 선행 절차를 건너뛰고 확정 → 차단 (G3_INTERCEPT_INTERLOCK_ORDER)", "{text}", "Guardrail ③ skip prerequisite steps → blocked (G3_INTERCEPT_INTERLOCK_ORDER)", "{text}"),
@@ -955,7 +955,7 @@ CAP = {
     "p1.scan_done": ("원터치 대조 카드 — 스캔 조각 {crops}개", "SigLIP2 가 고른 조각을 gocr 가 읽어 칸을 채웠습니다. 카드마다 스캔 원문 조각이 붙습니다", "One-touch check cards — {crops} scan crops", "gocr read the crops SigLIP2 chose and filled the fields; each card shows its source crop"),
     "p1.stepper": ("장갑 스테퍼", "장갑을 낀 채 ±0.1 단추로 실측치를 고칩니다", "Glove stepper", "Adjust the reading with ±0.1 buttons while wearing gloves"),
     "p1.sign_line": ("서명을 한 획 직선으로", "서명 규칙: 획 2회 이상 · 면적 15% 이상 · 직선 아님", "A one-stroke straight-line signature", "Signature rule: 2+ strokes · 15%+ of the pad · not a straight line"),
-    "p1.g1_retry": ("가드레일 — 무효 서명 → 사건을 열지 않고 재서명 (G1_SIGN_INVALID_RETRY)", "{text}", "Guardrail — invalid signature → re-sign without opening a case (G1_SIGN_INVALID_RETRY)", "{text}"),
+    "p1.g1_retry": ("가드레일 — 서명 규칙 미달 → 보내기 전에 단말이 막고 다시 서명 (코어 G1 판정은 그대로)", "{text}", "Guardrail — signature below the rule → the terminal blocks sending and asks to re-sign (the core G1 check still applies)", "{text}"),
     "p1.excuse": ("편차 소명 화면", "중앙 계측값과 현장 실측치가 달라 소명을 받습니다 (내부 판정 코드 · 원장 수치는 보이지 않음)", "Deviation justification", "The central and field readings differ, so a justification is required (no internal codes or ledger values shown)"),
     "p1.free_text": ("자유 서술 소명 → Zoro-1 이 표준 코드로 분류", "현장 작업자가 쓴 글을 글쓰기 모델이 정규화합니다 (normalize_excuse)", "Free-text justification → Zoro-1 sorts it into a standard code", "The writer model normalizes what the field worker typed (normalize_excuse)"),
     "p1.sent": ("전송 → 접수 번호", "현장 보고가 콘솔의 현장 대기 사건에 붙고(attach_report) 다시 분석합니다", "Sent → receipt number", "The report attaches to the waiting incident (attach_report) and is re-analyzed"),
@@ -1262,7 +1262,7 @@ def build(story):
             S.model(8, p6, L("자유 서술 소명 → 표준 코드 (Zoro-1 글쓰기)", "Free-text justification → standard code (Zoro-1 writer)"), L("현장 글을 정해진 소명 코드 중 하나로 분류합니다. 코드 밖의 답은 받지 않습니다", "Sorts the field text into one of the fixed justification codes; anything else is rejected"),
                     writer_painter({"aop_id": "", "summary": e["detail"].get("text", ""), "numbers": [], "problems": [], "attempts": 1, "by_model": True}, e, L("지시문: 현장 소명 → 표준 코드", "Instruction: field justification → standard code")), "m.excuse", active={"zoro_w"})
     S.beats(p6, L("관제 콘솔", "Control console"), ["p1.unmask", "p1.kiosk_done"])
-    S.beats(p6, L("Stage 5 상세", "Stage 5 detail"), ["p2.stage5", "p2.g3_rubber", "p2.reject", "p2.g3_order", "p2.step2", "p2.step3", "p2.archive"])
+    S.beats(p6, L("결재 HUD", "Approval HUD"), ["p2.stage5", "p2.g3_rubber", "p2.reject", "p2.g3_order", "p2.step2", "p2.step3", "p2.archive"])
     for sid, note in (("P2", L("AOP-103-FW02 원인 진단 요약 (발전소)", "AOP-103-FW02 root-cause summary (power plant)")), ("D2", L("EOP-103-CDU02 원인 진단 요약 (데이터센터)", "EOP-103-CDU02 root-cause summary (data center)"))):
         det = S.snap(f"{sid}-detail-final") or S.snap(f"{sid}-detail")
         if det and det.get("analysis", {}).get("draft"):
@@ -1270,7 +1270,7 @@ def build(story):
             w = S.window(f"{sid.lower()}.inject" if sid == "P2" else "aidc.switch", f"{sid.lower()}.archive")
             ev = [e for e in S.trace.between(w[0], w[1], "zoro", "글쓰기") if "표준" not in e["detail"].get("system", "")] if w else []
             S.model(11, p6, note, L("같은 Zoro-1 몸통이 글쓰기로 바뀌어 도메인 용어로 씁니다", "The same Zoro-1 backbone switches to writing, in the domain's own terms"), writer_painter(dr, ev[-1] if ev else None, L("지시문: 도메인 전용 (발전소 AOP · 데이터센터 EOP)", "Instruction: domain-specific (power plant AOP · data center EOP)")), f"m.write.{sid}", active={"zoro_w"})
-    S.beats(p6, L("Stage 5 상세", "Stage 5 detail"), ["p4.g3_rubber", "p4.false_positive", "p4.cosign", "p4.archive", "d2.g3_order", "d2.interlock", "d2.archive", "d4.g3_rubber", "d4.archive", "end.queue"])
+    S.beats(p6, L("결재 HUD", "Approval HUD"), ["p4.g3_rubber", "p4.false_positive", "p4.cosign", "p4.archive", "d2.g3_order", "d2.interlock", "d2.archive", "d4.g3_rubber", "d4.archive", "end.queue"])
 
     # 요약
     rows = []
@@ -1334,16 +1334,53 @@ def render(segs, out, stills):
     print(f"written {out} · {total:.0f} s · {os.path.getsize(out) / 1e6:.1f} MB")
 
 
+#: 전처리 Off · On 비교 · 심볼 사전 장면이 읽는 측정 파일과 그것을 만드는 명령 (docs/verification.md 10.1 · README)
+PROBES = [
+    ("delta_pre_plant.json", r"run\windows\rocm.bat delta_probe out\delta_pre_plant.json --no-a0"),
+    ("delta_base_plant.json", r"run\windows\rocm.bat delta_probe out\delta_base_plant.json --no-a0 --no-ignore --no-chroma --no-align"),
+    ("delta_pre_aidc.json", r"run\windows\rocm.bat delta_probe out\delta_pre_aidc.json --no-a0 --domain aidc"),
+    ("delta_base_aidc.json", r"run\windows\rocm.bat delta_probe out\delta_base_aidc.json --no-a0 --domain aidc --no-ignore --no-chroma --no-align"),
+    ("delta_shift_align.json", r"run\windows\rocm.bat delta_probe out\delta_shift_align.json --no-a0 --shift 9x6"),
+    ("delta_shift_noalign.json", r"run\windows\rocm.bat delta_probe out\delta_shift_noalign.json --no-a0 --shift 9x6 --no-align"),
+    ("symbol_probe.json", r"run\windows\rocm.bat symbol_probe --save"),
+]
+
+
+def preflight(dirs):
+    """편집에 쓰는 입력이 다 있는지 먼저 봅니다. 없으면 그 장면이 말없이 빠지므로(예전 동작), 무엇이 없고 어떻게 만드는지 알립니다.
+    P3 조각 계획 장면은 첫 녹화 폴더의 모델 기록(trace.jsonl)에서 나오고, 델타 비교 · 심볼 장면도 그 장면 안에서 그려집니다."""
+    missing = []
+    for d in dirs:
+        if not os.path.exists(os.path.join(d, "timeline.json")):
+            missing.append((os.path.join(d, "timeline.json"), "node scripts/e2e/run.js --record --out <녹화 폴더>"))
+    if dirs and not os.path.exists(os.path.join(dirs[0], "trace.jsonl")):
+        missing.append((os.path.join(dirs[0], "trace.jsonl") + " (모델 장면 · P3 조각 계획 · 델타 비교 · 심볼)", "node scripts/e2e/run.js --record (모델 기록을 녹화 폴더에 남기게 앱을 띄움)"))
+    for name, cmd in PROBES:
+        if not os.path.exists(os.path.join(ROOT, "out", name)):
+            missing.append((os.path.join("out", name), cmd))
+    return missing
+
+
 def main():
     global LANG, TR
     ap = argparse.ArgumentParser()
     ap.add_argument("--lang", default="ko")
     ap.add_argument("--rec", action="append", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--allow-missing", action="store_true", help="빠진 입력이 있어도 그 장면을 빼고 편집합니다")
     a = ap.parse_args()
     LANG = a.lang
     TR = Translator(os.path.join(ROOT, "app", "src", "i18n", "en.json")) if LANG == "en" else (lambda s: s)
-    recs = [Rec(os.path.join(ROOT, r) if not os.path.isabs(r) else r) for r in a.rec]
+    dirs = [os.path.join(ROOT, r) if not os.path.isabs(r) else r for r in a.rec]
+    missing = preflight(dirs)
+    if missing:
+        print("[편집] 빠진 입력 (그 장면은 영상에서 빠집니다):")
+        for what, how in missing:
+            print(f"  - {what}\n      만들기: {how}")
+        if not a.allow_missing or any(w.endswith("timeline.json") for w, _ in missing):
+            print("[편집] 멈춥니다. 빠진 장면을 알고도 편집하려면 --allow-missing (녹화 폴더의 timeline.json 은 꼭 있어야 함)")
+            sys.exit(2)
+    recs = [Rec(d) for d in dirs]
     trace = Trace([os.path.join(r.dir, "trace.jsonl") for r in recs])
     # 판정 코드 → 이름 (verdict_catalog 스냅숏)
     catalog = {}

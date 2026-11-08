@@ -88,7 +88,7 @@ button.ov-pill:hover, .ov-pill[aria-expanded="true"] { background: var(--glass-s
 .view-pill .tab.active { color: #fff; background: #12305a; box-shadow: inset 0 0 0 1px var(--blue); }
 .mining-toggle { cursor: pointer; color: var(--muted); }
 .mining-toggle.on { color: #1a1205; background: rgba(240, 160, 32, 0.92); border-color: var(--amber); }
-.physics-open { border-color: rgba(240, 160, 32, 0.7); }
+.demo-pill { border-color: rgba(240, 160, 32, 0.7); }
 .settings-pill.auto { border-color: var(--green); }
 .breadcrumb { font-size: 11px; color: var(--text); }
 .crumb-title { color: var(--amber); margin-right: 6px; }
@@ -109,15 +109,17 @@ button.ov-pill:hover, .ov-pill[aria-expanded="true"] { background: var(--glass-s
 /* 사건 대기열 · 설정 팝오버 */
 .incident-popover { position: absolute; left: 12px; top: 48px; z-index: 25; width: 360px; max-height: calc(100% - 60px); display: flex; flex-direction: column; gap: 8px; }
 .settings-popover { position: absolute; right: 12px; top: 48px; z-index: 25; width: 460px; max-height: calc(100% - 60px); display: flex; flex-direction: column; gap: 8px; }
+/* 시연 · 시험 도구 팝오버 (시나리오 주입 · 물리엔진 · 세션 초기화): 설정에서 숨기면 알약도 사라집니다 */
+.demo-popover { position: absolute; right: 12px; top: 48px; z-index: 25; width: 400px; max-height: calc(100% - 60px); display: flex; flex-direction: column; gap: 8px; }
+.demo-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.demo-reset.armed { color: #fff; background: var(--red); border-color: var(--red); }
 /* 화면 언어 (한국어 · English): 백엔드 설정 파일에 남고 두 창이 함께 바뀝니다 */
 .lang-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); }
 .lang-row .domain-switch { height: 28px; }
+/* 도메인 이름은 길어(1.2GW 화력발전소 · 100MW AI 데이터센터) 설명 아래 줄에 단추를 둡니다 */
+.lang-row.domain-row { flex-direction: column; align-items: flex-start; }
+.domain-row .domain-switch { max-width: 100%; }
 .sim { padding: 5px 6px; color: var(--text); background: #2a2210; border: 1px solid var(--amber); border-radius: 4px; }
-.lane-line { display: flex; flex-wrap: wrap; gap: 4px; font-size: 11px; }
-.lane-chip { padding: 1px 7px; color: #c9d1e3; background: #1b2130; border: 1px solid var(--glass-line); border-radius: 10px; }
-.lane-chip b { color: #fff; }
-.lane-chip.hold { color: #1a1205; background: var(--yellow); border-color: var(--yellow); }
-.lane-chip.hold b { color: #1a1205; }
 .inline { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
 .inline input { padding: 4px 8px; width: 120px; color: var(--text); background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; }
 .inline.wide { flex: 1; }
@@ -249,6 +251,7 @@ button.ov-pill:hover, .ov-pill[aria-expanded="true"] { background: var(--glass-s
 .cmd-toast { display: flex; align-items: center; gap: 8px; padding: 5px 8px 5px 12px; font-size: 12px; color: var(--text); background: var(--glass-strong); backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur); border: 1px solid var(--glass-line); border-left: 3px solid var(--blue); border-radius: 8px; }
 .cmd-toast .toast-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cmd-toast .ov-close { margin-left: 0; }
+.cmd-toast .toast-action { flex-shrink: 0; white-space: nowrap; }
 .cmd-toast.ok { border-left-color: var(--green); }
 .cmd-toast.info { border-left-color: var(--yellow); }
 .cmd-toast.err { border-left-color: var(--red); color: #f0a5a5; }
@@ -333,10 +336,9 @@ button.ov-pill:hover, .ov-pill[aria-expanded="true"] { background: var(--glass-s
 
 /* A0 종합 도면 · 타일 (Part 8-4) */
 .a0-view { position: absolute; inset: 0; }
-.a0-sheet { position: absolute; overflow: hidden; background: #fff; border-radius: 4px; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.55); }
+.a0-sheet { position: absolute; overflow: hidden; transform-origin: 0 0; background: #fff; border-radius: 4px; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.55); }
 .a0-sheet.dark { background: #0d1320; }
-.a0-canvas { position: absolute; inset: 0; transform-origin: 0 0; transition: transform 0.35s ease; }
-.a0-canvas img { position: absolute; image-rendering: auto; }
+.a0-sheet img { position: absolute; image-rendering: auto; user-select: none; -webkit-user-drag: none; }
 .a0-tile { position: absolute; border: 1px dashed rgba(58, 160, 255, 0.55); cursor: zoom-in; }
 .a0-tile span { position: absolute; left: 4px; top: 2px; font: bold 13px/1 "Malgun Gothic", sans-serif; color: #1c5fa8; background: rgba(255, 255, 255, 0.8); padding: 1px 4px; border-radius: 3px; }
 .a0-tile.selected { background: rgba(58, 160, 255, 0.1); border: 2px solid #3aa0ff; }
@@ -348,7 +350,7 @@ button.ov-pill:hover, .ov-pill[aria-expanded="true"] { background: var(--glass-s
 .a0-eq.root { border-color: #ff4d4f; }
 .a0-eq.alarm { border-color: #ff9f43; }
 .a0-eq.hit { border-style: dashed; border-color: var(--yellow); }
-.a0-minimap { position: absolute; left: 12px; bottom: 12px; z-index: 6; display: grid; gap: 2px; padding: 6px; }
+.a0-minimap { position: absolute; left: 64px; bottom: 12px; z-index: 6; display: grid; gap: 2px; padding: 6px; }
 .a0-mini { padding: 2px 8px; font-size: 10px; color: #cbd5e1; background: #222938; border: 1px solid #364055; }
 .a0-mini.selected { border-color: #3aa0ff; color: #fff; }
 .a0-mini.root { background: #4a1d20; }
@@ -485,6 +487,8 @@ button.big { padding: 20px 40px; font-size: 21px; border-radius: 8px; }
 .theme-field .chip { color: #1f2328; background: #f3f5f8; border-color: #c8ced6; font-size: 13px; padding: 4px 10px; }
 .theme-field .chip.active { border-color: #0b6bcb; color: #0b6bcb; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+.form-grid .more-field { align-self: end; justify-self: start; font-size: 14px; }
+.kind-switch { align-items: center; }
 .form-grid label { display: flex; flex-direction: column; gap: 5px; font-size: 14px; color: #5b6573; }
 .form-grid input { font-size: 18px; padding: 9px 11px; color: #1f2328; border: 1px solid #c8ced6; border-radius: 6px; }
 .from-scan { margin-left: 8px; font-style: normal; font-size: 12px; color: #1d7f3f; }
@@ -518,8 +522,14 @@ button.big { padding: 20px 40px; font-size: 21px; border-radius: 8px; }
 .interlock.compact .il-step { padding: 4px 6px; margin-top: 4px; font-size: 12px; }
 .interlock.compact .il-input input { width: 110px; }
 .quick-approval { display: flex; flex-direction: column; gap: 6px; }
+.quick-approval .qa-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.quick-approval .qa-draft { flex-shrink: 0; white-space: nowrap; }
 .quick-steps { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: #c9d1e3; }
+.quick-approval .actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .quick-approval .actions button { padding: 6px 10px; font-size: 12px; }
+.quick-approval .qa-more { display: flex; flex-direction: column; gap: 6px; padding: 6px; background: #121722; border: 1px solid var(--line); border-radius: 6px; }
+.quick-approval .qa-more .field input { width: 100%; }
+.quick-approval .qa-tests { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding-top: 4px; border-top: 1px dashed rgba(140, 160, 195, 0.25); font-size: 11px; }
 
 /* 다중 이슈 분해 트리 (Part 8-6) */
 .issues { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; padding: 8px; background: #141925; border: 1px solid var(--line); border-left: 4px solid #59606e; border-radius: 6px; }

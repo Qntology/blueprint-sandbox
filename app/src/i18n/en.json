@@ -1277,6 +1277,22 @@
    "bottleneck loss: "
   ],
   [
+   "블록 (\\d+)\\.\\.(\\d+) 묶음 (\\d+) MB 를 올리면 가중치 예산 (\\d+) MB 를 넘습니다 \\(지금 (\\d+) MB 상주\\)",
+   "loading blocks $1..$2 ($3 MB) would exceed the weight budget of $4 MB ($5 MB resident)"
+  ],
+  [
+   "비전 묶음 (\\d+) MB 를 올리면 가중치 예산 (\\d+) MB 를 넘습니다 \\(지금 (\\d+) MB 상주\\)",
+   "loading the vision group ($1 MB) would exceed the weight budget of $2 MB ($3 MB resident)"
+  ],
+  [
+   "출력 묶음 (\\d+) MB 를 올리면 가중치 예산 (\\d+) MB 를 넘습니다 \\(지금 (\\d+) MB 상주\\)",
+   "loading the output group ($1 MB) would exceed the weight budget of $2 MB ($3 MB resident)"
+  ],
+  [
+   "블록 (\\d+)\\.\\.(\\d+) 묶음은 장치 메모리 (\\d+) MB 가 필요한데 여유가 (\\d+) MB 뿐입니다 \\(여유분 (\\d+) MB 포함\\)\\. 같은 GPU 를 쓰는 다른 프로그램을 닫거나 BLUEPRINT_ZORO_STREAM_BLOCKS 로 구간을 줄이세요",
+   "blocks $1..$2 need $3 MB of device memory but only $4 MB is free (including $5 MB headroom). Close other programs using the same GPU or reduce the span with BLUEPRINT_ZORO_STREAM_BLOCKS"
+  ],
+  [
    "블록 (\\d+)\\.\\.(\\d+)",
    "blocks $1..$2"
   ],

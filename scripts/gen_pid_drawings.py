@@ -1162,12 +1162,24 @@ def main():
         return
     global CFG, LANG
     args = sys.argv[1:]
-    if len(args) >= 2 and args[0] == "--lang":
-        LANG = args[1]
-        args = args[2:]
-    if len(args) >= 2 and args[0] == "--domain":
-        CFG = DOMAINS[args[1]]
-        args = args[2:]
+
+    # --lang · --domain 은 어느 순서로 와도 됩니다. 예전에는 --lang 이 앞이어야 해서, 거꾸로 쓰면 남은 인자가 출력 폴더 이름이 됐습니다.
+    def take(name):
+        if name in args:
+            i = args.index(name)
+            if i + 1 >= len(args):
+                sys.exit(f"{name} 뒤에 값이 필요합니다")
+            value = args[i + 1]
+            del args[i : i + 2]
+            return value
+        return None
+
+    lang = take("--lang")
+    if lang:
+        LANG = lang
+    domain = take("--domain")
+    if domain:
+        CFG = DOMAINS[domain]
     if LANG == "en":
         # 영어 화면용 마스터만 (그림만: 배관 · 심볼 좌표와 판독 정답은 한국어 마스터의 JSON 이 그대로 맞습니다)
         masters = args[0] if len(args) > 0 else os.path.join(ROOT, "core", "fixtures", "drawings", "en")

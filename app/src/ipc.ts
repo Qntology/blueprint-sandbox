@@ -10,7 +10,11 @@ const RAW = new Set(["drawing_image", "get_language", "set_language"]);
 /** 응답에서 번역하지 않고 그대로 두는 칸: 현장 서류를 읽은 값(점검자 이름 등)은 그대로 다시 백엔드로 가고, 스캔 원문은 서류 그대로 보여야 합니다 */
 const KEEP: Record<string, string[]> = { scan_field_documents: ["prefill", "raw"] };
 
+/** 명령별 호출 수 (E2E · 개발 확인용, `window.__ipcCalls`). 화면이 백엔드를 얼마나 자주 부르는지 잽니다. */
+const calls: Record<string, number> = ((window as unknown as { __ipcCalls?: Record<string, number> }).__ipcCalls ??= {});
+
 export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  calls[cmd] = (calls[cmd] ?? 0) + 1;
   try {
     const r = await rawInvoke<T>(cmd, args);
     if (RAW.has(cmd)) return r;

@@ -70,14 +70,11 @@ export function PhysicsPanel({ plant, supervisor, automation, onOpenIncident }: 
     invoke<PhysicsStatus>("physics_status")
       .then(setSt)
       .catch(() => {});
+  // 시뮬레이터가 돌면 백엔드가 0.5초마다 physics_update 를 보냅니다. 그 알림만 듣습니다 (예전에는 1초 폴링도 함께 돌았음).
   useEffect(() => {
     void load();
-    const timer = window.setInterval(load, 1000);
     const stop = listen("physics_update", () => void load());
-    return () => {
-      window.clearInterval(timer);
-      void stop.then((f) => f());
-    };
+    return () => void stop.then((f) => f());
   }, []);
 
   const call = async (cmd: string, args: Record<string, unknown> = {}) => {

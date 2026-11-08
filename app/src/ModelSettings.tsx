@@ -1,6 +1,6 @@
 import { invoke } from "./ipc";
 import { listen } from "./ipc";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useT } from "./i18n";
 import { tr } from "./i18n/lang";
 
@@ -79,11 +79,15 @@ export function ModelSettings({ open, onOpen }: { open: boolean; onOpen: () => v
     [refresh],
   );
 
+  // 듣기 · 모델 확인(ensure_models)은 처음 한 번만 합니다. 예전에는 넘겨받은 onOpen 이 콘솔을 그릴 때마다 새 함수라
+  // 이 효과가 렌더마다 다시 돌아, 가만히 있어도 분당 30번 남짓 · 재생 중에는 프레임마다 모델 폴더를 다시 훑었습니다.
+  const onOpenRef = useRef(onOpen);
+  onOpenRef.current = onOpen;
   useEffect(() => {
     const stops = [
       listen<Alert>("app_error_alert", (e) => {
         if (e.payload.action !== "open_settings") return setError(e.payload.message);
-        onOpen();
+        onOpenRef.current();
         if (e.payload.model) run("download_model", { modelName: e.payload.model });
       }),
       listen<{ model: string; percent: number; message: string }>("download_progress", (e) => {
@@ -96,7 +100,7 @@ export function ModelSettings({ open, onOpen }: { open: boolean; onOpen: () => v
     // 듣기 시작한 뒤에 물어야 알림을 놓치지 않습니다.
     Promise.all(stops).then(() => invoke("ensure_models")).catch((e) => setError(String(e))).finally(refresh);
     return () => void stops.forEach((s) => s.then((f) => f()));
-  }, [onOpen, refresh, run]);
+  }, [refresh, run]);
 
   if (!open) return null;
   const models = report?.models ?? [];

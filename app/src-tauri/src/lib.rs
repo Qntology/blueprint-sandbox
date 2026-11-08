@@ -277,7 +277,8 @@ fn notify_field(app: &AppHandle) {
     let _ = app.emit_to(FIELD, "field_state", json!({ "ready": engine_ready() && loaded }));
 }
 
-#[tauri::command]
+// 모델 폴더를 훑는 명령은 메인(창) 스레드를 막지 않게 비동기로 돕니다 (동기 명령은 Tauri 2 에서 메인 스레드에서 돎).
+#[tauri::command(async)]
 fn check_model_status(window: Window, jobs: State<'_, Jobs>) -> Result<ModelReport, String> {
     console_only(&window)?;
     let jobs = jobs.lock();
@@ -318,7 +319,7 @@ fn import_model(window: Window, app: AppHandle, model_name: String) -> Result<St
 }
 
 /// 없는 모델은 먼저 가져올 곳에서 가져오고, 그래도 없으면 설정을 열고 내려받으라고 알립니다 (검색용 모델은 선택이라 알리지 않음).
-#[tauri::command]
+#[tauri::command(async)]
 fn ensure_models(window: Window, app: AppHandle) -> Result<(), String> {
     console_only(&window)?;
     let mut search_changed = false;
@@ -1206,6 +1207,22 @@ fn switch_domain_mode(window: Window, app: AppHandle, desk: State<'_, Desk>, mod
     if *lock(&desk.domain) == mode {
         return Ok(domain_dto(&desk));
     }
+    reset_domain(&app, &desk, mode)
+}
+
+/// 지금 도메인을 처음 상태로 되돌립니다 (콘솔 창 전용, UI 단순화 P9): 진행 · 보관 사건 · 감사 기록 · 자동화 모드 · 물리엔진 · 현장 단말 대기.
+/// 앱을 다시 띄우지 않고(모델을 다시 열지 않고) E2E · 시연을 새로 시작합니다. 원장 · 시나리오 · 마스터 도면 색인은 같은 것이라 그대로 씁니다.
+#[tauri::command(async)]
+fn reset_session(window: Window, app: AppHandle, desk: State<'_, Desk>) -> Result<DomainDto, String> {
+    console_only(&window)?;
+    let mode = *lock(&desk.domain);
+    reset_domain(&app, &desk, mode)
+}
+
+/// 원장 · 시나리오를 `mode` 것으로 갈아 끼우고 진행 상태를 모두 비웁니다 (도메인 전환 · 세션 초기화).
+/// 도메인이 바뀔 때만 마스터 도면 델타 색인을 새로 만듭니다.
+fn reset_domain(app: &AppHandle, desk: &Desk, mode: DomainMode) -> Result<DomainDto, String> {
+    let changed = *lock(&desk.domain) != mode;
     let db = Lattice::embedded_for(mode).map_err(|e| format!("{e:#}"))?;
     let set = ScenarioSet::embedded_for(mode).map_err(|e| format!("{e:#}"))?;
     {
@@ -1221,23 +1238,25 @@ fn switch_domain_mode(window: Window, app: AppHandle, desk: State<'_, Desk>, mod
     *lock(&desk.field_case) = None;
     lock(&desk.field_scans).clear();
     *lock(&desk.field_timings) = None;
-    *lock(&desk.masters) = None;
-    // 새 도메인 마스터 도면 다섯 장으로 델타 색인을 다시 만듭니다 (모델이 열려 있을 때, 뒤에서 1 ~ 2 초).
-    if let Some(reader) = lock(&desk.reader).clone() {
-        let app2 = app.clone();
-        std::thread::spawn(move || {
-            let desk = app2.state::<Desk>();
-            match index_masters(&desk, &reader) {
-                // 색인하는 동안 다시 바뀌었으면 버립니다.
-                Ok(set) if *lock(&desk.domain) == mode => *lock(&desk.masters) = Some(Arc::new(set)),
-                Ok(_) => {}
-                Err(e) => eprintln!("[델타] {} 마스터 도면을 색인하지 못했습니다 (Red-line 은 전부 읽음): {e:#}", mode.label()),
-            }
-        });
+    if changed {
+        *lock(&desk.masters) = None;
+        // 새 도메인 마스터 도면 다섯 장으로 델타 색인을 다시 만듭니다 (모델이 열려 있을 때, 뒤에서 1 ~ 2 초).
+        if let Some(reader) = lock(&desk.reader).clone() {
+            let app2 = app.clone();
+            std::thread::spawn(move || {
+                let desk = app2.state::<Desk>();
+                match index_masters(&desk, &reader) {
+                    // 색인하는 동안 다시 바뀌었으면 버립니다.
+                    Ok(set) if *lock(&desk.domain) == mode => *lock(&desk.masters) = Some(Arc::new(set)),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[델타] {} 마스터 도면을 색인하지 못했습니다 (Red-line 은 전부 읽음): {e:#}", mode.label()),
+                }
+            });
+        }
     }
-    let dto = domain_dto(&desk);
+    let dto = domain_dto(desk);
     let _ = app.emit("domain_changed", json!({ "mode": mode, "label": mode.label() }));
-    notify_console(&app);
+    notify_console(app);
     Ok(dto)
 }
 
@@ -1763,6 +1782,7 @@ pub fn run() {
             verdict_catalog,
             domain_info,
             switch_domain_mode,
+            reset_session,
             get_language,
             set_language,
             field_ready,

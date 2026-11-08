@@ -19,7 +19,8 @@ function Section({ title, open, onToggle, children, sectionRef }: { title: React
 }
 
 /** 우측 통합 병목 · 결재 HUD (개선안 3단계 2번 → 2차 개선안: noto-sandbox `.unit-hud` 처럼 도면 위에 뜬 반투명 유리 판).
- *  병목 배지 → 인터록 신호등 게이트 → 표준 조치 · 결재 → 선택 설비가 아코디언으로 이어지고, [접기 ▸] 로 제목 줄만 남깁니다.
+ *  병목 배지 → 인터록 신호등 게이트 → 결재 → 선택 설비가 아코디언으로 이어지고, [접기 ▸] 로 제목 줄만 남깁니다.
+ *  결재 · 인터록 입력은 이 HUD 한 곳에서만 합니다 (Stage 5 서랍은 초안 · 대조 읽기 전용, UI 단순화 U1).
  *  CCTV 말풍선의 [📋 인터록 이동] 은 `focus` 를 올려 인터록 칸을 펴고 그 자리로 옮깁니다. */
 export function RightRail(props: {
   plant: Plant | null;
@@ -30,15 +31,15 @@ export function RightRail(props: {
   t: number | null;
   catalog: Record<string, VerdictInfo>;
   supervisor: string;
-  onDecided: (m: string) => void;
-  onOpenApproval: () => void;
+  demo: boolean;
+  onDecided: (m: string, ok: boolean, finalized: boolean) => void;
+  onOpenDraft: () => void;
   bottlenecks: Bottleneck[];
   folded: boolean;
   onFold: (folded: boolean) => void;
   focus: number;
-  ttf: string | null;
 }) {
-  const { plant, detail, selected, onSelect, onPick, t, catalog, supervisor, onDecided, onOpenApproval, bottlenecks, folded, onFold, focus, ttf } = props;
+  const { plant, detail, selected, onSelect, onPick, t, catalog, supervisor, demo, onDecided, onOpenDraft, bottlenecks, folded, onFold, focus } = props;
   const say = useT();
   const [open, setOpen] = useState({ bottleneck: true, approval: true, equipment: true });
   const [flash, setFlash] = useState(false);
@@ -65,7 +66,6 @@ export function RightRail(props: {
         <span className="hud-sum">
           {bottlenecks.length ? say(`🚨 병목 ${bottlenecks.length}건`, `🚨 ${bottlenecks.length} bottlenecks`) : say("병목 없음", "No bottlenecks")}
           {pending ? ` · 🔒 Step ${pending.no}` : ""}
-          {ttf ? ` · ${ttf}` : ""}
         </span>
         <button className="bh-toggle" onClick={() => onFold(!folded)} aria-expanded={!folded} title={folded ? say("결재 HUD 펼치기", "Expand the approval HUD") : say("결재 HUD 접기 (도면 오른쪽을 넓게)", "Fold the approval HUD (widen the drawing)")}>
           {folded ? say("◂ 펼치기", "◂ Expand") : say("접기 ▸", "Fold ▸")}
@@ -97,8 +97,8 @@ export function RightRail(props: {
           {detail && (
             <Section title={say(`🚦 인터록 게이트 · 결재${pending ? ` (🔒 Step ${pending.no})` : ""}`, `🚦 Interlock Gate · Approval${pending ? ` (🔒 Step ${pending.no})` : ""}`)} open={open.approval} onToggle={() => toggle("approval")} sectionRef={interlock}>
               <div className={flash ? "flash" : ""}>
-                <InterlockPanel detail={detail} supervisor={supervisor} onChanged={onDecided} compact />
-                <QuickApproval detail={detail} supervisor={supervisor} onDecided={onDecided} onOpenDetail={onOpenApproval} />
+                <InterlockPanel detail={detail} supervisor={supervisor} onChanged={(m) => onDecided(m, true, false)} compact />
+                <QuickApproval detail={detail} supervisor={supervisor} demo={demo} onDecided={onDecided} onOpenDraft={onOpenDraft} />
               </div>
             </Section>
           )}

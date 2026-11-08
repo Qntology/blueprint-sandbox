@@ -1,7 +1,7 @@
 // 실제 앱의 주제어실 콘솔 · 현장 단말 두 창을 끝까지 돌립니다 (zoro-gravity 의 l4.js 와 같은 방식).
 //
-//   npm i --no-save playwright-core@1.55.0
-//   node scripts/e2e/console.js [--shots 폴더] [--only P2,P1,P3] [--lang en] [--audit]
+//   node scripts/e2e/run.js [console.js 인자]      앱 띄우기 · 엔진 대기 · 앱 내리기까지 한 줄 (권장)
+//   node scripts/e2e/console.js [--shots 폴더] [--only P2,P1,P3] [--lang en] [--audit]   앱을 따로 띄워 둔 경우
 //
 // --lang en  설정 팝오버에서 화면 언어를 English 로 바꾸고 영어 화면으로 같은 흐름을 돕니다 (질의도 영어로 칩니다).
 //            스크린샷마다 화면에 남은 한글 줄을 모아 <shots>/i18n_visible.json 에 남깁니다 (번역 표에 없는 글).
@@ -10,28 +10,29 @@
 // 흐름: 발전소 P2 · P1 · P3 · P3F · P4 · A0 · SEARCH · PHYS, CCTV 관제판 CCTV, 도메인 전환 뒤 AI 데이터센터 AIDC(전환) · D2 · D1 · D3 · D3F · D4 ·
 // DPHYS, 그리고 PLANT(발전소로 되돌림). 기본은 전부 차례로 돕니다.
 //
-// 앱은 먼저 띄워 둡니다. WebView2 에 디버그 포트를 열고, 스캐너 폴더를 같은 값으로 줍니다.
+// UI 단순화 뒤의 화면 (docs/ui-simplify-plan.md): 결재는 오른쪽 결재 HUD 한 곳, 시나리오 주입 · 물리엔진은 우상단 🧪 시연 판,
+// 도메인 전환은 설정 팝오버, 확정 뒤 보관 문서는 허브 알림의 [보관 문서 열기], 단계 카드는 Stage 1 · 2 를 한 칸으로.
+// 앱 다루기(선택자 · 판 여닫기)는 scripts/e2e/lib.js 에서 record.js 와 함께 씁니다.
+//
+// 앱을 따로 띄울 때: WebView2 에 디버그 포트를 열고, 스캐너 폴더를 같은 값으로 줍니다.
 //   WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222
 //   BLUEPRINT_SCANNER_DIR=<폴더>
-// 현장 스캔 이미지는 `python scripts/gen_pid_drawings.py` 가 out/field 에 만듭니다.
-const { chromium } = require("playwright-core");
+// 현장 스캔 이미지는 `python scripts/gen_pid_drawings.py` (+ `--domain aidc`)가 out/field 에 만듭니다.
 const fs = require("fs");
 const path = require("path");
+const { make, ROOT } = require("./lib");
 
-const ROOT = path.resolve(__dirname, "../..");
-const SCAN_DIR = process.env.BLUEPRINT_SCANNER_DIR;
 const args = process.argv.slice(2);
 const flag = (name) => {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : null;
 };
-const SHOTS = flag("--shots") || path.join(ROOT, "out", "shots");
+const SHOTS = path.resolve(ROOT, flag("--shots") || path.join("out", "shots"));
 const ONLY = (flag("--only") || "P2,P1,P3,P3F,P4,A0,SEARCH,PHYS,CCTV,AIDC,D2,D1,D3,D3F,D4,DPHYS,PLANT").split(",");
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const EN = flag("--lang") === "en";
 const AUDIT = args.includes("--audit");
-/** 화면 글 (한국어 화면, 영어 화면) */
-const L = (ko, en) => (EN ? en : ko);
+const app = make({ en: EN });
+const { L, sleep, waitText, stage, closeDrawer, openArchive, inject, openIncident, clickQueueItem, placeScan, fieldReset, tidy, deselect, cosign, confirm, tryGuard, interlockValue, interlockRadio, openPopover } = app;
 /** 영어 화면에서 스크린샷마다 모은 한글 줄 (창 · 장면별) */
 const visible = {};
 // 현장 단말 화면에 나오면 안 되는 내부 정보 (core/src/privacy.rs FIELD_FORBIDDEN).
@@ -44,46 +45,6 @@ const results = [];
 
 function assert(cond, message) {
   if (!cond) throw new Error(message);
-}
-
-async function connect() {
-  for (let i = 0; i < 150; i++) {
-    try {
-      return await chromium.connectOverCDP("http://127.0.0.1:9222");
-    } catch {
-      await sleep(2000);
-    }
-  }
-  throw new Error("CDP 연결 시간 초과");
-}
-
-async function pages(browser) {
-  for (let i = 0; i < 150; i++) {
-    const all = browser.contexts().flatMap((c) => c.pages());
-    let consolePage = null;
-    let fieldPage = null;
-    for (const p of all) {
-      const text = await p.evaluate(() => document.body.innerText).catch(() => "");
-      // 콘솔 제목 · 단말 머리는 도메인마다 다릅니다 (발전소 관제 콘솔 · AI 데이터센터 자율 관제 콘솔).
-      if ((text.includes("관제 콘솔") && text.includes("공간 Depth")) || (text.includes("Control Console") && text.includes("Spatial Depth"))) consolePage = p;
-      if (text.includes("Field Patrol Kiosk")) fieldPage = p;
-    }
-    if (consolePage && fieldPage) return { consolePage, fieldPage };
-    await sleep(2000);
-  }
-  throw new Error("두 창을 찾지 못했습니다");
-}
-
-/** 설정 팝오버의 화면 언어 단추로 언어를 고르고, 두 창이 그 언어로 바뀔 때까지 기다립니다. */
-async function setLanguage(c, f, lang) {
-  const now = await c.evaluate(() => document.documentElement.lang);
-  if (now !== lang) {
-    await c.locator(".settings-pill").click();
-    await c.locator(`.settings-popover [data-lang="${lang}"]`).click();
-    await c.locator(".settings-popover .ov-close").click();
-  }
-  for (const p of [c, f]) await p.waitForFunction((l) => document.documentElement.lang === l, lang, { timeout: 30000 });
-  await sleep(1500);
 }
 
 async function shot(page, name) {
@@ -101,80 +62,11 @@ async function noLeak(page, where) {
   assert(found.length === 0, `현장 단말에 내부 정보가 보입니다 (${where}): ${found.join(", ")}`);
 }
 
-async function waitText(page, text, timeout = 240000) {
-  await page.waitForFunction((t) => document.body.innerText.includes(t), text, { timeout });
-}
-
-// 2차 개선안(풀스크린 오버레이): 사건 대기열 · 시뮬레이터는 좌상단 [🚨 사건 대기열] 알약의 팝오버 안에 있습니다.
-async function openQueue(page) {
-  if (await page.locator("#incident-popover").isHidden()) await page.locator(".queue-pill").click();
-  await page.locator("#incident-popover").waitFor({ state: "visible", timeout: 10000 });
-}
-
-async function closeQueue(page) {
-  if (await page.locator("#incident-popover").isVisible()) await page.locator("#incident-popover .ov-close").click();
-}
-
-async function inject(page, id) {
-  await openQueue(page);
-  await page.selectOption("select.sim", id);
-}
-
-// 시나리오 주입은 끝나면 새 사건을 스스로 고르고 팝오버를 닫습니다. 그 전에 목록에 뜨면 E2E 가 누릅니다 (어느 쪽이 먼저든 같은 사건).
-async function openIncident(page, scenario) {
-  const end = Date.now() + 240000;
-  while (Date.now() < end) {
-    if ((await page.locator(`main.console[data-scenario="${scenario}"]`).count()) > 0) break;
-    await openQueue(page).catch(() => {});
-    const item = page.locator(".queue-item", { hasText: `${scenario} · ` }).first();
-    if (await item.isVisible().catch(() => false)) await item.click({ timeout: 3000 }).catch(() => {});
-    await sleep(1500);
-  }
-  assert((await page.locator(`main.console[data-scenario="${scenario}"]`).count()) > 0, `${scenario} 사건을 열지 못했습니다`);
-  await closeQueue(page);
-  await sleep(1500);
-}
-
-async function clickQueueItem(page, text) {
-  await openQueue(page);
-  const item = page.locator(".queue-item", { hasText: text }).first();
-  await item.waitFor({ timeout: 240000 });
-  await item.click();
-  await closeQueue(page);
-  await sleep(1500);
-}
-
-async function stage(page, n) {
-  await page.locator(".stage-card").nth(n - 1).click();
-  await sleep(800);
-}
-
-async function closeDrawer(page) {
-  await page.locator(".drawer header button", { hasText: L("닫기", "Close") }).click();
-}
-
-// 확정하면 콘솔이 보관 문서 서랍을 스스로 엽니다. 열린 뒤에 닫아야 다음 흐름의 클릭을 가리지 않습니다.
-async function closeArchive(page) {
-  await waitText(page, L("보관 문서", "Archived Record"), 30000);
-  await closeDrawer(page);
-}
-
-function placeScan(file) {
-  assert(SCAN_DIR, "BLUEPRINT_SCANNER_DIR 를 주세요");
-  fs.mkdirSync(SCAN_DIR, { recursive: true });
-  fs.copyFileSync(path.join(ROOT, "out", "field", file), path.join(SCAN_DIR, file));
-}
-
-// 앞 흐름이 어느 화면에서 멈췄든 첫 화면으로 되돌립니다 (소명 화면에는 "처음으로" 가 없고 "이전 화면" 만 있습니다).
-async function fieldReset(page) {
-  for (const label of L(["이전 화면", "처음으로"], ["Back", "Start Over"])) {
-    const button = page.locator("button", { hasText: label }).first();
-    if (await button.count()) {
-      await button.click();
-      await sleep(500);
-    }
-  }
-  await page.locator("button", { hasText: L("도면/계기 스캔", "Scan Drawing/Gauge") }).first().waitFor({ timeout: 30000 });
+/** 결재 HUD 의 [조치확정] 이 풀릴 때까지 (막힘: 현장 대기 · 선행 절차 · 공동 결재) */
+async function confirmed(c) {
+  await c.locator(".approval-hud .quick-approval button.confirm:not([disabled])").waitFor({ timeout: 60000 });
+  await confirm(c);
+  await waitText(c, L("확정했습니다", "Confirmed ("));
 }
 
 async function p2(c) {
@@ -186,43 +78,46 @@ async function p2(c) {
   await shot(c, "P2-2-mermaid");
   await c.locator(".tab", { hasText: L("마인드맵", "Mind Map") }).click();
   await sleep(2500);
-  await shot(c, "P2-3-mindmap");
-  await c.locator(".mining-toggle input").check();
-  await sleep(2500);
-  await shot(c, "P2-4-mindmap-mining");
+  // 흐름 · 병목 겹치기는 기본으로 켜져 있습니다. 끈 도면을 한 번 찍고 다시 켭니다 (뒤 흐름이 기본 상태로 돌게).
+  const mining = c.locator(".mining-toggle input");
+  assert(await mining.isChecked(), "흐름 · 병목 오버레이가 기본으로 켜져 있어야 합니다");
+  await shot(c, "P2-3-mindmap-mining");
   await c.locator(".tab", { hasText: "P&ID" }).click();
   await sleep(1500);
-  await shot(c, "P2-5-drawing-mining");
-  await c.locator(".mining-toggle input").uncheck();
+  await shot(c, "P2-4-drawing-mining");
+  await mining.uncheck();
+  await sleep(800);
+  await shot(c, "P2-5-drawing-plain");
+  await mining.check();
   await stage(c, 4);
   await shot(c, "P2-6-stage4");
   await closeDrawer(c);
-  await c.locator("button", { hasText: L("시계열 · SDS 분석기", "Time-series · SDS Analyzer") }).click();
-  await sleep(800);
+  // 시계열 · SDS: 허브 Drop-up 하나 (예전 SDS 분석기 서랍과 합침)
+  await c.locator(".charts-toggle").click();
+  await c.locator(".telemetry-dropup").waitFor({ timeout: 10000 });
   await shot(c, "P2-7-sds");
-  await closeDrawer(c);
+  await c.locator(".telemetry-dropup .ov-close").click();
+  // Stage 5 서랍은 초안 · Factcheck 읽기 전용, 결재는 오른쪽 HUD 하나
   await stage(c, 5);
-  await c.locator("button", { hasText: L("공동 결재 없이 확정 시도", "without co-sign") }).click();
+  await shot(c, "P2-7b-stage5-draft");
+  await closeDrawer(c);
+  await tryGuard(c, "cosign");
   await waitText(c, L("차단", "blocked"));
   await shot(c, "P2-8-rubber-stamp");
   // 선행 절차 인터록 (Part 8-4): Step 1 은 DCS 값으로 통과, Step 2 (바이패스 개방) 가 남아 확정이 잠깁니다.
-  // 오른쪽 통합 결재창에도 같은 신호등 게이트가 있어서 서랍 안의 것을 고릅니다.
-  await c.locator(".drawer label.check", { hasText: L("공동 결재", "co-sign") }).locator("input").check();
-  await c.locator(".drawer button", { hasText: L("선행 절차를 건너뛰고 확정 시도", "without prerequisite steps") }).click();
-  await waitText(c, "Step 2");
+  await cosign(c);
+  await tryGuard(c, "order");
+  await waitText(c, L("먼저 끝내야 확정", "before confirming"));
   await shot(c, "P2-8b-interlock-blocked");
-  await c.locator(".drawer .il-step", { hasText: "Step 2" }).locator("input").fill("65");
-  await c.locator(".drawer .il-step", { hasText: "Step 2" }).locator("button", { hasText: L("현장 값 확인", "Check field value") }).click();
+  await interlockValue(c, 2, 65);
   await waitText(c, L("남은 선행 절차: Step 3", "Remaining prerequisite steps: Step 3"));
-  await c.locator(".drawer .il-step", { hasText: "Step 3" }).locator("button", { hasText: L("무전 확인", "radio confirmation") }).click();
+  await interlockRadio(c, 3);
   await waitText(c, L("모두 확인", "prerequisite steps confirmed"));
   await sleep(800);
   await shot(c, "P2-8c-interlock-done");
-  const cosign = c.locator(".drawer label.check", { hasText: L("공동 결재", "co-sign") }).locator("input");
-  if (!(await cosign.isChecked())) await cosign.check();
-  await c.locator(".drawer button", { hasText: L("조치확정", "Confirm Action") }).click();
-  await waitText(c, L("확정했습니다", "Confirmed ("));
-  await waitText(c, L("보관 문서", "Archived Record"), 30000);
+  await cosign(c);
+  await confirmed(c);
+  await openArchive(c);
   await shot(c, "P2-9-approved");
   await closeDrawer(c);
   results.push({ id: "P2", ok: true });
@@ -247,15 +142,13 @@ async function p1(c, f) {
   await f.locator("button", { hasText: L("소명 포함 전송하기", "Send with Justification") }).click();
   await waitText(f, L("접수 번호", "Receipt No."));
   await noLeak(f, "전송");
-  await sleep(1500);
+  // 현장 회신이 오면 콘솔이 허브에 도착 알림을 띄웁니다
+  await waitText(c, L("현장 보고 도착", "Field report received"), 60000);
   await openIncident(c, "P1");
   await stage(c, 3);
   await shot(c, "P1-4-stage3-truth");
   await closeDrawer(c);
-  await stage(c, 5);
-  await c.locator(".drawer button", { hasText: L("조치확정", "Confirm Action") }).click();
-  await waitText(c, L("확정했습니다", "Confirmed ("));
-  await closeArchive(c);
+  await confirmed(c);
   await waitText(f, L("처리가 끝났습니다", "Processing complete"), 60000);
   await noLeak(f, "확정 안내");
   await shot(f, "P1-5-field-finished");
@@ -282,10 +175,7 @@ async function p3(c, f, forged) {
   await shot(c, `${id}-3-stage3`);
   await closeDrawer(c);
   if (!forged) {
-    await stage(c, 5);
-    await c.locator(".drawer button", { hasText: L("조치확정", "Confirm Action") }).click();
-    await waitText(c, L("확정했습니다", "Confirmed ("));
-    await closeArchive(c);
+    await confirmed(c);
     await waitText(f, L("반영되었습니다", "was applied"), 60000);
     await shot(f, `${id}-4-field-finished`);
   }
@@ -301,38 +191,16 @@ async function p4(c) {
   await closeDrawer(c);
   await stage(c, 5);
   await shot(c, "P4-2-stage5");
-  await c.locator(".drawer label.check", { hasText: L("공동 결재", "co-sign") }).locator("input").check();
-  await c.locator(".drawer button", { hasText: L("조치확정", "Confirm Action") }).click();
-  await waitText(c, L("확정했습니다", "Confirmed ("));
-  await waitText(c, L("보관 문서", "Archived Record"), 30000);
+  await closeDrawer(c);
+  await cosign(c);
+  await confirmed(c);
+  await openArchive(c);
   await shot(c, "P4-3-approved");
   await closeDrawer(c);
   results.push({ id: "P4", ok: true });
 }
 
-// A0 종합 도면 (Part 8-4): 4×4 타일 격자, 선택 설비 타일 강조, 타일 확대
-// 앞 흐름이 남긴 확대 창 · 서랍 · 팝오버 · 검색 결과를 닫습니다.
-async function tidy(c) {
-  if (await c.locator(".cz-card").count()) await c.locator(".cz-card .ov-close").click();
-  const close = c.locator(".drawer header button", { hasText: L("닫기", "Close") });
-  if (await close.count()) await close.first().click();
-  await closeQueue(c);
-  if (await c.locator(".settings-popover").isVisible()) await c.locator(".settings-popover .ov-close").click();
-  if (await c.locator(".search-results").count()) await c.locator(".search-results .ov-close").click();
-  if (await c.locator(".telemetry-dropup").count()) await c.locator(".telemetry-dropup .ov-close").click();
-  await sleep(300);
-}
-
-/** 판이 모두 닫힌 뒤 ESC 를 누르면 검색 표시 → 설비 선택이 풀립니다 (말풍선이 타일 · 상자를 가리지 않게). */
-async function deselect(c) {
-  await tidy(c);
-  await c.evaluate(() => document.activeElement && document.activeElement.blur && document.activeElement.blur());
-  for (let i = 0; i < 4 && (await c.locator(".cctv").count()) > 0; i++) {
-    await c.keyboard.press("Escape");
-    await sleep(300);
-  }
-}
-
+// A0 종합 도면 (Part 8-4): 4×4 타일 격자, 선택 설비 타일 강조, 타일 누르면 그 타일에 맞춰 확대 (도면과 같은 휠 확대 · 끌기)
 async function a0(c) {
   await deselect(c);
   await c.locator(".tab", { hasText: "P&ID" }).click();
@@ -340,8 +208,11 @@ async function a0(c) {
   await c.waitForSelector(".a0-sheet img", { timeout: 30000 });
   await sleep(1200);
   await shot(c, "A0-1-sheet");
+  const before = await c.evaluate(() => getComputedStyle(document.querySelector(".a0-sheet")).transform);
   await c.locator(".a0-tile", { hasText: "B4" }).first().click({ position: { x: 30, y: 30 } });
   await sleep(1000);
+  const after = await c.evaluate(() => getComputedStyle(document.querySelector(".a0-sheet")).transform);
+  assert(after !== before, `B4 타일을 눌러도 확대되지 않았습니다 (${before} → ${after})`);
   await shot(c, "A0-2-zoom-B4");
   await c.locator("button", { hasText: L("전체 보기", "Show all") }).click();
   await c.locator(".chip", { hasText: "PID-103-LAB" }).click();
@@ -431,9 +302,16 @@ async function statusLatency(c, ms) {
   }, ms);
 }
 
-async function phys(c) {
+/** 물리엔진 서랍은 시연 판(🧪)의 [⚡ 물리엔진 · 자율 대응] 으로 엽니다 */
+async function openPhysics(c) {
   await tidy(c);
-  await c.locator("button", { hasText: L("물리엔진 · 자율 대응", "Physics Engine") }).click();
+  await openPopover(c, "demo");
+  await c.locator("#demo-popover .demo-physics").click();
+  await c.locator(".drawer .physics").waitFor({ timeout: 10000 });
+}
+
+async function phys(c) {
+  await openPhysics(c);
   await c.locator(".drawer button", { hasText: L("시뮬레이터 시작", "Start simulator") }).click();
   await sleep(4000);
   await c.locator(".drawer button", { hasText: L("18% 고착 주입", "stuck at 18%") }).click();
@@ -487,7 +365,7 @@ async function phys(c) {
 // ───────── 개선안: CCTV형 통합 관제판 ─────────
 
 // 2차 개선안: 도면이 무대 전체에 깔리고(빈 자리 높이를 거의 다 씀), 근본 원인 · 경보 설비에 CCTV 말풍선이 지시선으로 붙고,
-// 결재 HUD · 하단 허브(파이프라인 · 3줄 미니 파형 · 질의)가 떠 있는지 봅니다. CAM-02 · 03 은 허브의 [📈] Drop-up 안에 있습니다.
+// 결재 HUD · 하단 허브(파이프라인 · 3줄 미니 파형 · 질의)가 떠 있는지 봅니다. CAM-02 · 03 은 타임머신 끝 [📈 시계열 · SDS] 의 Drop-up 안에 있습니다.
 async function visibleCards(c) {
   return c.locator(".cctv").evaluateAll((els) => els.filter((e) => e.style.visibility !== "hidden" && e.offsetWidth > 0).map((e) => e.dataset.card));
 }
@@ -503,6 +381,9 @@ async function cctv(c) {
   for (const want of L(["감지된 핵심 병목", "인터록 게이트", "표준 조치 요약", "STUCK_LOW", "CAM-EQ"], ["Detected Key Bottlenecks", "Interlock Gate", "Standard Action Summary", "STUCK_LOW", "CAM-EQ"])) {
     assert(text.includes(want), `CCTV 관제판에 '${want}' 가 없습니다`);
   }
+  // UI 단순화: 같은 숫자는 한 곳에만 (트립 잔여는 타임머신 배지, 대기 건수는 알약)
+  const ttfCount = await c.evaluate(() => (document.body.innerText.match(/잔여\(TTF\)|Time to .*\(TTF\)/g) || []).length);
+  assert(ttfCount === 1, `트립 잔여(TTF) 머리 숫자가 ${ttfCount} 곳에 보입니다`);
   // 도면 크기: 결재 HUD 를 뺀 빈 자리에 맞춰 그립니다 (예전 6 : 4 분할에서는 410 × 290 px 였습니다)
   const geo = await c.evaluate(() => {
     const r = (s) => document.querySelector(s).getBoundingClientRect();
@@ -529,7 +410,7 @@ async function cctv(c) {
   });
   assert(!overlap, "CCTV 말풍선이 떠 있는 판과 겹칩니다");
   await shot(c, "CCTV-1-p2");
-  // 허브의 [📈 CAM-02·03] → 시계열 · SDS 로직 차트 Drop-up
+  // 타임머신 끝 [📈 시계열 · SDS] → 시계열 · SDS 로직 차트 Drop-up
   await c.locator(".charts-toggle").click();
   await c.locator(".telemetry-dropup").waitFor({ timeout: 10000 });
   const charts = await c.locator(".telemetry-dropup").innerText();
@@ -575,16 +456,8 @@ async function cctv(c) {
 
 // ───────── 추가 개선안: AI 데이터센터 모드 ─────────
 
-async function switchDomain(c, label, brand) {
-  await tidy(c);
-  await c.locator(".domain-switch .seg", { hasText: label }).click();
-  await waitText(c, brand, 60000);
-  await sleep(1500);
-}
-
 async function aidc(c, f) {
-  await switchDomain(c, L("AI 데이터센터", "AI Data Center"), L("AI 데이터센터 자율 관제 콘솔", "AI Data Center Autonomous Control Console"));
-  await waitText(f, L("AI 데이터센터 현장 엔지니어 단말", "AI Data Center Field Engineer Terminal"), 30000);
+  await app.switchDomain(c, f, "aidc");
   // 도면 칩은 도면 뷰의 도구줄에 있습니다 (앞 흐름이 다른 뷰에서 멈췄을 수 있음)
   await c.locator(".tab", { hasText: L("도면", "Drawing") }).click();
   await sleep(800);
@@ -614,20 +487,16 @@ async function d2(c) {
   await stage(c, 4);
   await shot(c, "D2-4-stage4");
   await closeDrawer(c);
-  await stage(c, 5);
-  await c.locator(".drawer label.check", { hasText: L("공동 결재", "co-sign") }).locator("input").check();
-  await c.locator(".drawer button", { hasText: L("선행 절차를 건너뛰고 확정 시도", "without prerequisite steps") }).click();
-  await waitText(c, "Step 2");
-  await c.locator(".drawer .il-step", { hasText: "Step 2" }).locator("input").fill("65");
-  await c.locator(".drawer .il-step", { hasText: "Step 2" }).locator("button", { hasText: L("현장 값 확인", "Check field value") }).click();
+  await cosign(c);
+  await tryGuard(c, "order");
+  await waitText(c, L("먼저 끝내야 확정", "before confirming"));
+  await interlockValue(c, 2, 65);
   await waitText(c, L("남은 선행 절차: Step 3", "Remaining prerequisite steps: Step 3"));
-  await c.locator(".drawer .il-step", { hasText: "Step 3" }).locator("button", { hasText: L("무전 확인", "radio confirmation") }).click();
+  await interlockRadio(c, 3);
   await waitText(c, L("모두 확인", "prerequisite steps confirmed"));
-  const cosign = c.locator(".drawer label.check", { hasText: L("공동 결재", "co-sign") }).locator("input");
-  if (!(await cosign.isChecked())) await cosign.check();
-  await c.locator(".drawer button", { hasText: L("조치확정", "Confirm Action") }).click();
-  await waitText(c, L("확정했습니다", "Confirmed ("));
-  await waitText(c, L("보관 문서", "Archived Record"), 30000);
+  await cosign(c);
+  await confirmed(c);
+  await openArchive(c);
   const archive = await c.locator(".drawer").innerText();
   assert(archive.includes("NOC-2026-") && archive.includes(L("NOC 관제실 결재", "NOC approval")), "데이터센터 보관 문서는 NOC 번호 · 관제실 결재여야 합니다");
   await shot(c, "D2-5-approved");
@@ -661,15 +530,12 @@ async function d1(c, f) {
   await f.locator("input[value=transmitter_drift]").check();
   await f.locator("button", { hasText: L("소명 포함 전송하기", "Send with Justification") }).click();
   await waitText(f, L("접수 번호", "Receipt No."));
-  await sleep(1500);
+  await waitText(c, L("현장 보고 도착", "Field report received"), 60000);
   await openIncident(c, "D1");
   await stage(c, 3);
   await shot(c, "D1-2-stage3-truth");
   await closeDrawer(c);
-  await stage(c, 5);
-  await c.locator(".drawer button", { hasText: L("조치확정", "Confirm Action") }).click();
-  await waitText(c, L("확정했습니다", "Confirmed ("));
-  await closeArchive(c);
+  await confirmed(c);
   await waitText(f, L("처리가 끝났습니다", "Processing complete"), 60000);
   await noLeak(f, "D1 확정 안내");
   await shot(f, "D1-3-field-finished");
@@ -696,10 +562,7 @@ async function d3(c, f, forged) {
   await shot(c, `${id}-2-stage3`);
   await closeDrawer(c);
   if (!forged) {
-    await stage(c, 5);
-    await c.locator(".drawer button", { hasText: L("조치확정", "Confirm Action") }).click();
-    await waitText(c, L("확정했습니다", "Confirmed ("));
-    await closeArchive(c);
+    await confirmed(c);
     await waitText(f, L("반영되었습니다", "was applied"), 60000);
     await shot(f, `${id}-3-field-finished`);
   }
@@ -712,12 +575,12 @@ async function d4(c) {
   await stage(c, 5);
   const text = await c.locator(".drawer").innerText();
   assert(text.includes("EPO"), "배터리 절차서의 고위험 조치(EPO)가 보이지 않습니다");
-  await c.locator(".drawer button", { hasText: L("공동 결재 없이 확정 시도", "without co-sign") }).click();
+  await closeDrawer(c);
+  await tryGuard(c, "cosign");
   await waitText(c, L("차단", "blocked"));
-  await c.locator(".drawer label.check", { hasText: L("공동 결재", "co-sign") }).locator("input").check();
-  await c.locator(".drawer button", { hasText: L("조치확정", "Confirm Action") }).click();
-  await waitText(c, L("확정했습니다", "Confirmed ("));
-  await waitText(c, L("보관 문서", "Archived Record"), 30000);
+  await cosign(c);
+  await confirmed(c);
+  await openArchive(c);
   await shot(c, "D4-1-approved");
   await closeDrawer(c);
   results.push({ id: "D4", ok: true });
@@ -725,8 +588,7 @@ async function d4(c) {
 
 // 데이터센터 물리엔진: CDU 밸브 고착 → GPU 정션 온도 상승 → 인과 사슬 → CDU 우회밸브 완화 → 셧다운(95 ℃) 전 회복
 async function dphys(c) {
-  await tidy(c);
-  await c.locator("button", { hasText: L("물리엔진 · 자율 대응", "Physics Engine") }).click();
+  await openPhysics(c);
   await c.locator(".drawer button", { hasText: L("시뮬레이터 시작", "Start simulator") }).click();
   await sleep(4000);
   await c.locator(".drawer button", { hasText: L("18% 고착 주입", "stuck at 18%") }).click();
@@ -748,18 +610,19 @@ async function dphys(c) {
 }
 
 async function plant(c, f) {
-  await switchDomain(c, L("화력발전소", "Thermal Power Plant"), L("1.2GW 발전소 관제 콘솔", "1.2GW Power Plant Control Console"));
-  await waitText(f, L("1.2GW 발전소 현장 순시", "1.2GW Power Plant Field Patrol"), 30000);
+  await app.switchDomain(c, f, "plant");
   results.push({ id: "PLANT", ok: true });
 }
 
 (async () => {
-  const browser = await connect();
-  const { consolePage: c, fieldPage: f } = await pages(browser);
+  const browser = await app.connect();
+  const { c, f } = await app.findPages(browser);
   // 화면의 단계 이름에도 "Zoro-1" 이 있으니, 아래 상태 줄이 모델을 다 연 뒤의 문구로 바뀔 때까지 기다립니다.
-  await c.waitForFunction(() => /(엔진|Engine): Zoro-1/.test(document.body.innerText), null, { timeout: 900000 });
+  await app.waitEngine(c);
   if (AUDIT) for (const p of [c, f]) await p.evaluate(() => (window.__i18nAudit = true));
-  await setLanguage(c, f, EN ? "en" : "ko");
+  await app.setLanguage(c, f, EN ? "en" : "ko");
+  const calls0 = await c.evaluate(() => ({ ...(window.__ipcCalls || {}) }));
+  const t0 = Date.now();
   for (const id of ONLY) {
     try {
       if (id === "P2") await p2(c);
@@ -785,6 +648,11 @@ async function plant(c, f) {
       await shot(f, `${id}-error-field`).catch(() => {});
     }
   }
+  // 흐름 전체에서 화면이 부른 백엔드 명령 수 (UI 단순화 P7 · P8: 모델 확인 · 상세 다시 받기)
+  const calls1 = await c.evaluate(() => ({ ...(window.__ipcCalls || {}) })).catch(() => ({}));
+  const calls = Object.fromEntries(Object.keys(calls1).map((k) => [k, calls1[k] - (calls0[k] || 0)]).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]));
+  fs.mkdirSync(SHOTS, { recursive: true });
+  fs.writeFileSync(path.join(SHOTS, "ipc_calls.json"), JSON.stringify({ secs: Math.round((Date.now() - t0) / 1000), flows: ONLY, calls }, null, 2));
   // --only 로 일부만 다시 돌리면 앞 실행의 다른 시나리오 결과는 남기고 같은 시나리오만 바꿉니다.
   const file = path.join(SHOTS, "results.json");
   let merged = results;

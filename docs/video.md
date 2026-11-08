@@ -33,6 +33,23 @@
 
 ## 다시 만들기
 
+실행기 한 줄이 앱(ROCm)을 띄우고 모델 기록(`<녹화 폴더>/trace.jsonl`)을 그 폴더에 남기게 맞춘 뒤 record.js 를 돌리고 앱을 내립니다.
+언어마다 앱을 새로 띄우므로 한 줄씩 돌립니다. 편집기는 시작할 때 녹화 폴더 · 모델 기록 · 측정 파일(`out/delta_*.json` · `symbol_probe.json`)을
+보고, 빠진 것이 있으면 만드는 명령을 알리고 멈춥니다 (`--allow-missing` 으로 알고도 편집).
+
+```bat
+node scripts\e2e\run.js --record --out out\rec\master_ko
+node scripts\e2e\run.js --record --lang en --out out\rec\master_en
+:: 한 장면만 다시: --only P1 --out out\rec\master_ko_p1 (편집기가 실패한 장면을 뒤 폴더의 것으로 바꿉니다)
+python scripts\e2e\edit_video.py --lang ko --rec out/rec/master_ko --rec out/rec/master_ko_p1 --out out/video/blueprint_master_e2e_ko.mp4
+python scripts\e2e\edit_video.py --lang en --rec out/rec/master_en --out out/video/blueprint_master_e2e_en.mp4
+```
+
+UI 단순화(2026-11-09, [ui-simplify-plan.md](ui-simplify-plan.md)) 뒤 장면은 같은 ID 로 화면만 바뀌었습니다: 결재 · 가드레일 시험은 오른쪽 결재 HUD
+(Stage 5 서랍은 초안 읽기 전용), 레인은 파이프라인 카드, P1 의 무효 서명은 단말이 보내기 전에 막습니다(`p1.g1_retry`). 이 화면으로는 아직 다시 찍지 않았습니다.
+
+손으로 하던 순서 (참고):
+
 ```bash
 # 1) 앱 (ROCm) — 디버그 포트 · 스캐너 폴더 · 모델 기록
 scripts\rocm-env.bat

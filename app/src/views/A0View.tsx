@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
-import { fitRect } from "../cctv/stage";
+import { fitRect, usePanZoom } from "../cctv/stage";
+import { ZoomCtl } from "../cctv/ZoomCtl";
 import { drawingImage } from "../drawings";
 import { useLang, useT } from "../i18n";
 import type { Context } from "../PlantTopologyView";
@@ -10,13 +11,16 @@ const pct = (v: number, total: number) => `${(v / total) * 100}%`;
 
 /** A0 종합 도면 뷰 (Part 8-4 1 · 5절). 마스터 도면 다섯 장을 원장 배치대로 앉히고 격자 타일을 겹칩니다.
  *  판독은 이 타일 단위로 하고(A0 한 장은 글자가 너무 작아 엔진 가정 밖), 타일을 누르면 그 타일로 확대합니다.
- *  2차 개선안: 종합 도면은 무대의 빈 자리에 맞춰 크게 그리고, 타일 미니맵은 왼쪽 아래 유리 카드로 늘 떠 있습니다. */
+ *  2차 개선안: 종합 도면은 무대의 빈 자리에 맞춰 크게 그리고, 타일 미니맵은 왼쪽 아래 유리 카드로 늘 떠 있습니다.
+ *  UI 단순화 U10: 도면 · Mermaid 와 같은 휠 확대 · 끌기 · 확대 단추를 쓰고, 타일 누르기는 그 타일에 맞추기만 합니다. */
 export function A0View({ ctx, a0 }: { ctx: Context; a0: A0Info }) {
   const [W, H] = a0.pixel_size;
   const say = useT();
   const lang = useLang();
   const [urls, setUrls] = useState<Record<string, string>>({});
   const [zoom, setZoom] = useState<A0Tile | null>(null);
+  const fit = fitRect(ctx.stage, ctx.inset, W / H);
+  const pz = usePanZoom(fit, a0.id);
 
   useEffect(() => {
     for (const s of a0.sheets) drawingImage(s.drawing).then((url) => setUrls((u) => ({ ...u, [s.drawing]: url }))).catch(() => {});
@@ -24,10 +28,15 @@ export function A0View({ ctx, a0 }: { ctx: Context; a0: A0Info }) {
 
   const tileOf = (kks: string | null | undefined) => (kks ? a0.equipment[kks]?.tile ?? null : null);
   const marks = (id: string) => [id === tileOf(ctx.selected) ? "selected" : "", id === tileOf(ctx.rootKks) ? "root" : "", id === tileOf(ctx.alarmKks) ? "alarm" : "", id === zoom?.id ? "zoomed" : ""].join(" ");
-  // 확대: 타일 왼쪽 위를 원점으로 옮기고 타일이 보기 창을 채우게 키웁니다 (transform-origin 0 0).
-  const scale = zoom ? Math.min(W / (zoom.x1 - zoom.x0), H / (zoom.y1 - zoom.y0)) : 1;
-  const transform = zoom ? `scale(${scale}) translate(${-(zoom.x0 / W) * 100}%, ${-(zoom.y0 / H) * 100}%)` : "none";
-  const fit = fitRect(ctx.stage, ctx.inset, W / H);
+  /** 타일(A0 픽셀)을 판 좌표(배율 1)로 옮겨 그 자리에 맞춥니다 */
+  const focusTile = (tile: A0Tile) => {
+    setZoom(tile);
+    pz.zoomTo({ x: (tile.x0 / W) * fit.w, y: (tile.y0 / H) * fit.h, w: ((tile.x1 - tile.x0) / W) * fit.w, h: ((tile.y1 - tile.y0) / H) * fit.h });
+  };
+  const showAll = () => {
+    setZoom(null);
+    pz.reset();
+  };
 
   const bar = ctx.bar
     ? createPortal(
@@ -48,12 +57,12 @@ export function A0View({ ctx, a0 }: { ctx: Context; a0: A0Info }) {
               <span>
                 {say("확대", "Zoomed")} <b>{zoom.id}</b>
               </span>
-              <button className="plain small" onClick={() => setZoom(null)}>
+              <button className="plain small" onClick={showAll}>
                 {say("전체 보기", "Show all")}
               </button>
             </>
           ) : (
-            <span className="muted">{say("타일을 누르면 그 구역으로 확대합니다", "Click a tile to zoom into that area")}</span>
+            <span className="muted">{say("타일을 누르면 그 구역으로 확대합니다 (휠 확대 · 끌어 이동)", "Click a tile to zoom into that area (wheel to zoom · drag to pan)")}</span>
           )}
         </div>,
         ctx.bar,
@@ -61,15 +70,15 @@ export function A0View({ ctx, a0 }: { ctx: Context; a0: A0Info }) {
     : null;
 
   return (
-    <div className="a0-view">
+    <>
       {bar}
-      <div className={`a0-sheet ${ctx.dark ? "dark" : ""}`} style={{ left: fit.x, top: fit.y, width: fit.w, height: fit.h }}>
-        <div className="a0-canvas" style={{ transform }}>
+      <div className="sheet-viewport a0-view" ref={pz.bind}>
+        <div className={`a0-sheet ${ctx.dark ? "dark" : ""}`} style={pz.style}>
           {a0.sheets.map((s) =>
             urls[s.drawing] ? <img key={s.drawing} src={urls[s.drawing]} alt={s.drawing} draggable={false} style={{ left: pct(s.x, W), top: pct(s.y, H), width: pct(a0.sheet_px[0], W) }} /> : null,
           )}
           {a0.tiles.map((t) => (
-            <div key={t.id} className={`a0-tile ${marks(t.id)}`} style={{ left: pct(t.x0, W), top: pct(t.y0, H), width: pct(t.x1 - t.x0, W), height: pct(t.y1 - t.y0, H) }} onClick={() => setZoom(t)}>
+            <div key={t.id} className={`a0-tile ${marks(t.id)}`} style={{ left: pct(t.x0, W), top: pct(t.y0, H), width: pct(t.x1 - t.x0, W), height: pct(t.y1 - t.y0, H) }} onClick={() => focusTile(t)}>
               <span>
                 {t.id}
                 {t.id === tileOf(ctx.rootKks) ? " 🔥" : ""}
@@ -92,11 +101,12 @@ export function A0View({ ctx, a0 }: { ctx: Context; a0: A0Info }) {
       </div>
       <div className="a0-minimap vp-glass ov-avoid" style={{ gridTemplateColumns: `repeat(${a0.grid.cols}, 1fr)` }} aria-label={say("A0 타일 미니맵", "A0 tile minimap")}>
         {a0.tiles.map((t) => (
-          <button key={t.id} className={`a0-mini ${marks(t.id)}`} onClick={() => setZoom(zoom?.id === t.id ? null : t)}>
+          <button key={t.id} className={`a0-mini ${marks(t.id)}`} onClick={() => (zoom?.id === t.id ? showAll() : focusTile(t))}>
             {t.id}
           </button>
         ))}
       </div>
-    </div>
+      <ZoomCtl scale={pz.view.s} onZoom={(f) => pz.zoomAt(f)} onReset={showAll} />
+    </>
   );
 }

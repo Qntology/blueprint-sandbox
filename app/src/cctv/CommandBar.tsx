@@ -298,10 +298,11 @@ export function SearchDropup({ run, onClose, onSelect, onPick, onInterlock, inte
               <span className="muted">{h.doc.subtitle}</span>
               {h.why.length > 0 && <span className="why">{t("왜", "Why")}: {h.why.slice(0, 6).join(" · ")}</span>}
             </button>
+            {/* 행을 누르면 설비를 고르거나(설비 · 계측 · 도면 · MOC) 사건을 엽니다(사건 · 보관). 단추는 그와 다른 일만: 사건 행의 설비 보기 · 인터록 보기 */}
             <span className="hit-actions">
-              {h.doc.kks && (
-                <button className="vt-btn" onClick={() => onSelect(h.doc.kks!)} title={t("도면에서 이 설비를 비춥니다", "Show this equipment on the drawing")}>
-                  {t("📍 도면 핀", "📍 Pin on drawing")}
+              {h.doc.kks && (h.doc.kind === "incident" || h.doc.kind === "archive") && (
+                <button className="vt-btn" onClick={() => onSelect(h.doc.kks!)} title={t("사건을 열지 않고 도면에서 그 설비만 비춥니다", "Show the equipment on the drawing without opening the incident")}>
+                  {t("📍 설비 보기", "📍 Show equipment")}
                 </button>
               )}
               {h.doc.kks && interlockKks.has(h.doc.kks) && (
@@ -313,11 +314,6 @@ export function SearchDropup({ run, onClose, onSelect, onPick, onInterlock, inte
                   }}
                 >
                   {t("📋 인터록 보기", "📋 View interlock")}
-                </button>
-              )}
-              {(h.doc.kind === "incident" || h.doc.kind === "archive") && (
-                <button className="vt-btn" onClick={() => onPick(h.doc.id)}>
-                  {t("📂 열기", "📂 Open")}
                 </button>
               )}
             </span>

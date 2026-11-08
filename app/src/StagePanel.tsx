@@ -1,12 +1,11 @@
 import { invoke } from "./ipc";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { shortTag, useTerms } from "./domain";
+import { useEffect, useState } from "react";
+import { useTerms } from "./domain";
 import { useT } from "./i18n";
 import { tr } from "./i18n/lang";
 import type { DrawerKey } from "./OfficerView";
-import { clock, fixed, fmt, mmss, signedSecs, STAGE_LABEL } from "./plant";
-import type { ArchiveDoc, Asked, Detail, InterlockStep, Lane, Plant, VerdictInfo } from "./types";
-import { WaveChart, type Trace } from "./WaveChart";
+import { clock, fmt, mmss, STAGE_LABEL } from "./plant";
+import type { ArchiveDoc, Asked, Detail, InterlockStep, Lane, VerdictInfo } from "./types";
 
 const STAGE_CLASS: Record<string, string> = { Done: "ok", Skipped: "skip", Corrected: "fix", Alert: "alert", Waiting: "wait", Blocked: "block" };
 
@@ -19,17 +18,29 @@ function duration(ms: number): string {
 /** 단계 카드에 붙일 프로세스 마이닝 레인 (개선안 3단계 3번: 단계 바 + 마이닝 레인 두 줄을 한 줄로) */
 const STAGE_LANES: Record<number, string[]> = { 1: ["gate01"], 2: ["gate01"], 3: ["gate2"], 4: ["gate3"], 5: ["gate45", "approval"] };
 
-/** 파이프라인 줄 (Stage 1 ~ 5). 카드마다 그 단계 레인의 건수 · 최대 대기를 함께 적습니다. 누르면 단계 상세가 열립니다.
+/** 단계 카드: Stage 1 · 2 (크롭 · 판독)는 같은 상세를 여는 한 칸에 두 상태를 함께 보입니다 */
+const STAGE_CARDS: number[][] = [[1, 2], [3], [4], [5]];
+/** 두 단계 중 더 눈여겨볼 상태 (막힘 > 경보 > 대기 > 교정 > 완료 > 건너뜀) */
+const STATUS_RANK: Record<string, number> = { Blocked: 5, Alert: 4, Waiting: 3, Corrected: 2, Done: 1, Skipped: 0 };
+
+/** 파이프라인 줄 (Stage 1 ~ 5, 카드 넷). 카드마다 그 단계 레인의 건수 · 최대 대기를 함께 적습니다. 누르면 단계 상세가 열립니다.
  *  2차 개선안: 하단 허브 맨 윗줄(noto-sandbox 의 퀘스트 줄 자리)에 한 줄로 들어가고, 단계 요약은 마우스를 올리면 보입니다. */
-export function StageBar({ detail, onOpen, lanes, tail }: { detail: Detail | null; onOpen: (k: DrawerKey) => void; lanes: Lane[]; tail?: ReactNode }) {
+export function StageBar({ detail, onOpen, lanes }: { detail: Detail | null; onOpen: (k: DrawerKey) => void; lanes: Lane[] }) {
   const terms = useTerms();
   const t = useT();
   const stages = detail?.analysis.stages ?? [];
-  const lane = (n: number) => {
-    const ls = lanes.filter((l) => STAGE_LANES[n].includes(l.key));
+  const lane = (ns: number[]) => {
+    const ls = lanes.filter((l) => ns.some((n) => STAGE_LANES[n].includes(l.key)));
     return { count: Math.max(0, ...ls.map((l) => l.count)), wait: Math.max(0, ...ls.map((l) => (l.count > 0 ? l.max_wait_secs : 0))) };
   };
-  const done = lanes.find((l) => l.key === "done")?.count ?? 0;
+  const fallback = (n: number) =>
+    [
+      t("SigLIP2 크롭", "SigLIP2 Crop"),
+      t("gocr 판독 + 대장 교정", "gocr Read + Register Fix"),
+      t("Gate 1~2 원장 대조", "Gate 1~2 Ledger Check"),
+      t("Gate 3 + Zoro-1 판단", "Gate 3 + Zoro-1 Verdict"),
+      t(`Zoro-1 ${terms.procedure} 초안`, `Zoro-1 ${terms.procedure} Draft`),
+    ][n - 1];
   return (
     <div className="stagebar">
       <span
@@ -37,35 +48,35 @@ export function StageBar({ detail, onOpen, lanes, tail }: { detail: Detail | nul
         title={detail ? t(`${detail.analysis.route.kks} 파이프라인 · 마이닝 레인`, `${detail.analysis.route.kks} Pipeline · Mining Lanes`) : t("파이프라인 · 마이닝 레인", "Pipeline · Mining Lanes")}
       >
         {t("🧩 파이프라인", "🧩 Pipeline")}
-        <i>{t(`처리 완료 ${done}건`, `${done} closed`)}</i>
       </span>
-      {[1, 2, 3, 4, 5].map((n) => {
-        const s = stages.find((x) => x.stage === n);
-        const l = lane(n);
+      {STAGE_CARDS.map((ns) => {
+        const ss = ns.map((n) => stages.find((x) => x.stage === n));
+        const shown = ss.filter((s) => s) as NonNullable<(typeof ss)[number]>[];
+        const worst = shown.reduce<(typeof shown)[number] | null>((w, s) => (!w || (STATUS_RANK[s.status] ?? 0) > (STATUS_RANK[w.status] ?? 0) ? s : w), null);
+        const l = lane(ns);
+        const name = ns.length > 1 ? t("크롭 · 판독", "Crop · Read") : (ss[0]?.name ?? fallback(ns[0]));
         return (
           <button
-            key={n}
-            className={`stage-card ${s ? STAGE_CLASS[s.status] : "skip"}`}
+            key={ns[0]}
+            data-stage={ns[0]}
+            className={`stage-card ${worst ? STAGE_CLASS[worst.status] : "skip"}`}
             disabled={!detail}
-            onClick={() => onOpen(n as DrawerKey)}
-            title={t(
-              `${s?.summary ?? "-"} (${duration(s?.ms ?? 0)}) · 레인 ${l.count}건${l.wait > 0 ? ` · 최대 대기 ${mmss(l.wait)}` : ""}`,
-              `${s?.summary ?? "-"} (${duration(s?.ms ?? 0)}) · Lane: ${l.count}${l.wait > 0 ? ` · Max wait ${mmss(l.wait)}` : ""}`,
-            )}
+            onClick={() => onOpen(ns[0] as DrawerKey)}
+            title={ns
+              .map((n, i) =>
+                t(
+                  `Stage ${n}. ${ss[i]?.name ?? fallback(n)}: ${ss[i]?.summary ?? "-"} (${duration(ss[i]?.ms ?? 0)})`,
+                  `Stage ${n}. ${ss[i]?.name ?? fallback(n)}: ${ss[i]?.summary ?? "-"} (${duration(ss[i]?.ms ?? 0)})`,
+                ),
+              )
+              .concat(t(`레인 ${l.count}건${l.wait > 0 ? ` · 최대 대기 ${mmss(l.wait)}` : ""}`, `Lane: ${l.count}${l.wait > 0 ? ` · Max wait ${mmss(l.wait)}` : ""}`))
+              .join("\n")}
           >
             <strong>
-              Stage {n}.{" "}
-              {s?.name ??
-                [
-                  t("SigLIP2 크롭", "SigLIP2 Crop"),
-                  t("gocr 판독 + 대장 교정", "gocr Read + Register Fix"),
-                  t("Gate 1~2 원장 대조", "Gate 1~2 Ledger Check"),
-                  t("Gate 3 + Zoro-1 판단", "Gate 3 + Zoro-1 Verdict"),
-                  t(`Zoro-1 ${terms.procedure} 초안`, `Zoro-1 ${terms.procedure} Draft`),
-                ][n - 1]}
+              Stage {ns.join("·")}. {name}
             </strong>
             <em>
-              [{s ? STAGE_LABEL[s.status] : t("대기", "Waiting")}]
+              <span>{ss.map((s) => `[${s ? STAGE_LABEL[s.status] : t("대기", "Waiting")}]`).join(" ")}</span>
               <span className={`lane-badge ${l.wait > 0 ? "hold" : ""}`}>
                 {t(`${l.count}건`, `${l.count}`)}
                 {l.wait > 0 ? ` · ⏳ ${mmss(l.wait)}` : ""}
@@ -74,7 +85,6 @@ export function StageBar({ detail, onOpen, lanes, tail }: { detail: Detail | nul
           </button>
         );
       })}
-      {tail}
     </div>
   );
 }
@@ -423,8 +433,9 @@ function requirement(s: InterlockStep): string {
 }
 
 /** 깊이별 선행 절차(Interlock) 체크 (Part 8-4). 순서대로 끝나야 아래 확정이 풀립니다.
- *  `compact` 는 우측 결재창의 신호등 게이트 (개선안 3단계 2번: 마이닝 · 인터록 · 결재를 한 화면에) */
-export function InterlockPanel({ detail, supervisor, onChanged, compact = false }: { detail: Detail; supervisor: string; onChanged: (m: string) => void; compact?: boolean }) {
+ *  `compact` 는 우측 결재창의 신호등 게이트 (개선안 3단계 2번: 마이닝 · 인터록 · 결재를 한 화면에).
+ *  `readOnly` 는 Stage 5 서랍의 상태 보기 (값 입력 · 무전 확인은 결재 HUD 한 곳에서만 합니다). */
+export function InterlockPanel({ detail, supervisor, onChanged, compact = false, readOnly = false }: { detail: Detail; supervisor: string; onChanged: (m: string) => void; compact?: boolean; readOnly?: boolean }) {
   const terms = useTerms();
   const t = useT();
   const il = detail.analysis.interlock;
@@ -468,7 +479,7 @@ export function InterlockPanel({ detail, supervisor, onChanged, compact = false 
               {next?.no !== s.no ? t(` · Step ${next?.no} 먼저`, ` · Step ${next?.no} first`) : ""}
             </div>
           )}
-          {s.status !== "passed" && s.check.kind !== "loto" && (
+          {!readOnly && s.status !== "passed" && s.check.kind !== "loto" && (
             <div className="il-input">
               <input
                 type="number"
@@ -481,7 +492,7 @@ export function InterlockPanel({ detail, supervisor, onChanged, compact = false 
               </button>
             </div>
           )}
-          {s.status !== "passed" && s.check.kind === "loto" && (
+          {!readOnly && s.status !== "passed" && s.check.kind === "loto" && (
             <div className="il-input">
               <button className="plain" disabled={busy || next?.no !== s.no} onClick={() => submit(s.no, null, true)}>
                 {t(`📻 ${terms.supervisor} 무전 확인으로 갈음 (사번 날인)`, `📻 Use ${terms.supervisor} radio confirmation instead (ID stamp)`)}
@@ -494,29 +505,11 @@ export function InterlockPanel({ detail, supervisor, onChanged, compact = false 
   );
 }
 
-function Approval({ detail, supervisor, onDecided }: { detail: Detail; supervisor: string; onDecided: (m: string) => void }) {
+/** Stage 5 상세: Zoro-1 조치 절차서 초안 · Factcheck 대조 · 인터록 상태 (읽기 전용). 결재는 오른쪽 결재 HUD 한 곳에서 합니다 (UI 단순화 U1). */
+function Draft({ detail, supervisor }: { detail: Detail; supervisor: string }) {
   const terms = useTerms();
   const t = useT();
   const d = detail.analysis.draft;
-  const [ref, setRef] = useState(d?.aop_id ?? "");
-  const [cosign, setCosign] = useState(false);
-  const [scans, setScans] = useState(0);
-  const [note, setNote] = useState("");
-  const [reply, setReply] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const pending = detail.analysis.interlock?.steps.find((s) => s.status !== "passed") ?? null;
-  const act = async (action: string) => {
-    setBusy(true);
-    try {
-      const r = await invoke<{ ok: boolean; message: string }>("decide_incident", { input: { id: detail.id, supervisor_id: supervisor, action, team_lead_cosign: cosign, procedure_ref: ref, evidence_scans: scans, note } });
-      setReply(r.message);
-      onDecided(r.message);
-    } catch (e) {
-      setReply(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
     <div className="two-col">
       <section>
@@ -578,197 +571,14 @@ function Approval({ detail, supervisor, onDecided }: { detail: Detail; superviso
             </ul>
           </>
         )}
-        <InterlockPanel
-          detail={detail}
-          supervisor={supervisor}
-          onChanged={(m) => {
-            setReply(m);
-            onDecided(m);
-          }}
-        />
-        <h4>
-          [{d?.high_risk ? t("고위험 계통 조작 승인 (policy.rs 안전 가드레일)", "High-Risk System Operation Approval (policy.rs safety guardrail)") : t(`${terms.supervisor} 확정`, `${terms.supervisor} confirmation`)}]
-        </h4>
-        {d?.high_risk && (
-          <>
-            <p className="muted">{t(`고위험 조치: ${d.risk_actions.join(", ")}`, `High-risk actions: ${d.risk_actions.join(", ")}`)}</p>
-            <label className="field">
-              {t("근거 절차서 번호", "Procedure ref. no.")}
-              <input value={ref} onChange={(e) => setRef(e.target.value)} />
-            </label>
-            <label className="check">
-              <input type="checkbox" checked={cosign} onChange={(e) => setCosign(e.target.checked)} />
-              {t(`${terms.supervisor}(파트장) 공동 결재를 받았습니다 (team_lead_cosign)`, `${terms.supervisor} (Team Lead) co-sign obtained (team_lead_cosign)`)}
-            </label>
-            <label className="field">
-              {t("오경보 입증 현장 증빙 스캔 (장)", "False-alarm field evidence scans (pages)")}
-              <input type="number" min={0} value={scans} onChange={(e) => setScans(Number(e.target.value))} />
-            </label>
-          </>
-        )}
-        <label className="field">
-          {t("현장 재점검 요청 메모", "Field recheck request note")}
-          <input
-            value={note}
-            onChange={(e) => setNote(e.target.value)}
-            placeholder={
-              terms.code === "KKS"
-                ? t("예: 2층 급수조절밸브 포지셔너 현장 확인", "e.g. Check feedwater control valve positioner on 2F")
-                : t("예: 2층 CDU 유량조절밸브 액추에이터 현장 확인", "e.g. Check CDU flow control valve actuator on 2F")
-            }
-          />
-        </label>
-        <div className="actions">
-          {d?.high_risk && (
-            <button className="plain" disabled={busy} onClick={() => act("approve_false_positive")}>
-              {t("고위험 예외승인 (오경보)", "High-risk exception approval (false alarm)")}
-            </button>
-          )}
-          <button className="plain" disabled={busy} onClick={() => act("recheck")}>
-            {t("현장 재점검요구", "Request field recheck")}
-          </button>
-          <button className="plain" disabled={busy} onClick={() => act("reject")}>
-            {t("반려", "Reject")}
-          </button>
-          <button className="danger-fill" disabled={busy || !!pending} onClick={() => act(d?.high_risk ? "approve_procedure" : "confirm")}>
-            {pending ? t(`🔒 조치확정 (Step ${pending.no} 필요)`, `🔒 Confirm Action (Step ${pending.no} required)`) : t("🚨 조치확정", "🚨 Confirm Action")}
-          </button>
-        </div>
-        {d?.high_risk && (
-          <button className="plain small" disabled={busy} onClick={() => act("confirm")}>
-            {t("(시험) 공동 결재 없이 확정 시도", "(Test) Try confirming without co-sign")}
-          </button>
-        )}
-        {pending && (
-          <button className="plain small" disabled={busy} onClick={() => act(d?.high_risk ? "approve_procedure" : "confirm")}>
-            {t("(시험) 선행 절차를 건너뛰고 확정 시도", "(Test) Try confirming without prerequisite steps")}
-          </button>
-        )}
-        {reply && <p className="note">{reply}</p>}
-      </section>
-    </div>
-  );
-}
-
-const COLORS = ["#ff6b3d", "#f6c453", "#4fd1c5", "#7aa2ff", "#c084fc", "#9ae66e"];
-
-function Sds({ detail, plant }: { detail: Detail; plant: Plant }) {
-  const t = useT();
-  const a = detail.analysis;
-  const root = a.substantive?.causal?.root;
-  const origin = root?.at_ms ?? a.chain[0]?.at_ms ?? a.sds.center_ms;
-  const traces = useMemo<Trace[]>(() => {
-    const out: Trace[] = [];
-    const add = (tag: string, title: string, channel?: string) => {
-      if (!out.some((x) => x.tag === tag && x.channel === channel)) out.push({ tag, title, color: COLORS[out.length % COLORS.length], channel });
-    };
-    const label = (tag: string) => {
-      const s = plant.sensors.find((x) => x.tag === tag);
-      const e = plant.equipment.find((x) => x.kks === s?.kks);
-      return `${e?.name ?? ""} ${s?.label ?? ""} (${tag}, ${s?.unit ?? ""})`;
-    };
-    for (const p of a.substantive?.causal?.propagation ?? []) {
-      if (p.causal_match || p.backflow) add(p.upstream_tag, `[${p.backflow ? t("역류", "Backflow") : `D -${p.hops}`}] ${label(p.upstream_tag)}`);
-    }
-    if (a.route.tag) {
-      const chs = detail.timeline.channels[a.route.tag];
-      if (chs) Object.keys(chs).forEach((c) => add(a.route.tag!, `${t(`[채널 ${c}]`, `[Ch ${c}]`)} ${label(a.route.tag!)}`, c));
-      else add(a.route.tag, `[D 0] ${label(a.route.tag)}`);
-    }
-    return out.slice(0, 5);
-  }, [a, detail, plant, t]);
-  const markers = a.chain.map((ev) => ({
-    at_ms: ev.at_ms,
-    label: `${signedSecs(ev.at_ms, origin)} ${shortTag(ev.tag)} ${ev.kind === "limit" ? t("한계", "limit") : ev.direction === "Up" ? "↑" : "↓"}`,
-    color: ev.kind === "limit" ? "#ff4d4f" : "#f6c453",
-  }));
-  const from = Math.max(detail.timeline.t0_ms, origin - 20_000);
-  const to = Math.min(detail.timeline.now_ms + 15_000, detail.timeline.t0_ms + 150_000);
-  return (
-    <div className="two-col wide-left">
-      <section>
-        <div className="timeline-strip">
-          {t(`[SDS 스냅샷 ID: ${a.sds.sds_id}] 트리거:`, `[SDS Snapshot ID: ${a.sds.sds_id}] Trigger:`)} {a.sds.trigger_kind}{" "}
-          {a.trigger.slope !== null ? t(`· 기울기 ${a.trigger.slope?.toFixed(2)}/s`, `· slope ${a.trigger.slope?.toFixed(2)}/s`) : ""}{" "}
-          {a.trigger.ttf_secs !== null ? t(`· 트립 도달 예상 잔여 ${a.trigger.ttf_secs?.toFixed(0)}초`, `· est. ${a.trigger.ttf_secs?.toFixed(0)}s to trip`) : ""}
-        </div>
-        <WaveChart
-          timeline={detail.timeline}
-          traces={traces}
-          sensors={plant.sensors}
-          from={from}
-          to={to}
-          markers={[{ at_ms: origin, label: t("t=0 발원", "t=0 origin"), color: "#ffffff" }, ...markers]}
-          cursor={detail.timeline.now_ms}
-        />
-        {root && (
-          <div className="callout adverse">
-            {t(
-              `📌 [시계열 인과 시차(Δt) 판정] 관측 시차 Δt = +${root.lag_secs.toFixed(1)}초 (배관 허용 ${root.lag_range[0]} ~ ${root.lag_range[1]}초 안) → ${plant.equipment.find((e) => e.kks === a.route.kks)?.name ?? ""} 이상은 ${root.lag_secs.toFixed(1)}초 전 ${plant.equipment.find((e) => e.kks === root.kks)?.name ?? ""} 변화가 원인`,
-              `📌 [Time-Series Causal Lag (Δt) Verdict] Observed lag Δt = +${root.lag_secs.toFixed(1)}s (within pipe tolerance ${root.lag_range[0]} ~ ${root.lag_range[1]}s) → the ${plant.equipment.find((e) => e.kks === a.route.kks)?.name ?? ""} anomaly is caused by the ${plant.equipment.find((e) => e.kks === root.kks)?.name ?? ""} change ${root.lag_secs.toFixed(1)}s earlier`,
-            )}
-          </div>
-        )}
-        <h4>{t("[60초 링버퍼 지표]", "[60 s Ring-Buffer Metrics]")}</h4>
-        <table className="grid">
-          <thead>
-            <tr>
-              <th>{t("센서", "Sensor")}</th>
-              <th>{t("변곡 시각", "Inflection")}</th>
-              <th>{t("기울기 /s", "Slope /s")}</th>
-              <th>{t("가속도", "Accel.")}</th>
-              <th>EWMA</th>
-              <th>TTF</th>
-            </tr>
-          </thead>
-          <tbody>
-            {a.metrics.map((m) => (
-              <tr key={m.sensor_tag}>
-                <td className="mono">{m.sensor_tag}</td>
-                <td>{m.inflection_at_ms ? signedSecs(m.inflection_at_ms, origin) : "-"}</td>
-                <td>{fixed(m.slope_per_sec_milli / 1000, 2)}</td>
-                <td>{fixed(m.accel_milli / 1000, 2)}</td>
-                <td>{fmt(m.ewma_milli / 1000)}</td>
-                <td>{m.estimated_ttf_secs !== null ? t(`${m.estimated_ttf_secs}초`, `${m.estimated_ttf_secs}s`) : "-"}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </section>
-      <section>
-        <h4>{t("[SDS 시공간 직교 분할 검증 (Zoro-1 판단)]", "[SDS Spatio-Temporal Orthogonal Split Check (Zoro-1 Verdict)]")}</h4>
-        <p className="muted">{t("복합 알람을 직교 기준으로 쪼개어 묻고, 가장 낮은 확률을 최종 확신도로 씁니다.", "Splits a compound alarm into orthogonal questions and uses the lowest probability as the final confidence.")}</p>
-        {a.sds.decomposed_confidences.length === 0 && <p className="callout">{t("축별 질문 기록이 없습니다 (모델 없음 또는 절차 판정).", "No per-axis question log (no model, or procedural verdict).")}</p>}
-        {a.sds.decomposed_confidences.map(([axis, p]) => (
-          <div key={axis} className="bar-row">
-            <span>{axis}</span>
-            <div className="bar-track">
-              <div className="bar-fill" style={{ width: `${p * 100}%` }} />
-            </div>
-            <b className="mono">{p.toFixed(3)}</b>
-          </div>
-        ))}
+        <InterlockPanel detail={detail} supervisor={supervisor} onChanged={() => {}} readOnly />
+        {d?.high_risk && <p className="muted">{t(`고위험 조치: ${d.risk_actions.join(", ")}`, `High-risk actions: ${d.risk_actions.join(", ")}`)}</p>}
         <p className="callout">
-          {t("➔ SDS 최종 채택 확신도 (Min): ", "➔ SDS final confidence (Min): ")}
-          {a.sds.min_confidence !== null ? a.sds.min_confidence.toFixed(3) : t("없음", "none")}
+          {t(
+            `결재(${terms.supervisor} 확정 · 공동 결재 · 재점검 · 반려)는 오른쪽 결재 HUD 에서 합니다.`,
+            `Approval (${terms.supervisor} confirmation · co-sign · recheck · reject) is done in the approval HUD on the right.`,
+          )}
         </p>
-        <h4>{t("[게이트별 SDS 상태 전이 코드]", "[SDS State Transition Codes by Gate]")}</h4>
-        <div className="chips">
-          {a.sds.gate_state_vector.map((c, i) => (
-            <span key={i} className="chip mono">
-              {c}
-            </span>
-          ))}
-        </div>
-        <h4>{t("[신호 전파 체인 (Event Trace)]", "[Signal Propagation Chain (Event Trace)]")}</h4>
-        <ul className="facts">
-          {a.chain.map((ev, i) => (
-            <li key={i}>
-              • {signedSecs(ev.at_ms, origin)} : {ev.tag} {ev.label}{" "}
-              {ev.kind === "limit" ? t("한계 돌파", "limit breached") : ev.direction === "Up" ? t("상승", "rising") : t("하락", "falling")}
-            </li>
-          ))}
-        </ul>
       </section>
     </div>
   );
@@ -806,45 +616,75 @@ const TITLES = (): Record<string, string> => ({
   "2": tr("🔍 [Stage 1 & 2 상세] SigLIP2 시각 앵커 조각 계획 & gocr + Lattice 대장 교정 결과", "🔍 [Stage 1 & 2 Detail] SigLIP2 Visual-Anchor Crop Plan & gocr + Lattice Register Correction"),
   "3": tr("⚖️ [Stage 3 상세] Gate 1 형식 심사 & Gate 2 3중 진실 정합성 교차 대조", "⚖️ [Stage 3 Detail] Gate 1 Format Review & Gate 2 Triple-Truth Cross-Check"),
   "4": tr("🧠 [Stage 4 상세] Gate 3 마인드맵 파급 분석 & Zoro-1 포인터 판단 (jev_head)", "🧠 [Stage 4 Detail] Gate 3 Mind Map Propagation Analysis & Zoro-1 Pointer Verdict (jev_head)"),
-  "5": tr("✍️ [Stage 5 상세] Zoro-1 글쓰기 조치 절차서 초안 · Factcheck 수치 검증 · 최종 결재", "✍️ [Stage 5 Detail] Zoro-1 Action Procedure Draft · Factcheck Figure Check · Final Approval"),
-  sds: tr("⏱️ [시계열 & SDS 심층 분석기] 다중 계통 시계열 파형 동기화 (Δt) 및 SDS 직교 분할 검증", "⏱️ [Time Series & SDS Deep Analyzer] Multi-System Waveform Sync (Δt) & SDS Orthogonal Split Check"),
+  "5": tr("✍️ [Stage 5 상세] Zoro-1 글쓰기 조치 절차서 초안 · Factcheck 수치 검증 (결재는 오른쪽 HUD)", "✍️ [Stage 5 Detail] Zoro-1 Action Procedure Draft · Factcheck Figure Check (approve in the right HUD)"),
   archive: tr("🗄️ 보관 문서 (Gate 5)", "🗄️ Archived Record (Gate 5)"),
 });
 
-/** 우측 통합 결재창의 짧은 결재 (개선안 Part 1 우측 아래: 표준 조치 요약 + [재점검 지시] [확정]).
- *  고위험이면 파트장 공동 결재와 절차서 번호(초안의 번호로 미리 채움)가 함께 갑니다. 오경보 처리 · 시험 버튼은 Stage 5 상세에 있습니다. */
-export function QuickApproval({ detail, supervisor, onDecided, onOpenDetail }: { detail: Detail; supervisor: string; onDecided: (m: string) => void; onOpenDetail: () => void }) {
+/** 결재 (오른쪽 결재 HUD 한 곳, UI 단순화 U1): 표준 조치 요약 · 공동 결재 · [재점검 지시] [조치확정],
+ *  [더 보기] 에 반려 · 고위험 예외승인(오경보) · 근거 절차서 번호 · 증빙 장수 · 재점검 메모.
+ *  확정 막힘(현장 대기 · 선행 절차 · 공동 결재)은 단추가 미리 막고 백엔드 가드레일이 한 번 더 막습니다.
+ *  시연 모드에는 가드레일을 일부러 건드려 보는 시험 단추가 붙습니다 (영상 · E2E). */
+export function QuickApproval({
+  detail,
+  supervisor,
+  demo,
+  onDecided,
+  onOpenDraft,
+}: {
+  detail: Detail;
+  supervisor: string;
+  demo: boolean;
+  onDecided: (m: string, ok: boolean, finalized: boolean) => void;
+  onOpenDraft: () => void;
+}) {
   const terms = useTerms();
   const t = useT();
   const d = detail.analysis.draft;
   const pending = detail.analysis.interlock?.steps.find((s) => s.status !== "passed") ?? null;
+  const awaiting = detail.state === "awaiting_field";
   const [cosign, setCosign] = useState(false);
+  const [more, setMore] = useState(false);
+  const [ref, setRef] = useState(d?.aop_id ?? "");
+  const [scans, setScans] = useState(0);
+  const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [reply, setReply] = useState<string | null>(null);
   useEffect(() => {
     setCosign(false);
+    setMore(false);
+    setRef(detail.analysis.draft?.aop_id ?? "");
+    setScans(0);
+    setNote("");
     setReply(null);
-  }, [detail.id]);
-  const act = async (action: string, note = "") => {
+  }, [detail.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const act = async (action: string) => {
     setBusy(true);
     try {
-      const r = await invoke<{ ok: boolean; message: string }>("decide_incident", { input: { id: detail.id, supervisor_id: supervisor, action, team_lead_cosign: cosign, procedure_ref: d?.aop_id ?? "", evidence_scans: 0, note } });
+      const r = await invoke<{ ok: boolean; message: string; finalized: boolean }>("decide_incident", {
+        input: { id: detail.id, supervisor_id: supervisor, action, team_lead_cosign: cosign, procedure_ref: ref, evidence_scans: scans, note },
+      });
       setReply(r.message);
-      onDecided(r.message);
+      onDecided(r.message, r.ok, r.finalized);
     } catch (e) {
       setReply(String(e));
+      onDecided(String(e), false, false);
     } finally {
       setBusy(false);
     }
   };
-  const awaiting = detail.state === "awaiting_field";
+  const confirmAction = d?.high_risk ? "approve_procedure" : "confirm";
   return (
     <div className="quick-approval">
-      <h4>
-        {t(
-          `[표준 조치 요약 ${d ? (d.problems.length ? "(Fact ✗ 템플릿)" : "(Fact ✓)") : ""}]`,
-          `[Standard Action Summary${d ? (d.problems.length ? " (Fact ✗ template)" : " (Fact ✓)") : ""}]`,
-        )}
+      <h4 className="qa-head">
+        <span>
+          {t(
+            `[표준 조치 요약 ${d ? (d.problems.length ? "(Fact ✗ 템플릿)" : "(Fact ✓)") : ""}]`,
+            `[Standard Action Summary${d ? (d.problems.length ? " (Fact ✗ template)" : " (Fact ✓)") : ""}]`,
+          )}
+        </span>
+        <button className="plain small qa-draft" onClick={onOpenDraft}>
+          {t("📄 초안 전문", "📄 Full draft")}
+        </button>
       </h4>
       {d ? (
         <ol className="quick-steps">
@@ -863,19 +703,19 @@ export function QuickApproval({ detail, supervisor, onDecided, onOpenDetail }: {
         </p>
       )}
       {d?.high_risk && (
-        <label className="check">
+        <label className="check cosign">
           <input type="checkbox" checked={cosign} onChange={(e) => setCosign(e.target.checked)} />
           {t(`파트장 공동 결재 (${d.aop_id}) · 고위험: ${d.risk_actions.join(", ")}`, `Team Lead co-sign (${d.aop_id}) · High-risk: ${d.risk_actions.join(", ")}`)}
         </label>
       )}
       <div className="actions">
-        <button className="plain" disabled={busy} onClick={() => act("recheck", `${terms.control_room} 재점검 지시`)}>
+        <button className="plain recheck" disabled={busy} onClick={() => act("recheck")}>
           {t("재점검 지시", "Order Recheck")}
         </button>
-        <button className="plain" disabled={busy} onClick={onOpenDetail}>
-          {t("상세 결재", "Detailed Approval")}
+        <button className="plain qa-more-toggle" aria-expanded={more} onClick={() => setMore((m) => !m)}>
+          {more ? t("접기 ▴", "Less ▴") : t("더 보기 ▾", "More ▾")}
         </button>
-        <button className="danger-fill" disabled={busy || !!pending || awaiting || (!!d?.high_risk && !cosign)} onClick={() => act(d?.high_risk ? "approve_procedure" : "confirm")}>
+        <button className="danger-fill confirm" disabled={busy || !!pending || awaiting || (!!d?.high_risk && !cosign)} onClick={() => act(confirmAction)}>
           {awaiting
             ? t("⏳ 현장 대기", "⏳ Awaiting Field Check")
             : pending
@@ -885,12 +725,71 @@ export function QuickApproval({ detail, supervisor, onDecided, onOpenDetail }: {
                 : t("🚨 조치확정", "🚨 Confirm Action")}
         </button>
       </div>
-      {reply && <p className="note">{reply}</p>}
+      {more && (
+        <div className="qa-more">
+          {d?.high_risk && (
+            <>
+              <label className="field">
+                {t("근거 절차서 번호", "Procedure ref. no.")}
+                <input className="qa-ref" value={ref} onChange={(e) => setRef(e.target.value)} />
+              </label>
+              <label className="field">
+                {t("오경보 입증 현장 증빙 스캔 (장)", "False-alarm field evidence scans (pages)")}
+                <input className="qa-scans" type="number" min={0} value={scans} onChange={(e) => setScans(Number(e.target.value))} />
+              </label>
+            </>
+          )}
+          <label className="field">
+            {t("현장 재점검 요청 메모", "Field recheck request note")}
+            <input
+              className="qa-note"
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              placeholder={
+                terms.code === "KKS"
+                  ? t("예: 2층 급수조절밸브 포지셔너 현장 확인", "e.g. Check feedwater control valve positioner on 2F")
+                  : t("예: 2층 CDU 유량조절밸브 액추에이터 현장 확인", "e.g. Check CDU flow control valve actuator on 2F")
+              }
+            />
+          </label>
+          <div className="actions">
+            <button className="plain qa-reject" disabled={busy} onClick={() => act("reject")}>
+              {t("반려", "Reject")}
+            </button>
+            {d?.high_risk && (
+              <button className="plain qa-false-positive" disabled={busy} onClick={() => act("approve_false_positive")}>
+                {t("고위험 예외승인 (오경보)", "High-risk exception approval (false alarm)")}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+      {demo && (d?.high_risk || pending || awaiting) && (
+        <div className="qa-tests">
+          <span className="muted">{t("가드레일 시험", "Guardrail tests")}</span>
+          {d?.high_risk && (
+            <button className="plain small qa-test-cosign" disabled={busy} onClick={() => act("confirm")}>
+              {t("(시험) 공동 결재 없이 확정 시도", "(Test) Try confirming without co-sign")}
+            </button>
+          )}
+          {pending && (
+            <button className="plain small qa-test-order" disabled={busy} onClick={() => act(confirmAction)}>
+              {t("(시험) 선행 절차를 건너뛰고 확정 시도", "(Test) Try confirming without prerequisite steps")}
+            </button>
+          )}
+          {awaiting && (
+            <button className="plain small qa-test-field" disabled={busy} onClick={() => act("confirm")}>
+              {t("(시험) 현장 확인 전 확정 시도", "(Test) Try confirming before the field check")}
+            </button>
+          )}
+        </div>
+      )}
+      {reply && <p className="note qa-reply">{reply}</p>}
     </div>
   );
 }
 
-export function StageDrawer({ which, detail, archive, plant, catalog, supervisor, onClose, onDecided }: { which: DrawerKey; detail: Detail | null; archive: ArchiveDoc | null; plant: Plant | null; catalog: Record<string, VerdictInfo>; supervisor: string; onClose: () => void; onDecided: (m: string) => void }) {
+export function StageDrawer({ which, detail, archive, catalog, supervisor, onClose }: { which: DrawerKey; detail: Detail | null; archive: ArchiveDoc | null; catalog: Record<string, VerdictInfo>; supervisor: string; onClose: () => void }) {
   const t = useT();
   return (
     <div className="drawer">
@@ -907,8 +806,7 @@ export function StageDrawer({ which, detail, archive, plant, catalog, supervisor
         {detail && (which === 1 || which === 2) && <Scan detail={detail} />}
         {detail && which === 3 && <Truth detail={detail} supervisor={supervisor} />}
         {detail && which === 4 && <Decision detail={detail} catalog={catalog} />}
-        {detail && which === 5 && <Approval detail={detail} supervisor={supervisor} onDecided={onDecided} />}
-        {detail && plant && which === "sds" && <Sds detail={detail} plant={plant} />}
+        {detail && which === 5 && <Draft detail={detail} supervisor={supervisor} />}
       </div>
     </div>
   );

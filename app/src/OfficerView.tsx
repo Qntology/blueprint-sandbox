@@ -11,15 +11,26 @@ import { causalTraces } from "./cctv/traces";
 import { DEFAULT_SUPERVISOR, DOMAIN_ICON, PLANT_TERMS, PLANT_TERMS_EN, TermsContext, type DomainInfo, type DomainMode } from "./domain";
 import { ModelSettings } from "./ModelSettings";
 import { PhysicsPanel } from "./PhysicsPanel";
-import { fmt, mmss } from "./plant";
+import { fmt } from "./plant";
 import { PlantTopologyView, type Tab } from "./PlantTopologyView";
 import { StageBar, StageDrawer } from "./StagePanel";
 import { TimeScrubber } from "./TimeScrubber";
 import type { ArchiveDoc, Bottleneck, ConsoleStatus, Detail, IncidentRow, Lane, Plant, ScenarioInfo, VerdictInfo } from "./types";
 
-export type DrawerKey = 1 | 2 | 3 | 4 | 5 | "sds" | "archive" | "physics" | null;
+export type DrawerKey = 1 | 2 | 3 | 4 | 5 | "archive" | "physics" | null;
+/** 떠 있는 팝오버 (한 번에 하나): 좌상단 사건 대기열 · 우상단 시연 도구 · 관제 설정 */
+type Popover = "queue" | "demo" | "settings" | null;
+/** 허브 위로 펼치는 판 (한 번에 하나): 검색 결과 · 시계열 · SDS 차트 */
+type Dropup = "search" | "charts" | null;
+/** 허브 위 한 줄 알림. `action` 은 알림에서 바로 하는 일 (보관 문서 열기 · 도착한 현장 보고 열기) */
+interface Notice {
+  kind: "ok" | "err" | "info";
+  text: string;
+  action?: { label: string; run: () => void };
+}
 
 const DARK_KEY = "blueprint.drawing-dark";
+const DEMO_KEY = "blueprint.demo-tools";
 
 function readPref(key: string): string | null {
   try {
@@ -29,11 +40,19 @@ function readPref(key: string): string | null {
   }
 }
 
-/** 관제 콘솔 (기획 Part 8-1 · 개선안 CCTV형 통합 관제판 · 2차 개선안 풀스크린 오버레이 · 추가 개선안 도메인 모드).
- *  고른 3-Way 도면 뷰 하나가 무대 전체에 깔리고(noto-sandbox 의 `inset: 0` 월드), 그 위에 반투명 유리 판이 뜹니다:
- *  좌상단 브랜드 · 도메인 · 사건 대기열 알약과 도면 도구줄, 우상단 뷰 전환 · 흐름 오버레이 · 물리엔진 · 설정 알약,
- *  오른쪽 병목 · 인터록 · 결재 HUD, 아래 가운데 파이프라인 · 타임머신(3줄 미니 파형) · 자연어 질의 허브.
- *  근본 원인 · 경보 · 선택 · 검색 1위 설비에는 CCTV 말풍선이 지시선으로 붙습니다. 선택 설비(`selectedKks`)와 재생 시각(`t`) 하나로 모두 맞물립니다. */
+function writePref(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // 저장소가 막혀 있으면 이번 실행에만
+  }
+}
+
+/** 관제 콘솔 (기획 Part 8-1 · 개선안 CCTV형 통합 관제판 · 2차 개선안 풀스크린 오버레이 · 추가 개선안 도메인 모드 · UI 단순화 기획안).
+ *  고른 3-Way 도면 뷰 하나가 무대 전체에 깔리고, 그 위에 반투명 유리 판이 뜹니다:
+ *  좌상단 브랜드 · 사건 대기열 알약과 도면 도구줄, 우상단 뷰 전환 · 흐름 오버레이 · 시연 도구 · 설정 알약,
+ *  오른쪽 병목 · 인터록 · 결재 HUD(결재는 여기 한 곳), 아래 가운데 파이프라인 · 타임머신 · 자연어 질의 허브.
+ *  팝오버 · Drop-up · 서랍은 종류마다 한 번에 하나만 열리고, ESC 는 맨 위의 것부터 닫습니다. */
 export function OfficerView() {
   const [plant, setPlant] = useState<Plant | null>(null);
   const [domain, setDomain] = useState<DomainInfo | null>(null);
@@ -48,26 +67,25 @@ export function OfficerView() {
   const [mining, setMining] = useState(true);
   const [t, setT] = useState<number | null>(null);
   const [drawer, setDrawer] = useState<DrawerKey>(null);
+  const [popover, setPopover] = useState<Popover>("queue");
+  const [dropup, setDropup] = useState<Dropup>(null);
   const [supervisor, setSupervisor] = useState("OP-201");
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [opening, setOpening] = useState(false);
   const [basis, setBasis] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
-  // 2차 개선안: 떠 있는 판들의 여닫기
+  const [notice, setNotice] = useState<Notice | null>(null);
   const [tab, setTab] = useState<Tab>("drawing");
-  const [queueOpen, setQueueOpen] = useState(true);
   const [hudFolded, setHudFolded] = useState(false);
   const [hudFocus, setHudFocus] = useState(0);
-  const [chartsOpen, setChartsOpen] = useState(false);
   const [search, setSearch] = useState<SearchRun | null>(null);
-  const [searchOpen, setSearchOpen] = useState(false);
   const [context, setContext] = useState(true);
   const [zoomKks, setZoomKks] = useState<string | null>(null);
   const [lanes, setLanes] = useState<Lane[]>([]);
   const [bottlenecks, setBottlenecks] = useState<Bottleneck[]>([]);
   const [dark, setDark] = useState(() => readPref(DARK_KEY) === "1");
+  // 시연 · 시험 도구 (시나리오 주입 · 물리엔진 · 가드레일 시험 단추): 운영 화면에서는 설정에서 숨깁니다
+  const [demo, setDemo] = useState(() => readPref(DEMO_KEY) !== "0");
+  const [resetArmed, setResetArmed] = useState(false);
   const [barSlot, setBarSlot] = useState<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const hubCard = useRef<HTMLDivElement>(null);
@@ -75,15 +93,20 @@ export function OfficerView() {
   const stage = useElementSize(stageRef);
   const lang = useLang();
   const say = useT();
+  const sayRef = useRef(say);
+  sayRef.current = say;
   const terms = plant?.terms ?? domain?.terms ?? (lang === "en" ? PLANT_TERMS_EN : PLANT_TERMS);
   // 창 제목도 화면 언어를 따릅니다 (용어는 백엔드 원장의 것을 번역 표가 바꿈)
   useLanguageSync(useCallback(() => `blueprint ${terms.console_title} (${terms.control_room})`, [terms]));
 
-  const refresh = useCallback(() => {
-    invoke<ConsoleStatus>("console_status").then(setStatus).catch((e) => setError(String(e)));
-    invoke<IncidentRow[]>("incident_list").then(setRows).catch((e) => setError(String(e)));
-    invoke<Plant>("plant_topology").then(setPlant).catch((e) => setError(String(e)));
-  }, []);
+  const fail = useCallback((e: unknown) => setNotice({ kind: "err", text: String(e) }), []);
+  const toggle = (p: Exclude<Popover, null>) => setPopover((o) => (o === p ? null : p));
+  const openSettings = useCallback(() => setPopover("settings"), []);
+
+  // 원장(큰 응답)은 처음 · 도메인 · 언어 · 변경 오버레이 수가 바뀔 때만 받습니다
+  const loadPlant = useCallback(() => {
+    invoke<Plant>("plant_topology").then(setPlant).catch(fail);
+  }, [fail]);
 
   // 도메인마다 달라지는 것: 판정 이름(구역) · 시나리오 목록 · 용어
   const loadDomain = useCallback(() => {
@@ -95,84 +118,130 @@ export function OfficerView() {
     });
   }, []);
 
-  // 확정 직후 보관 문서를 자동으로 연 사건 (한 번만 엽니다)
-  const archiveShown = useRef<string | null>(null);
+  // 프로세스 마이닝 (레인 · 병목): 파이프라인 카드 · 결재 HUD 가 같은 값을 씁니다.
+  const loadMining = useCallback(() => {
+    invoke<{ lanes: Lane[]; bottlenecks: Bottleneck[] }>("mining_overview")
+      .then((m) => {
+        setLanes(m.lanes);
+        setBottlenecks(m.bottlenecks);
+      })
+      .catch(() => {});
+  }, []);
+
+  const incidentRef = useRef<string | null>(null);
+  incidentRef.current = incident;
+  /** 마지막으로 받은 사건 목록 (null = 처음 · 도메인 전환 직후라 도착 알림을 내지 않음) */
+  const rowsRef = useRef<IncidentRow[] | null>(null);
+  const pickRef = useRef<(id: string) => void>(() => {});
+
+  /** 목록을 바꾸고, 현장 단말에서 새로 온 보고(FLD)나 현장 회신을 받아 결재로 넘어간 사건을 알립니다 */
+  const applyRows = useCallback((list: IncidentRow[]) => {
+    const prev = rowsRef.current;
+    rowsRef.current = list;
+    setRows(list);
+    if (!prev) return;
+    const before = new Map(prev.map((r) => [r.id, r]));
+    const arrived = list.find((r) => r.state !== "done" && ((!before.has(r.id) && r.id.startsWith("FLD")) || (before.get(r.id)?.state === "awaiting_field" && r.state === "review")));
+    if (!arrived) return;
+    const s = sayRef.current;
+    setNotice({
+      kind: "info",
+      text: s(`📨 현장 보고 도착 · ${arrived.building} ${arrived.kks} · ${arrived.id}`, `📨 Field report received · ${arrived.building} ${arrived.kks} · ${arrived.id}`),
+      action: { label: s("열기", "Open"), run: () => pickRef.current(arrived.id) },
+    });
+  }, []);
+
+  /** 사건 하나를 엽니다. 처리가 끝난 사건(목록 상태 done)은 보관 문서를, 진행 중이면 상세를 받습니다. */
+  const loadCase = useCallback(
+    (id: string, list: IncidentRow[], keepSelection: boolean, showArchive = false) => {
+      if (list.find((r) => r.id === id)?.state === "done") {
+        setDetail(null);
+        invoke<ArchiveDoc>("archive_detail", { id })
+          .then((a) => {
+            setArchive(a);
+            if (showArchive) setDrawer("archive");
+          })
+          .catch(fail);
+        return;
+      }
+      setArchive(null);
+      invoke<Detail>("incident_detail", { id })
+        .then((d) => {
+          setDetail(d);
+          // 보관 문서 서랍은 진행 중인 사건을 고르면 닫습니다 (빈 서랍이 화면을 가리지 않게)
+          setDrawer((open) => (open === "archive" ? null : open));
+          if (!keepSelection) {
+            setT(d.timeline.now_ms);
+            setSelectedKks(d.analysis.substantive?.causal?.root?.kks ?? d.analysis.route.kks);
+          }
+        })
+        .catch(() => setDetail(null));
+    },
+    [fail],
+  );
+
+  /** 백엔드가 사건이 바뀌었다고 알릴 때 (incident_changed) 한 번: 상태 줄 · 목록 · 고른 사건 · 레인 */
+  const reload = useCallback(() => {
+    invoke<ConsoleStatus>("console_status").then(setStatus).catch(fail);
+    invoke<IncidentRow[]>("incident_list")
+      .then((list) => {
+        applyRows(list);
+        const id = incidentRef.current;
+        if (id) loadCase(id, list, true);
+      })
+      .catch(fail);
+    loadMining();
+  }, [applyRows, fail, loadCase, loadMining]);
+  const reloadRef = useRef(reload);
+  reloadRef.current = reload;
 
   const resetCase = useCallback(() => {
-    archiveShown.current = null;
     setIncident(null);
     setDetail(null);
     setArchive(null);
     setSelectedKks(null);
     setT(null);
     setDrawer(null);
-    setMessage(null);
+    setDropup(null);
+    setNotice(null);
     setSearch(null);
-    setSearchOpen(false);
     setZoomKks(null);
   }, []);
 
   useEffect(() => {
-    refresh();
+    loadPlant();
     loadDomain();
-    const stop = listen("incident_changed", () => refresh());
+    reloadRef.current();
+    const stop = listen("incident_changed", () => reloadRef.current());
     const stopDomain = listen("domain_changed", () => {
       resetCase();
-      refresh();
+      rowsRef.current = null;
+      loadPlant();
       loadDomain();
+      reloadRef.current();
     });
-    const timer = window.setInterval(() => invoke<IncidentRow[]>("incident_list").then(setRows).catch(() => {}), 5000);
+    // 대기 시간(⏳ mm:ss)만 흐르게 하는 느린 예비: 목록 · 레인만 받고, 고른 사건의 상세는 다시 받지 않습니다
+    const timer = window.setInterval(() => {
+      invoke<IncidentRow[]>("incident_list")
+        .then((list) => applyRows(list))
+        .catch(() => {});
+      loadMining();
+    }, 5000);
     return () => {
       void stop.then((f) => f());
       void stopDomain.then((f) => f());
       window.clearInterval(timer);
     };
-  }, [refresh, loadDomain, resetCase]);
+  }, [applyRows, loadDomain, loadMining, loadPlant, resetCase]);
 
-  // 프로세스 마이닝 (레인 · 병목): 파이프라인 줄 · 사건 대기열 · 결재 HUD 가 같은 값을 씁니다.
+  // 승인된 변경(MOC)이 반영되면 원장 오버레이 수가 바뀝니다. 그때만 원장을 다시 받습니다.
+  const lastOverlays = useRef<number | null>(null);
   useEffect(() => {
-    const load = () =>
-      invoke<{ lanes: Lane[]; bottlenecks: Bottleneck[] }>("mining_overview")
-        .then((m) => {
-          setLanes(m.lanes);
-          setBottlenecks(m.bottlenecks);
-        })
-        .catch(() => {});
-    load();
-    const timer = window.setInterval(load, 3000);
-    return () => window.clearInterval(timer);
-  }, [rows.length, status?.audit_count, detail?.id]);
-
-  // 사건을 고르면 상세를 받고, 선택 설비를 근본 원인(없으면 경보 설비)으로 옮깁니다.
-  const loadDetail = useCallback((id: string, keepSelection = false) => {
-    setArchive(null);
-    invoke<Detail>("incident_detail", { id })
-      .then((d) => {
-        setDetail(d);
-        // 확정 뒤 자동으로 연 보관 문서 서랍은 진행 중인 사건을 고르면 닫습니다 (빈 서랍이 화면을 가리지 않게).
-        setDrawer((open) => (open === "archive" ? null : open));
-        if (!keepSelection) {
-          setT(d.timeline.now_ms);
-          setSelectedKks(d.analysis.substantive?.causal?.root?.kks ?? d.analysis.route.kks);
-        }
-      })
-      .catch(() => {
-        setDetail(null);
-        invoke<ArchiveDoc>("archive_detail", { id }).then((a) => {
-          setArchive(a);
-          // 확정 직후 한 번만 보관 문서를 엽니다. 목록이 새로 올 때마다 다시 열면 닫아도 계속 화면을 가립니다.
-          if (archiveShown.current !== id) {
-            archiveShown.current = id;
-            setDrawer("archive");
-          }
-        });
-      });
-  }, []);
-
-  useEffect(() => {
-    if (!incident) return;
-    loadDetail(incident, true);
-  }, [rows, incident, loadDetail]);
+    if (!status) return;
+    const n = status.overlays.length;
+    if (lastOverlays.current !== null && lastOverlays.current !== n) loadPlant();
+    lastOverlays.current = n;
+  }, [status, loadPlant]);
 
   // 새 설비를 고르면 질의 문맥을 다시 켭니다 (문맥 칩 ✕ 는 그 설비에서만 끕니다)
   useEffect(() => setContext(true), [selectedKks]);
@@ -184,11 +253,11 @@ export function OfficerView() {
       first.current = false;
       return;
     }
-    refresh();
+    loadPlant();
     loadDomain();
-    if (incident) loadDetail(incident, true);
+    reloadRef.current();
     setSearch(null);
-    setSearchOpen(false);
+    setDropup((d) => (d === "search" ? null : d));
   }, [lang]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 하단 허브 높이: 서랍 · 차트 Drop-up 이 허브 위에서 멈춥니다
@@ -205,24 +274,53 @@ export function OfficerView() {
 
   function pick(id: string) {
     setIncident(id);
-    setMessage(null);
-    setQueueOpen(false);
-    loadDetail(id);
+    setNotice(null);
+    setPopover((p) => (p === "queue" ? null : p));
+    loadCase(id, rowsRef.current ?? [], false, true);
   }
+  pickRef.current = pick;
+
+  const openArchive = useCallback(
+    (id: string) => {
+      invoke<ArchiveDoc>("archive_detail", { id })
+        .then((a) => {
+          setArchive(a);
+          setDrawer("archive");
+        })
+        .catch(fail);
+    },
+    [fail],
+  );
+
+  /** 결재 결과: 막히면 사유, 확정되면 [보관 문서 열기] 가 붙은 알림 (보관 문서 서랍은 저절로 열리지 않습니다) */
+  const onDecided = useCallback(
+    (msg: string, ok: boolean, finalized: boolean) => {
+      const id = incidentRef.current;
+      setNotice({
+        kind: !ok ? "err" : finalized ? "ok" : "info",
+        text: msg,
+        action: finalized && id ? { label: sayRef.current("🗄️ 보관 문서 열기", "🗄️ Open Archived Record"), run: () => openArchive(id) } : undefined,
+      });
+    },
+    [openArchive],
+  );
 
   async function inject(id: string) {
     setBusy(say(`시나리오 ${id} 주입 중 (Zoro-1 판단 · 글쓰기)`, `Injecting scenario ${id} (Zoro-1 judgment · drafting)`));
-    setError(null);
+    setNotice(null);
+    setPopover(null);
     try {
       const created = await invoke<string | null>("inject_scenario", { id });
       if (created) pick(created);
       else {
         const scans = scenarios.find((s) => s.id === id)?.scans.join(", ");
-        setMessage(say(`${id}: 알람 없이 계측만 바뀌었습니다. 현장 단말에서 Red-line 을 스캔해 보내세요 (스캐너 폴더에 ${scans}).`, `${id}: measurements changed without an alarm. Scan the Red-line on the field terminal and send it (scanner folder: ${scans}).`));
+        setNotice({
+          kind: "info",
+          text: say(`${id}: 알람 없이 계측만 바뀌었습니다. 현장 단말에서 Red-line 을 스캔해 보내세요 (스캐너 폴더에 ${scans}).`, `${id}: measurements changed without an alarm. Scan the Red-line on the field terminal and send it (scanner folder: ${scans}).`),
+        });
       }
-      refresh();
     } catch (e) {
-      setError(String(e));
+      fail(e);
     } finally {
       setBusy(null);
     }
@@ -236,30 +334,55 @@ export function OfficerView() {
         `Switching to ${mode === "aidc" ? "AI Data Center" : "Thermal Power Plant"} mode (ledger · scenarios · drawing index)`,
       ),
     );
-    setError(null);
+    setNotice(null);
     try {
+      // 화면 비우기 · 다시 받기는 백엔드의 domain_changed 알림이 한 번에 합니다
       const d = await invoke<DomainInfo>("switch_domain_mode", { mode });
       setDomain(d);
       setSupervisor(DEFAULT_SUPERVISOR[d.mode]);
-      resetCase();
-      refresh();
-      loadDomain();
     } catch (e) {
-      setError(String(e));
+      fail(e);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** 같은 도메인을 처음 상태로 (사건 · 감사 · 물리엔진 · 현장 단말). 앱을 다시 띄우지 않고 E2E · 시연을 새로 시작합니다. */
+  async function resetSession() {
+    if (!resetArmed) {
+      setResetArmed(true);
+      window.setTimeout(() => setResetArmed(false), 4000);
+      return;
+    }
+    setResetArmed(false);
+    setBusy(say("세션을 처음 상태로 되돌리는 중 (사건 · 감사 · 물리엔진 · 현장 단말)", "Resetting the session (incidents · audit · physics · field terminal)"));
+    try {
+      await invoke("reset_session");
+      setPopover(null);
+    } catch (e) {
+      fail(e);
     } finally {
       setBusy(null);
     }
   }
 
   async function toggleAuto(on: boolean) {
-    setError(null);
+    setNotice(null);
     try {
       await invoke("set_automation", { input: { on, approver_id: supervisor, legal_basis: basis } });
       setOpening(false);
       setBasis("");
-      refresh();
     } catch (e) {
-      setError(String(e));
+      fail(e);
+    }
+  }
+
+  function setDemoPref(on: boolean) {
+    setDemo(on);
+    writePref(DEMO_KEY, on ? "1" : "0");
+    if (!on) {
+      setPopover((p) => (p === "demo" ? null : p));
+      setDrawer((d) => (d === "physics" ? null : d));
     }
   }
 
@@ -274,34 +397,33 @@ export function OfficerView() {
         const engine = sent;
         const result = await invoke<SearchResult>("search", { query: engine });
         setSearch({ typed: text, sent, engine, context: sent !== text ? kks : null, result });
-        setSearchOpen(true);
-        setChartsOpen(false);
+        // 알림 줄은 하나: 새 질의의 요약이 앞 알림을 대신합니다
+        setNotice(null);
+        setDropup("search");
         const top = result.hits[0];
         if (top?.passed && top.doc.kks && top.doc.kks !== selectedKks) setSelectedKks(top.doc.kks);
         return true;
       } catch (e) {
-        setError(String(e));
+        fail(e);
         return false;
       }
     },
-    [plant, context, selectedKks],
+    [plant, context, selectedKks, fail],
   );
 
   // ESC 는 맨 위 판부터 하나씩 닫고(noto-sandbox overlays.js 의 STACK), 닫을 판이 없으면 검색 표시 → 설비 선택을 풉니다.
   // Enter · / 는 어디서든 질의 줄로 (다른 입력 칸 · 단추에 초점이 있을 때는 그대로).
-  const keys = useRef({ zoomKks, drawer, settingsOpen, queueOpen, searchOpen, chartsOpen, search, selectedKks });
-  keys.current = { zoomKks, drawer, settingsOpen, queueOpen, searchOpen, chartsOpen, search, selectedKks };
+  const keys = useRef({ zoomKks, popover, dropup, drawer, search, selectedKks });
+  keys.current = { zoomKks, popover, dropup, drawer, search, selectedKks };
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented || e.isComposing) return;
       const s = keys.current;
       if (e.key === "Escape") {
-        // 화면에 겹친 순서대로: 확대 창(100) → 팝오버(25) → 허브 Drop-up(열리면 22, 서랍 위) → 서랍(20) → 검색 표시 → 설비 선택
+        // 화면에 겹친 순서대로: 확대 창(100) → 팝오버(25) → 허브 Drop-up(22) → 서랍(20) → 검색 표시 → 설비 선택
         if (s.zoomKks) setZoomKks(null);
-        else if (s.settingsOpen) setSettingsOpen(false);
-        else if (s.queueOpen) setQueueOpen(false);
-        else if (s.searchOpen) setSearchOpen(false);
-        else if (s.chartsOpen) setChartsOpen(false);
+        else if (s.popover) setPopover(null);
+        else if (s.dropup) setDropup(null);
         else if (s.drawer !== null) setDrawer(null);
         else if (s.search) setSearch(null);
         else if (s.selectedKks) setSelectedKks(null);
@@ -323,7 +445,7 @@ export function OfficerView() {
   const selected = useMemo(() => plant?.equipment.find((e) => e.kks === selectedKks) ?? null, [plant, selectedKks]);
   const crumb = selected?.breadcrumb ?? [];
   const at = t ?? detail?.timeline.now_ms ?? 0;
-  // 트립(셧다운) 잔여: 경보 센서의 TTF 와 보호 정지 한계
+  // 트립(셧다운) 잔여: 경보 센서의 TTF 와 보호 정지 한계. 머리 숫자는 타임머신의 배지 한 곳에만 보입니다.
   const ttf = detail ? (detail.analysis.trigger.ttf_secs ?? detail.analysis.substantive?.ttf_secs ?? null) : null;
   const alarmSensor = detail?.analysis.route.tag ? plant?.sensors.find((s) => s.tag === detail.analysis.route.tag) : undefined;
   const tripLimit = alarmSensor ? (alarmSensor.trip_high ?? alarmSensor.trip_low) : null;
@@ -339,7 +461,7 @@ export function OfficerView() {
         setHudFocus((n) => n + 1);
       }
     : null;
-  const toast = search ? searchSummary(search, say) : null;
+  const searchToast = search ? searchSummary(search, say) : null;
   const TABS: [Tab, string][] = [
     ["drawing", say(`① ${terms.drawing} 도면`, `① ${terms.drawing} Drawing`)],
     ["mermaid", say("② Mermaid 계통", "② Mermaid Diagram")],
@@ -368,11 +490,7 @@ export function OfficerView() {
               dark={dark}
               onDark={(on) => {
                 setDark(on);
-                try {
-                  localStorage.setItem(DARK_KEY, on ? "1" : "0");
-                } catch {
-                  // 저장소가 막혀 있으면 이번 실행에만
-                }
+                writePref(DARK_KEY, on ? "1" : "0");
               }}
               onZoom={setZoomKks}
               onInterlock={onInterlock}
@@ -381,36 +499,31 @@ export function OfficerView() {
             <div className="world-empty">{say("계통을 읽는 중입니다", "Loading the plant topology")}</div>
           )}
 
-          {/* 좌상단: 브랜드 · 도메인 · 사건 대기열, 뷰 도구줄(도면 선택 · 전체 계통 · A0), 공간 Depth */}
+          {/* 좌상단: 브랜드 · 사건 대기열, 뷰 도구줄(도면 선택 · 전체 계통 · A0), 공간 Depth(설비를 고를 때만) */}
           <header className="corner-tl">
             <div className="corner-row ov-avoid">
               <span className="brand-mark ov-pill">
-                ⚡ blueprint <span className="brand-title" title={terms.console_title}>{terms.console_title}</span>
+                ◆ blueprint <span className="brand-title" title={terms.console_title}>{terms.console_title}</span>
               </span>
-              <div className="domain-switch ov-pill" role="group" aria-label={say("도메인 모드", "Domain mode")}>
-                {(domain?.modes ?? []).map((m) => (
-                  <button key={m.mode} className={m.mode === domain?.mode ? "seg active" : "seg"} disabled={!!busy} onClick={() => void switchDomain(m.mode)} title={say(`${m.label} 모드`, `${m.label} mode`)}>
-                    {DOMAIN_ICON[m.mode]} {m.label}
-                  </button>
-                ))}
-              </div>
-              <button className={`ov-pill queue-pill ${waiting ? "hot" : ""}`} aria-expanded={queueOpen} aria-controls="incident-popover" onClick={() => setQueueOpen((o) => !o)}>
-                {say(`🚨 사건 대기열 · 대기 ${waiting}건`, `🚨 Incident Queue · ${waiting} pending`)} {queueOpen ? "▴" : "▾"}
+              <button className={`ov-pill queue-pill ${waiting ? "hot" : ""}`} aria-expanded={popover === "queue"} aria-controls="incident-popover" onClick={() => toggle("queue")}>
+                {say(`🚨 사건 대기열 · 대기 ${waiting}건`, `🚨 Incident Queue · ${waiting} pending`)} {popover === "queue" ? "▴" : "▾"}
               </button>
             </div>
             <div className="corner-slot ov-avoid" ref={setBarSlot} />
-            <nav className="breadcrumb ov-bar ov-avoid" aria-label={say("공간 Depth", "Spatial Depth")}>
-              <span className="crumb-title">{say("공간 Depth", "Spatial Depth")}</span>
-              {(crumb.length ? crumb : [plant?.domain === "aidc" ? say("Lv1 센터", "Lv1 Center") : say("Lv1 호기", "Lv1 Unit"), say("Lv2 섹터", "Lv2 Sector"), say("Lv3 층", "Lv3 Floor"), say(`Lv4 ${terms.drawing} 도면`, `Lv4 ${terms.drawing} drawing`), `Lv5 ${terms.code}`]).map((c, i) => (
-                <span key={i} className="crumb">
-                  <em>Lv{i + 1}.</em> {c}
-                  {i < 4 && <b>▸</b>}
-                </span>
-              ))}
-            </nav>
+            {crumb.length > 0 && (
+              <nav className="breadcrumb ov-bar ov-avoid" aria-label={say("공간 Depth", "Spatial Depth")}>
+                <span className="crumb-title">{say("공간 Depth", "Spatial Depth")}</span>
+                {crumb.map((c, i) => (
+                  <span key={i} className="crumb">
+                    <em>Lv{i + 1}.</em> {c}
+                    {i < crumb.length - 1 && <b>▸</b>}
+                  </span>
+                ))}
+              </nav>
+            )}
           </header>
 
-          {/* 우상단: 3-Way 뷰 · 흐름 오버레이 · 물리엔진 · 설정 */}
+          {/* 우상단: 3-Way 뷰 · 흐름 오버레이 · 시연 도구 · 설정 */}
           <div className="corner-tr">
             <div className="corner-row ov-avoid">
               <div className="view-pill ov-pill" role="tablist" aria-label={say("3-Way 도면 뷰", "3-Way drawing views")}>
@@ -421,62 +534,78 @@ export function OfficerView() {
                 ))}
               </div>
               <label className={`mining-toggle ov-pill ${mining ? "on" : ""}`} title={say("배관 흐름 · 병목 · 근본 원인 물결을 도면 · 마인드맵 위에 겹칩니다", "Overlay pipe flow, bottlenecks and root-cause ripples on the drawing and mind map")}>
-                <input type="checkbox" checked={mining} onChange={(e) => setMining(e.target.checked)} />{say("⚡ 흐름 · 병목", "⚡ Flow · Bottleneck")} {mining ? "ON" : "OFF"}
+                <input type="checkbox" checked={mining} onChange={(e) => setMining(e.target.checked)} />
+                {say("🌊 흐름 · 병목", "🌊 Flow · Bottleneck")} {mining ? "ON" : "OFF"}
               </label>
-              {/* 영어 이름은 길어 머리줄 왼쪽(사건 대기열 알약)을 덮으므로 짧게 쓰고 전체 이름은 풍선 도움말 · 서랍 제목으로 */}
-              <button className="ov-pill physics-open" onClick={() => setDrawer("physics")} title={say("물리엔진 · 자율 대응", "Physics Engine · Autonomous Response")}>
-                {say("⚡ 물리엔진 · 자율 대응", "⚡ Physics Engine")}
-              </button>
-              <button className={`ov-pill settings-pill ${status?.automation ? "auto" : ""}`} aria-expanded={settingsOpen} onClick={() => setSettingsOpen((o) => !o)}>
+              {demo && (
+                <button className="ov-pill demo-pill" aria-expanded={popover === "demo"} aria-controls="demo-popover" onClick={() => toggle("demo")} title={say("시나리오 주입 · 물리엔진 · 세션 초기화 (설정에서 숨김)", "Scenario injection · physics engine · session reset (hide in Settings)")}>
+                  {say("🧪 시연 · 시험", "🧪 Demo · Test")} {popover === "demo" ? "▴" : "▾"}
+                </button>
+              )}
+              <button className={`ov-pill settings-pill ${status?.automation ? "auto" : ""}`} aria-expanded={popover === "settings"} onClick={() => toggle("settings")}>
                 ⚙️ {supervisor} · {status?.automation ? say("자동화 모드", "Automation Mode") : say("보조 모드", "Assist Mode")} ▾
               </button>
             </div>
           </div>
 
-          {/* 사건 대기열 팝오버: 시뮬레이터 · 마이닝 레인 · 확인 대기 · 처리 완료 */}
-          <section className="incident-popover ov-panel vp-glass ov-avoid" id="incident-popover" hidden={!queueOpen} aria-label={say("사건 대기열", "Incident Queue")}>
+          {/* 사건 대기열 팝오버: 확인 대기 · 처리 완료 (시나리오 주입은 시연 판으로 옮겼습니다) */}
+          <section className="incident-popover ov-panel vp-glass ov-avoid" id="incident-popover" hidden={popover !== "queue"} aria-label={say("사건 대기열", "Incident Queue")}>
             <div className="ov-head">
               <b>{say("🚨 사건 대기열", "🚨 Incident Queue")}</b>
-              <span className="muted">
-                {say(`대기 ${waiting} · 처리 완료 ${rows.length - waiting}`, `${waiting} pending · ${rows.length - waiting} closed`)}
-              </span>
-              <button className="ov-close" onClick={() => setQueueOpen(false)} aria-label={say("닫기", "Close")}>
+              <button className="ov-close" onClick={() => setPopover(null)} aria-label={say("닫기", "Close")}>
                 ✕
               </button>
             </div>
-            <select
-              className="sim"
-              value=""
-              disabled={!!busy}
-              onChange={(e) => {
-                if (e.target.value) void inject(e.target.value);
-              }}
-            >
-              <option value="">{say(`${terms.telemetry} 시뮬레이터 · 시나리오 주입`, `${terms.telemetry} simulator · inject scenario`)}</option>
-              {scenarios.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.id} · {s.title}
-                </option>
-              ))}
-            </select>
-            {lanes.length > 0 && (
-              <div className="lane-line" title={say("프로세스 마이닝 레인 (Stage 1 ~ 5 대기)", "Process mining lanes (Stage 1 ~ 5 waiting)")}>
-                {lanes.map((l) => (
-                  <span key={l.key} className={`lane-chip ${l.count > 0 && l.max_wait_secs > 0 && l.key !== "done" ? "hold" : ""}`}>
-                    {l.label} <b>{l.count}</b>
-                    {l.count > 0 && l.max_wait_secs > 0 && l.key !== "done" ? ` ⏳ ${mmss(l.max_wait_secs)}` : ""}
-                  </span>
-                ))}
-              </div>
-            )}
-            <AlarmQueue rows={rows} selected={incident} onPick={pick} catalog={catalog} />
+            <AlarmQueue rows={rows} selected={incident} onPick={pick} catalog={catalog} demo={demo} />
           </section>
 
-          {/* 설정 팝오버: 교대감독 사번 · 자동화 모드 · 모델 관리 (모델 관리는 늘 붙어 있어야 시작 때 모델을 확인합니다) */}
-          <section className="settings-popover ov-panel vp-glass" hidden={!settingsOpen} aria-label={say("관제 설정", "Console settings")}>
+          {/* 시연 · 시험 도구 팝오버: 시나리오 주입 · 물리엔진 시뮬레이터 · 세션 초기화 */}
+          {demo && (
+            <section className="demo-popover ov-panel vp-glass ov-avoid" id="demo-popover" hidden={popover !== "demo"} aria-label={say("시연 · 시험 도구", "Demo · test tools")}>
+              <div className="ov-head">
+                <b>{say("🧪 시연 · 시험 도구", "🧪 Demo · Test Tools")}</b>
+                <span className="muted">{say("명령은 시뮬레이터 · 합성 원장에만 들어갑니다", "Commands go to the simulator and synthetic ledger only")}</span>
+                <button className="ov-close" onClick={() => setPopover(null)} aria-label={say("닫기", "Close")}>
+                  ✕
+                </button>
+              </div>
+              <select
+                className="sim"
+                value=""
+                disabled={!!busy}
+                onChange={(e) => {
+                  if (e.target.value) void inject(e.target.value);
+                }}
+              >
+                <option value="">{say(`${terms.telemetry} 시뮬레이터 · 시나리오 주입`, `${terms.telemetry} simulator · inject scenario`)}</option>
+                {scenarios.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.id} · {s.title}
+                  </option>
+                ))}
+              </select>
+              <div className="demo-actions">
+                <button
+                  className="plain demo-physics"
+                  onClick={() => {
+                    setPopover(null);
+                    setDrawer("physics");
+                  }}
+                >
+                  {say("⚡ 물리엔진 · 자율 대응", "⚡ Physics Engine · Autonomous Response")}
+                </button>
+                <button className={`plain demo-reset ${resetArmed ? "armed" : ""}`} disabled={!!busy} onClick={() => void resetSession()}>
+                  {resetArmed ? say("한 번 더 누르면 초기화", "Press again to reset") : say("↺ 세션 초기화", "↺ Reset session")}
+                </button>
+              </div>
+            </section>
+          )}
+
+          {/* 설정 팝오버: 화면 언어 · 도메인 · 교대감독 사번 · 자동화 모드 · 시연 도구 · 모델 관리 (모델 관리는 늘 붙어 있어야 시작 때 모델을 확인합니다) */}
+          <section className="settings-popover ov-panel vp-glass" hidden={popover !== "settings"} aria-label={say("관제 설정", "Console settings")}>
             <div className="ov-head">
               <b>{say("⚙️ 관제 설정", "⚙️ Console Settings")}</b>
-              <button className="ov-close" onClick={() => setSettingsOpen(false)} aria-label={say("닫기", "Close")}>
+              <button className="ov-close" onClick={() => setPopover(null)} aria-label={say("닫기", "Close")}>
                 ✕
               </button>
             </div>
@@ -484,8 +613,18 @@ export function OfficerView() {
               <span>{say("화면 언어", "Display language")} · Language</span>
               <div className="domain-switch ov-pill">
                 {(["ko", "en"] as Lang[]).map((l) => (
-                  <button key={l} className={lang === l ? "seg active" : "seg"} data-lang={l} onClick={() => void chooseLang(l).catch((e) => setError(String(e)))}>
+                  <button key={l} className={lang === l ? "seg active" : "seg"} data-lang={l} onClick={() => void chooseLang(l).catch(fail)}>
                     {l === "ko" ? "🇰🇷 한국어" : "🇺🇸 English"}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="lang-row domain-row" role="group" aria-label={say("도메인 모드", "Domain mode")}>
+              <span title={say("바꾸면 사건 · 감사 기록 · 자동화 모드를 비웁니다", "Switching clears incidents, the audit log and automation mode")}>{say("도메인 (바꾸면 사건을 비움)", "Domain (switching clears incidents)")}</span>
+              <div className="domain-switch ov-pill">
+                {(domain?.modes ?? []).map((m) => (
+                  <button key={m.mode} className={m.mode === domain?.mode ? "seg active" : "seg"} disabled={!!busy} onClick={() => void switchDomain(m.mode)} title={say(`${m.label} 모드`, `${m.label} mode`)}>
+                    {DOMAIN_ICON[m.mode]} {m.label}
                   </button>
                 ))}
               </div>
@@ -520,7 +659,18 @@ export function OfficerView() {
                 </button>
               </div>
             )}
-            <ModelSettings open={settingsOpen} onOpen={() => setSettingsOpen(true)} />
+            <div className="lang-row demo-row" role="group" aria-label={say("시연 · 시험 도구", "Demo · test tools")}>
+              <span title={say("시나리오 주입 · 물리엔진 시뮬레이터 · 가드레일 시험 단추 · 세션 초기화", "Scenario injection · physics simulator · guardrail test buttons · session reset")}>{say("시연 · 시험 도구", "Demo · test tools")}</span>
+              <div className="domain-switch ov-pill">
+                <button className={demo ? "seg active" : "seg"} onClick={() => setDemoPref(true)}>
+                  {say("보이기", "Show")}
+                </button>
+                <button className={demo ? "seg" : "seg active"} onClick={() => setDemoPref(false)}>
+                  {say("숨기기", "Hide")}
+                </button>
+              </div>
+            </div>
+            <ModelSettings open={popover === "settings"} onOpen={openSettings} />
           </section>
 
           <RightRail
@@ -532,36 +682,33 @@ export function OfficerView() {
             t={t}
             catalog={catalog}
             supervisor={supervisor}
-            onDecided={(msg) => {
-              setMessage(msg);
-              refresh();
-            }}
-            onOpenApproval={() => setDrawer(5)}
+            demo={demo}
+            onDecided={onDecided}
+            onOpenDraft={() => setDrawer(5)}
             bottlenecks={bottlenecks}
             folded={hudFolded}
             onFold={setHudFolded}
             focus={hudFocus}
-            ttf={ttf !== null ? say(`⏱ ${terms.trip} ${ttf.toFixed(0)}초`, `⏱ ${terms.trip} ${ttf.toFixed(0)} s`) : null}
           />
 
-          {/* 하단 가운데 허브: [Drop-up] · 알림 · 파이프라인 · 타임머신 · 자연어 질의 */}
+          {/* 하단 가운데 허브: [Drop-up] · 알림 한 줄 · 파이프라인 · 타임머신 · 자연어 질의 */}
           <section className="hub ov-avoid" aria-label={say("관제 허브", "Control hub")}>
-            {searchOpen && search && (
+            {dropup === "search" && search && (
               <SearchDropup
                 run={search}
-                onClose={() => setSearchOpen(false)}
+                onClose={() => setDropup(null)}
                 onSelect={setSelectedKks}
                 onPick={pick}
                 onInterlock={() => onInterlock?.()}
                 interlockKks={interlockKks}
               />
             )}
-            {chartsOpen && detail && plant && (
+            {dropup === "charts" && detail && plant && (
               <section className="telemetry-dropup dropup vp-glass ov-avoid" aria-label={say("시계열 · SDS 로직 차트", "Time-series · SDS logic charts")}>
                 <div className="ov-head">
                   <b>{say("📈 CAM-02 시계열 · 🧠 CAM-03 SDS 로직 차트", "📈 CAM-02 Time Series · 🧠 CAM-03 SDS Logic Chart")}</b>
                   <span className="muted">{say("재생 시각 t 와 선택 설비에 맞물려 움직입니다", "Follows the replay time t and the selected equipment")}</span>
-                  <button className="ov-close" onClick={() => setChartsOpen(false)} aria-label={say("닫기", "Close")}>
+                  <button className="ov-close" onClick={() => setDropup(null)} aria-label={say("닫기", "Close")}>
                     ✕
                   </button>
                 </div>
@@ -571,58 +718,51 @@ export function OfficerView() {
                 </div>
               </section>
             )}
-            {(busy || error || message) && (
-              <div className={`cmd-toast notice ${error ? "err" : busy ? "busy" : "ok"}`} role="status">
-                {busy && <span className="spin" aria-hidden="true" />}
-                <span className="toast-text">{busy ?? error ?? message}</span>
-                {!busy && (
-                  <button
-                    className="ov-close"
-                    onClick={() => {
-                      setError(null);
-                      setMessage(null);
-                    }}
-                    aria-label={say("알림 닫기", "Dismiss notice")}
-                  >
-                    ✕
+            {busy ? (
+              <div className="cmd-toast notice busy" role="status">
+                <span className="spin" aria-hidden="true" />
+                <span className="toast-text">{busy}</span>
+              </div>
+            ) : notice ? (
+              <div className={`cmd-toast notice ${notice.kind}`} role="status">
+                <span className="toast-text" title={notice.text}>
+                  {notice.text}
+                </span>
+                {notice.action && (
+                  <button className="plain small toast-action" onClick={notice.action.run}>
+                    {notice.action.label}
                   </button>
                 )}
+                <button className="ov-close" onClick={() => setNotice(null)} aria-label={say("알림 닫기", "Dismiss notice")}>
+                  ✕
+                </button>
               </div>
-            )}
-            {toast && (
-              <div className={`cmd-toast ${toast.kind}`} role="status">
+            ) : searchToast ? (
+              <div className={`cmd-toast ${searchToast.kind}`} role="status">
                 <span className="toast-text" title={search?.sent}>
-                  {toast.text}
+                  {searchToast.text}
                 </span>
                 <button
                   className="ov-close"
                   onClick={() => {
                     setSearch(null);
-                    setSearchOpen(false);
+                    setDropup((d) => (d === "search" ? null : d));
                   }}
                   aria-label={say("검색 표시 지우기", "Clear search highlights")}
                 >
                   ✕
                 </button>
               </div>
-            )}
+            ) : null}
             <div className="hub-card vp-glass" ref={hubCard}>
-              <StageBar
-                detail={detail}
-                onOpen={(k) => setDrawer(k)}
-                lanes={lanes}
-                tail={
-                  <button className={`plain charts-toggle ${chartsOpen ? "active" : ""}`} disabled={!detail} aria-expanded={chartsOpen} onClick={() => setChartsOpen((o) => !o)} title={say("CAM-02 시계열 · CAM-03 SDS 로직 차트를 허브 위로 펼칩니다", "Open the CAM-02 time-series and CAM-03 SDS logic charts above the hub")}>
-                    📈 CAM-02·03 {chartsOpen ? "▼" : "▲"}
-                  </button>
-                }
-              />
+              <StageBar detail={detail} onOpen={(k) => setDrawer(k)} lanes={lanes} />
               {detail && plant && (
                 <TimeScrubber
                   detail={detail}
                   t={at}
                   onT={setT}
-                  onSds={() => setDrawer("sds")}
+                  charts={dropup === "charts"}
+                  onCharts={() => setDropup((d) => (d === "charts" ? null : "charts"))}
                   traces={traces}
                   lead={
                     ttf !== null && (
@@ -640,11 +780,8 @@ export function OfficerView() {
                 context={context}
                 onContext={setContext}
                 run={search}
-                open={searchOpen}
-                onToggle={() => {
-                  setSearchOpen((o) => !o);
-                  setChartsOpen(false);
-                }}
+                open={dropup === "search"}
+                onToggle={() => setDropup((d) => (d === "search" ? null : "search"))}
                 onSubmit={runSearch}
               />
             </div>
@@ -672,21 +809,7 @@ export function OfficerView() {
               </div>
             </div>
           )}
-          {drawer !== null && drawer !== "physics" && (
-            <StageDrawer
-              which={drawer}
-              detail={detail}
-              archive={archive}
-              plant={plant}
-              catalog={catalog}
-              supervisor={supervisor}
-              onClose={() => setDrawer(null)}
-              onDecided={(msg) => {
-                setMessage(msg);
-                refresh();
-              }}
-            />
-          )}
+          {drawer !== null && drawer !== "physics" && <StageDrawer which={drawer} detail={detail} archive={archive} catalog={catalog} supervisor={supervisor} onClose={() => setDrawer(null)} />}
           {zoomKks && plant && <CctvZoom kks={zoomKks} plant={plant} detail={detail} t={at} onClose={() => setZoomKks(null)} onT={setT} />}
         </div>
         <footer className="status-bar">
@@ -694,8 +817,6 @@ export function OfficerView() {
           <span>
             {say("도메인", "Domain")}: {domain ? `${DOMAIN_ICON[domain.mode]} ${domain.label}` : "-"} · {plant?.kind}
           </span>
-          <span>{say(`확인 대기 ${status?.pending ?? 0}건`, `${status?.pending ?? 0} pending`)}</span>
-          <span>{say(`보관 ${status?.archived ?? 0}건`, `${status?.archived ?? 0} archived`)}</span>
           <span>{say(`설비 관계망 ${status?.graph_nodes ?? 0}노드`, `Equipment graph ${status?.graph_nodes ?? 0} nodes`)}</span>
           <span>
             {say(`${terms.change} 오버레이 ${status?.overlays.length ?? 0}건`, `${terms.change} overlays ${status?.overlays.length ?? 0}`)}

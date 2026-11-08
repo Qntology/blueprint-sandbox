@@ -84,6 +84,15 @@ export function usePanZoom(fit: Rect, resetKey: unknown) {
 
   const reset = useCallback(() => setView({ s: 1, x: 0, y: 0 }), []);
 
+  /** 판 안의 사각형(판 좌표, 배율 1 기준)이 보기 창을 채우게 확대합니다 (A0 타일 누르기). */
+  const zoomTo = useCallback((r: Rect) => {
+    const { fit: f } = live.current;
+    const s = Math.min(MAX_S, Math.max(MIN_S, Math.min(f.w / Math.max(r.w, 1), f.h / Math.max(r.h, 1))));
+    const next = { s, x: (f.w - s * r.w) / 2 - s * r.x, y: (f.h - s * r.h) / 2 - s * r.y };
+    live.current = { ...live.current, view: next };
+    setView(next);
+  }, []);
+
   useEffect(() => {
     if (!el) return;
     const origin = () => el.getBoundingClientRect();
@@ -153,7 +162,7 @@ export function usePanZoom(fit: Rect, resetKey: unknown) {
   }, [el, zoomAt]);
 
   const style = { left: fit.x, top: fit.y, width: fit.w, height: fit.h, transform: `translate(${view.x}px, ${view.y}px) scale(${view.s})` };
-  return { view, style, bind, zoomAt, reset };
+  return { view, style, bind, zoomAt, zoomTo, reset };
 }
 
 /** 설비 자리 (무대 좌표). `remote` 는 설비가 다른 도면에 있어 이 도면의 점프 커넥터로 대신 가리킬 때 그 도면 번호 */

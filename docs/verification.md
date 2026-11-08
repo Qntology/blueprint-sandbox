@@ -589,3 +589,45 @@ tract 는 ONNX 에 적힌 동적 축 이름으로 모델당 한 번만 최적화
 | --- | --- | --- |
 | 한국어 | **통과** | 앱 시작 때 검색 모델 읽기 3.5 s (Stanza ko 0.4 · en 1.8 · 임베딩 1.3), 검색 표 · 개념 뱅크 임베딩 4.2 s. 머리줄에 `🧠 Stanza en · ko · 임베딩 granite-97m`, 기록에 `NMS 조각 '주급수 유량조절밸브' → 주급수 유량조절밸브 (설비 · 코사인 1.000 · z 4.6)`. 문맥 질의 `상류 1홉` → `문맥 10LAB10AP001 + '상류 1홉'` · 4건 |
 | 영어 (화면 번역 없이 엔진이 영어를 읽음) | **통과** | `main feedwater flow control valve 1 hop upstream` → `NMS segment … → Main Feedwater Flow Control Valve (equipment · cosine 0.988 · z 3.7)` · 기준 설비 10LAB20AA102 · 1위 Main Feedwater Pump A. 문맥 `1 hop upstream` → `context 10LAB10AP001 + '1 hop upstream'` · 4 hits. 화면 감사가 찾은 한글은 새 모델 설정 이름 두 줄 → 번역 표에 더함 |
+
+## 14. UI · 절차 단순화 (2026-11-09)
+
+기획안 0 ~ 2단계를 구현한 기록은 [ui-simplify-plan.md](ui-simplify-plan.md) 입니다. 다른 세션이 같은 GPU 에서 평가(`it_v2f` 최대 3.9 GB · `it_v2` 0.35 GB)를
+돌리는 중이라, 모델을 쓰는 앱 E2E 는 VRAM 을 나눠 쓰는 모드(`node scripts/e2e/run.js --share-gpu 2200`)로 돌렸습니다.
+
+### 14.1 화면이 부르는 백엔드 명령 수 (`scripts/e2e/ipc_probe.js`, 규칙 모드 · GPU 안 씀)
+
+| 구간 | 전 (d5a9ffd) | 후 |
+| --- | --- | --- |
+| 가만히 60초 | 96 (ensure_models 32 · check_model_status 32 · mining_overview 20 · incident_list 12) | 24 (incident_list 12 · mining_overview 12) |
+| 사건을 고른 채 60초 | 132 (incident_detail 12 포함) | 24 (incident_detail 0) |
+| 타임머신 재생 10초 | 1,157 (ensure_models 575 · check_model_status 574) | 4 |
+
+E2E 17 흐름 전체(한국어, 396 s)에서는 ensure_models 0 · incident_detail 30(알림 때만) · plant_topology 6 입니다 (`out/shots_ko/ipc_calls.json`).
+
+### 14.2 앱 E2E (실제 앱 두 창 · ROCm · 실제 모델, GPU 나눠 쓰기)
+
+| 실행 | 설정 | 결과 | VRAM: 이 앱 최대 · 중앙 / 어댑터 최대 |
+| --- | --- | --- | --- |
+| 한국어 17 흐름 | 가중치 상한 1,432 MB · 버퍼 캐시 256 MB | 16/17. PHYS 과열기 고점 646.6 ℃ (트립 645), 완화 제안 48.2 s | 3,083 · 1,277 / 7,787 MB |
+| 영어 17 흐름 | 가중치 상한 1,000 MB · 버퍼 캐시 0 · 지킴 7,876 MB | 16/17. DPHYS GPU 정션 고점 96.8 ℃ (셧다운 95). PHYS 643.3 ℃ 통과 | 2,922 · 1,212 / 7,429 MB (지킴 작동 0) |
+
+- 바뀐 화면을 지나는 흐름은 두 언어 모두 통과했습니다: 결재 HUD(공동 결재 · 가드레일 시험 단추 · 인터록 · 확정) · 허브 알림의 [보관 문서 열기] ·
+  현장 보고 도착 알림 · 시연 판 주입 · 설정의 도메인 전환 · A0 타일 맞춤 확대 · "TTF 머리 숫자 한 곳" 검사.
+- 물리엔진 두 흐름은 실행마다 한쪽이 빗나갔습니다. 상한 때문에 Zoro-1 판단이 블록을 나눠 올려 느려져, 완화 제안이 전체 상주 때 28.7 ~ 29.6 s(10.2 · 11.3절)에서
+  43.7 ~ 48.2 s 로 늦었습니다. 초안 글쓰기는 모든 블록이 함께 있어야 해서 실패하고 템플릿 초안으로 대신했습니다. GPU 를 혼자 쓸 때 다시 잴 항목입니다.
+- 영어 화면에 남은 한글은 스캔 원문(김래현, 일부러 둠)과 공유 모드의 상주 관리 오류 문구였습니다. 오류 문구는 번역 틀을 더해(`scripts/i18n/en_engine.py`) 대조 0 입니다.
+
+### 14.3 GPU 나눠 쓰기에서 잰 것
+
+- 같은 GPU 의 다른 평가는 30초 사이 0.2 ~ 3.6 GB 를 오르내렸습니다 (총 8,176 MB). 엔진의 기본 상한(시작 때 여유 − 1 GB)은 그 평가가 적게 쓸 때
+  크게 잡히므로 `BLUEPRINT_VRAM_BUDGET_MB` 로 고정해야 합니다.
+- 상한은 가중치에만 걸립니다. 허용치를 넘은 표본은 모두 현장 스캔 판독(P1 · D1) 때였고, 활성값이 1.6 GB 까지 더 붙었습니다.
+  그래서 `--share-gpu MB` 는 가중치 상한을 MB − 1200 으로 잡고, 어댑터 전체가 총량 − 300 MB 이상인 표본이 두 번 이어지면 앱을 내립니다.
+- 다른 평가의 두 프로세스는 두 실행 내내 계속 돌았습니다 (CPU 시간이 계속 늘어남).
+
+### 14.4 시험
+
+- `npx tsc --noEmit` · `npm run build` 통과.
+- 앱 크레이트 ROCm release 빌드 통과 (`lib.rs`: `reset_session` · 모델 확인 명령 비동기). core 는 바꾸지 않았습니다.
+- 녹화(record.js)는 새 화면으로 다시 찍지 않았습니다. 장면 ID 는 그대로 두고 선택자 · 자막만 고쳤습니다.

@@ -9,8 +9,9 @@ const SAMPLES = 320;
 
 /** 하단 타임머신 리플레이 (기획 Part 8-1B 4절). 슬라이더를 움직이면 세 뷰의 색 · 흐름 · 병목이 그 시각으로 바뀝니다.
  *  2차 개선안: 하단 허브 안의 한 줄로 줄이고, 슬라이더 바탕에 상류(D-1) · 원인(D 0) · 경보(D+n) 3줄 미니 파형을 깔아
- *  CAM-02 를 펼치지 않아도 변곡이 어디서 먼저 났는지 보입니다. */
-export function TimeScrubber({ detail, t, onT, onSds, traces, lead }: { detail: Detail; t: number; onT: (t: number) => void; onSds: () => void; traces: CausalTrace[]; lead?: ReactNode }) {
+ *  CAM-02 를 펼치지 않아도 변곡이 어디서 먼저 났는지 보입니다. 끝의 [📈 시계열 · SDS] 가 허브 위 차트 Drop-up 을 여닫습니다
+ *  (예전 SDS 분석기 서랍과 단계 줄의 CAM 단추를 이 하나로 합침, UI 단순화 U2). */
+export function TimeScrubber({ detail, t, onT, charts, onCharts, traces, lead }: { detail: Detail; t: number; onT: (t: number) => void; charts: boolean; onCharts: () => void; traces: CausalTrace[]; lead?: ReactNode }) {
   const tl = detail.timeline;
   const length = Math.max(...Object.values(tl.series).map((v) => v.length), 1);
   const start = tl.t0_ms;
@@ -102,8 +103,8 @@ export function TimeScrubber({ detail, t, onT, onSds, traces, lead }: { detail: 
       <span className="mono scrub-time">
         {clock(t)} ({signedSecs(t, origin)})
       </span>
-      <button className="teal" onClick={onSds}>
-        {say("⏱️ 시계열 · SDS 분석기", "⏱️ Time-series · SDS Analyzer")}
+      <button className={`teal charts-toggle ${charts ? "active" : ""}`} aria-expanded={charts} onClick={onCharts} title={say("CAM-02 시계열 · CAM-03 SDS 로직 차트를 허브 위로 펼칩니다", "Open the CAM-02 time-series and CAM-03 SDS logic charts above the hub")}>
+        {say("📈 시계열 · SDS", "📈 Time-series · SDS")} {charts ? "▼" : "▲"}
       </button>
     </div>
   );

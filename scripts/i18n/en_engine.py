@@ -298,6 +298,13 @@ PATTERNS = [
     [r"전파 지연: ([\d.]+)초 뒤 (.+) 이상", "propagation delay: $2 abnormal $1 s later"],
     [r"상류가 ([\d.]+)초 먼저 변함", "upstream changed $1 s earlier"],
     [r"병목 손실: ", "bottleneck loss: "],
+    # 상주 관리 오류 (residency.rs OverBudget · DeviceMemoryShort): VRAM 상한을 둔 실행(run.js --share-gpu)에서 초안 글쓰기 실패 사유로 보입니다.
+    # 아래 "블록 N..M" 일반 틀보다 앞에 둬야 문장 전체가 맞습니다.
+    [r"블록 (\d+)\.\.(\d+) 묶음 (\d+) MB 를 올리면 가중치 예산 (\d+) MB 를 넘습니다 \(지금 (\d+) MB 상주\)", "loading blocks $1..$2 ($3 MB) would exceed the weight budget of $4 MB ($5 MB resident)"],
+    [r"비전 묶음 (\d+) MB 를 올리면 가중치 예산 (\d+) MB 를 넘습니다 \(지금 (\d+) MB 상주\)", "loading the vision group ($1 MB) would exceed the weight budget of $2 MB ($3 MB resident)"],
+    [r"출력 묶음 (\d+) MB 를 올리면 가중치 예산 (\d+) MB 를 넘습니다 \(지금 (\d+) MB 상주\)", "loading the output group ($1 MB) would exceed the weight budget of $2 MB ($3 MB resident)"],
+    [r"블록 (\d+)\.\.(\d+) 묶음은 장치 메모리 (\d+) MB 가 필요한데 여유가 (\d+) MB 뿐입니다 \(여유분 (\d+) MB 포함\)\. 같은 GPU 를 쓰는 다른 프로그램을 닫거나 BLUEPRINT_ZORO_STREAM_BLOCKS 로 구간을 줄이세요",
+     "blocks $1..$2 need $3 MB of device memory but only $4 MB is free (including $5 MB headroom). Close other programs using the same GPU or reduce the span with BLUEPRINT_ZORO_STREAM_BLOCKS"],
     [r"블록 (\d+)\.\.(\d+)", "blocks $1..$2"],
     [r"셧다운 도달 예상: ", "time to shutdown: "],
     [r"트립 도달 예상: ", "time to trip: "],

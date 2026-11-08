@@ -2,15 +2,22 @@ import { useT } from "./i18n";
 import { mmss } from "./plant";
 import type { IncidentRow, VerdictInfo } from "./types";
 
-/** 알람 · 사건 대기열: 현장 대기 · 결재 대기 · 처리 완료 (2차 개선안: 좌상단 [🚨 사건 대기열] 알약의 팝오버 안) */
-export function AlarmQueue({ rows, selected, onPick, catalog }: { rows: IncidentRow[]; selected: string | null; onPick: (id: string) => void; catalog: Record<string, VerdictInfo> }) {
+/** 알람 · 사건 대기열: 현장 대기 · 결재 대기 · 처리 완료 (2차 개선안: 좌상단 [🚨 사건 대기열] 알약의 팝오버 안).
+ *  시나리오 주입 · 프로세스 마이닝 레인은 여기서 뺐습니다 (주입은 시연 판, 레인은 파이프라인 카드). */
+export function AlarmQueue({ rows, selected, onPick, catalog, demo }: { rows: IncidentRow[]; selected: string | null; onPick: (id: string) => void; catalog: Record<string, VerdictInfo>; demo: boolean }) {
   const t = useT();
   const waiting = rows.filter((r) => r.state !== "done");
   const done = rows.filter((r) => r.state === "done");
   return (
     <aside className="queue">
       <h3>{t(`확인 대기 (${waiting.length})`, `Pending (${waiting.length})`)}</h3>
-      {waiting.length === 0 && <p className="muted">{t("대기 중인 사건이 없습니다. 위의 시뮬레이터로 시나리오를 넣어 보세요.", "No incidents waiting. Inject a scenario with the simulator above.")}</p>}
+      {waiting.length === 0 && (
+        <p className="muted">
+          {demo
+            ? t("대기 중인 사건이 없습니다. 우상단 🧪 시연 판에서 시나리오를 넣어 보세요.", "No incidents waiting. Inject a scenario from the 🧪 Demo panel at the top right.")
+            : t("대기 중인 사건이 없습니다.", "No incidents waiting.")}
+        </p>
+      )}
       {waiting.map((r) => (
         <button key={r.id} className={`queue-item ${r.verdict_class ?? ""} ${selected === r.id ? "selected" : ""}`} onClick={() => onPick(r.id)}>
           <strong>

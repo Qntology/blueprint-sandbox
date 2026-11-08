@@ -8,8 +8,13 @@ import { SignaturePad, type SignatureStats } from "./SignaturePad";
 
 const RESET_SECONDS = 40;
 const IDLE_RESET_SECONDS = 180;
+/** 서명 규칙 (core/src/state_machine/gate1_formal.rs 의 SIGN_MIN_STROKES · SIGN_MIN_AREA 와 같은 값). 판정은 코어가 하고,
+ *  단말은 같은 기준으로 보내기 단추를 미리 막아 "보냄 → 서명 다시 → 소명 다시" 왕복을 없앱니다. */
+const SIGN_MIN_STROKES = 2;
+const SIGN_MIN_AREA = 0.15;
 
-type Phase = "start" | "scanning" | "pick" | "form" | "excuse" | "sent" | "finished";
+// 관할 섹터 고르기 화면은 없앴습니다: 엔진은 고른 섹터를 쓰지 않고 설비 코드의 원장 섹터로 라우팅 · 관할을 봅니다 (UI 단순화 K1).
+type Phase = "start" | "scanning" | "form" | "excuse" | "sent" | "finished";
 type Kind = "gauge_card" | "redline" | "manual";
 type Values = Record<string, string>;
 
@@ -81,7 +86,7 @@ interface FieldReply {
   message: string | null;
 }
 
-const STEP_OF: Record<Phase, number> = { start: 0, scanning: 0, pick: 1, form: 2, excuse: 2, sent: 3, finished: 3 };
+const STEP_OF: Record<Phase, number> = { start: 0, scanning: 0, form: 1, excuse: 1, sent: 2, finished: 2 };
 
 /** 현장 순시 · 정비 운전원 단말 (기획 Part 8-2 2절). 내부 판정 코드 · 확신도 · 마인드맵은 이 화면에 오지 않습니다. */
 export function KioskView() {
@@ -97,9 +102,9 @@ export function KioskView() {
     terms.code.endsWith("코드") ? `대상 ${terms.code}` : `대상 ${terms.code} 코드`,
     /(code|코드)$/i.test(terms.code) ? terms.code.charAt(0).toUpperCase() + terms.code.slice(1) : `${terms.code} Code`,
   );
+  const kindLabel = (k: Kind) => (k === "gauge_card" ? t("현장계기점검표", "Gauge Inspection Sheet") : k === "redline" ? t("설비변경 Red-line", "Equipment Change Red-line") : t("현장 수치 직접 입력", "Manual Field Entry"));
   const STEPS = [
     t("도면/계기 스캔", "Scan Drawing/Gauge"),
-    t("관할 섹터 선택", "Choose Sector"),
     t(`판독값 · ${aidc ? "LoTo" : "LOTO"} 서명`, `Readings · ${aidc ? "LoTo" : "LOTO"} Sign-off`),
     t(`${terms.control_room} 전송`, `Send to ${terms.control_room}`),
   ];
@@ -130,6 +135,9 @@ export function KioskView() {
   const [receipt, setReceipt] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [hold, setHold] = useState(false);
+  // 스캔이 서류 종류를 정했으면 종류 칩은 접어 두고, 비워 둬도 되는 센서 태그 칸은 [더 보기] 로 (UI 단순화 K3)
+  const [kindOpen, setKindOpen] = useState(false);
+  const [showTag, setShowTag] = useState(false);
   const receiptRef = useRef<string | null>(null);
 
   // 구역 이름 · 용어는 백엔드 글이라 받을 때의 화면 언어로 옵니다 (번역은 invoke 감싸기). 언어가 바뀌면 다시 받습니다.
@@ -166,7 +174,7 @@ export function KioskView() {
   }, [phase]);
 
   useEffect(() => {
-    if (phase !== "pick" && phase !== "form" && phase !== "excuse") return;
+    if (phase !== "form" && phase !== "excuse") return;
     let timer = window.setTimeout(reset, IDLE_RESET_SECONDS * 1000);
     const touched = () => {
       window.clearTimeout(timer);
@@ -202,6 +210,8 @@ export function KioskView() {
     setReceipt(null);
     setNotice(null);
     setHold(false);
+    setKindOpen(false);
+    setShowTag(false);
     setScanImage(null);
     setScanSize(null);
     setBoxes({});
@@ -230,8 +240,8 @@ export function KioskView() {
         setUsePaper(true);
       }
       if (r.kind) setKind(r.kind);
-      // 표제란에서 섹터를 알아냈으면 섹터 선택을 건너뜁니다.
-      setPhase(filled.sector ? "form" : "pick");
+      // 섹터는 묻지 않습니다 (표제란에서 읽었으면 제목에만 보이고, 없으면 엔진이 설비 코드로 정함)
+      setPhase("form");
     } catch (e) {
       setError(String(e));
       setPhase("start");
@@ -320,6 +330,8 @@ export function KioskView() {
             ? t("현장 실측치", "Field Reading")
             : null;
   const signMissing = !usePaper && !sig;
+  // 패드가 이미 재는 획수 · 면적 · 직선 여부로 코어와 같은 규칙을 미리 봅니다 (코어 판정은 그대로 남음)
+  const signWeak = !usePaper && !!sig && (sig.stroke_count < SIGN_MIN_STROKES || sig.bbox_area_ratio < SIGN_MIN_AREA || sig.single_line);
 
   // 숫자 칸 스테퍼: 장갑을 끼고도 누를 수 있게 키보드 대신 큰 버튼 (개선안 4단계)
   const bump = (key: string, d: number) =>
@@ -400,7 +412,7 @@ export function KioskView() {
               className="big plain"
               onClick={() => {
                 setKind("manual");
-                setPhase("pick");
+                setPhase("form");
               }}
             >
               {t("스캔 없이 수치입력", "Enter Values Without Scanning")}
@@ -412,32 +424,6 @@ export function KioskView() {
           <div className="spinner" />
           <p>{t("도면 · 점검표를 읽고 있습니다", "Reading the drawing and inspection sheet")}</p>
           <h1>{t("SigLIP2 로 읽을 곳을 고르고 gocr 로 글자를 읽습니다", "SigLIP2 picks where to read, then gocr reads the text")}</h1>
-        </section>
-      ) : phase === "pick" ? (
-        <section className="kiosk-card">
-          <h2>{t("어느 섹터(건물)의 설비 점검인가요?", "Which sector (building) is this equipment check for?")}</h2>
-          <div className="choices">
-            {sectors.map((s) => (
-              <button
-                key={s.key}
-                className="choice"
-                onClick={() => {
-                  setValues((v) => ({ ...v, sector: s.key }));
-                  setPhase("form");
-                }}
-              >
-                <strong>
-                  {s.building} {s.label} ({s.kks})
-                </strong>
-                <span>{s.blurb}</span>
-              </button>
-            ))}
-          </div>
-          <div className="actions">
-            <button className="plain" onClick={reset}>
-              {t("처음으로", "Start Over")}
-            </button>
-          </div>
         </section>
       ) : phase === "form" ? (
         <section className="kiosk-card">
@@ -457,17 +443,32 @@ export function KioskView() {
             </div>
           )}
           <div className="kind-switch">
-            {(["gauge_card", "redline", "manual"] as Kind[]).map((k) => (
-              <button key={k} className={kind === k ? "chip active" : "chip"} onClick={() => setKind(k)}>
-                {k === "gauge_card" ? t("현장계기점검표", "Gauge Inspection Sheet") : k === "redline" ? t("설비변경 Red-line", "Equipment Change Red-line") : t("현장 수치 직접 입력", "Manual Field Entry")}
-              </button>
-            ))}
+            {docs.length > 0 && !kindOpen ? (
+              <>
+                <span className="chip active">{kindLabel(kind)}</span>
+                <button className="plain small" onClick={() => setKindOpen(true)}>
+                  {t("종류 바꾸기", "Change type")}
+                </button>
+              </>
+            ) : (
+              (["gauge_card", "redline", "manual"] as Kind[]).map((k) => (
+                <button key={k} className={kind === k ? "chip active" : "chip"} onClick={() => setKind(k)}>
+                  {kindLabel(k)}
+                </button>
+              ))
+            )}
           </div>
           <div className="form-grid">
             {field("worker_name", t("점검자 성함", "Inspector Name"), t("예: 이승민", "e.g. Lee Seung-min"))}
             {field("worker_id", t("사번", "Employee ID"), example(eg.id))}
             {field("kks", codeLabel, example(eg.kks))}
-            {field("tag", t("센서 태그", "Sensor Tag"), example(eg.tag))}
+            {showTag || scanned.includes("tag") || values.tag?.trim() ? (
+              field("tag", t("센서 태그 (선택)", "Sensor Tag (optional)"), example(eg.tag))
+            ) : (
+              <button type="button" className="plain more-field" onClick={() => setShowTag(true)}>
+                {t("＋ 센서 태그 (선택 · 비우면 설비의 첫 센서)", "＋ Sensor tag (optional · blank = the equipment's first sensor)")}
+              </button>
+            )}
             {kind === "redline" ? (
               <>
                 {field("moc_no", t(`${terms.change} 변경번호`, `${terms.change} No.`), example(eg.moc))}
@@ -507,14 +508,16 @@ export function KioskView() {
             <button className="plain" disabled={busy} onClick={scan}>
               {t("도면/사진 더 넣기", "Add Drawing/Photo")}
             </button>
-            <button className="green" disabled={busy || missing !== null || signMissing} onClick={() => submit(null)}>
+            <button className="green" disabled={busy || missing !== null || signMissing || signWeak} onClick={() => submit(null)}>
               {busy
                 ? t("전송 중입니다", "Sending…")
                 : missing
                   ? t(`${missing} 칸을 채워 주세요`, `Required: ${missing}`)
                   : signMissing
                     ? t("서명해 주세요", "Please sign")
-                    : t(`${terms.control_room}로 전송하기`, `Send to ${terms.control_room}`)}
+                    : signWeak
+                      ? t("서명을 다시 해 주세요 (획 2회 이상 · 면적 15% 이상 · 직선 아님)", "Please sign again (2+ strokes · 15%+ of the pad · not a straight line)")
+                      : t(`${terms.control_room}로 전송하기`, `Send to ${terms.control_room}`)}
             </button>
           </div>
         </section>
@@ -541,6 +544,9 @@ export function KioskView() {
           )}
           {error && <p className="error">{error}</p>}
           <div className="actions">
+            <button className="plain" disabled={busy} onClick={reset}>
+              {t("처음으로", "Start Over")}
+            </button>
             <button className="plain" disabled={busy} onClick={() => setPhase("form")}>
               {t("이전 화면", "Back")}
             </button>
