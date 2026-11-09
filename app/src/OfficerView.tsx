@@ -828,7 +828,7 @@ export function OfficerView() {
           {zoomKks && plant && <CctvZoom kks={zoomKks} plant={plant} detail={detail} t={at} onClose={() => setZoomKks(null)} onT={setT} />}
         </div>
         <footer className="status-bar">
-          <span>{say("엔진", "Engine")}: {status?.engine ?? "-"}</span>
+          <span>{say("엔진", "Engine")}: {status?.engine ? (engineer ? status.engine : status.engine.replace(/\s*\(SharedResidency\)/, "")) : "-"}</span>
           <span>
             {say("도메인", "Domain")}: {domain ? `${DOMAIN_ICON[domain.mode]} ${domain.label}` : "-"} · {plant?.kind}
           </span>

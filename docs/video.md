@@ -40,9 +40,10 @@
 ```bat
 node scripts\e2e\run.js --record --out out\rec\master_ko
 node scripts\e2e\run.js --record --lang en --out out\rec\master_en
-:: 한 장면만 다시: --only P1 --out out\rec\master_ko_p1 (편집기가 실패한 장면을 뒤 폴더의 것으로 바꿉니다)
-python scripts\e2e\edit_video.py --lang ko --rec out/rec/master_ko --rec out/rec/master_ko_p1 --out out/video/blueprint_master_e2e_ko.mp4
-python scripts\e2e\edit_video.py --lang en --rec out/rec/master_en --out out/video/blueprint_master_e2e_en.mp4
+:: 한 장면만 다시: --only P1 --out out\rec\master_ko_p1 (편집기는 장면마다 그 장면이 성공한 마지막 --rec 폴더의 것을 씁니다)
+:: 데이터센터 장면만 다시 찍을 때는 데이터센터로 띄웁니다: set BLUEPRINT_DOMAIN=aidc 뒤 --only DPHYS --out out\rec\master_en_dphys
+python scripts\e2e\edit_video.py --lang ko --rec out/rec/master_ko --out out/video/blueprint_master_e2e_ko.mp4
+python scripts\e2e\edit_video.py --lang en --rec out/rec/master_en --rec out/rec/master_en_dphys --out out/video/blueprint_master_e2e_en.mp4
 ```
 
 UI 단순화(2026-11-09, [ui-simplify-plan.md](ui-simplify-plan.md)) 뒤 장면은 같은 ID 로 화면만 바뀌었습니다: 결재 · 가드레일 시험은 오른쪽 결재 HUD
@@ -50,6 +51,8 @@ UI 단순화(2026-11-09, [ui-simplify-plan.md](ui-simplify-plan.md)) 뒤 장면�
 더해진 장면: `p2.ref` (공동 결재 + 근거 절차서 번호를 초안 전문에서 읽어 침), `p1.request` · `d1.request` (단말 첫 화면의 현장 확인 요청을 골라 설비 코드를 채움).
 record.js 는 설정의 **엔지니어 보기**를 켜고 찍습니다 (기획 문구의 코드 이름 `jev_head` · `PointerPrompt` · `verdict.rs` 가 보이게, 운영 기본은 끔).
 주입한 알람 사건의 초안은 사건이 열린 뒤 뒤에서 채워지므로(P6), 일찍 연 Stage 5 서랍에는 "✍️ 초안 작성 중" 과 템플릿이 보일 수 있습니다.
+2026-11-09 에 이 화면으로 다시 찍었습니다 (한국어 15.9분 · 영어 16.9분, 장면 15/15). 영어 녹화 중에 다른 세션의 GPU 평가가 시작돼 DPHYS 고점이
+95.1 ℃ (셧다운 95) 로 넘어, DPHYS 만 다시 찍어(`master_en_dphys`, 고점 90.0 ℃) 편집기에 두 번째 `--rec` 로 넘겼습니다.
 
 손으로 하던 순서 (참고):
 
