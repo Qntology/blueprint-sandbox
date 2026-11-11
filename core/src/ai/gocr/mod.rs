@@ -24,12 +24,12 @@ use candle_core::{Device, Tensor};
 
 use self::config::GocrConfig;
 use self::image::PreparedImage;
-use self::text::{top1, AttnMode, Decoder, KvCache, PendingKv, Pos};
+use self::text::{top3, AttnMode, Decoder, KvCache, PendingKv, Pos};
 use super::gguf_model::load_active;
 use super::kv_turbo::{self, KvShape};
 use super::ocr::{LanguageDecoder, LanguageWeights, OcrEngine, PhaseCtx, VisionEncoder};
 use super::residency::{headroom_bytes, Loaded, SharedResidency};
-use super::speculative::{decode, BlockDiffusion, BlockModel, DecodeOptions};
+use super::speculative::{decode, BlockDiffusion, BlockModel, DecodeOptions, Pick};
 use super::tokenizer::ModelTokenizer;
 use super::weights::WeightFile;
 
@@ -123,6 +123,9 @@ pub struct OcrOutput {
     pub min_confidence: f32,
     /// 글자별 신뢰도 (`text` 의 글자 수와 같습니다). 값 하나가 믿을 만한지 칸 단위로 볼 때 씁니다.
     pub char_confidence: Vec<f32>,
+    /// 확신이 낮은 디코딩 스텝([`SHADOW_CEIL`] 밑)마다 모델이 본 2 · 3위 토큰의 바이트 (대부분 비어 있음). 원장 교정이 "모델이 그 자리에서
+    /// 실제로 본 글자" 인지 확인하는 근거로 씁니다 ([`alt_supports`], `Lattice::person_with_evidence`). 디코딩 결과는 바꾸지 않습니다.
+    pub alt_pieces: Vec<AltPiece>,
     /// 끝 토큰에 닿기 전에 길이 제한으로 멈췄는가
     pub truncated: bool,
     /// 초안 · 검증 순전파 횟수
@@ -205,7 +208,7 @@ impl GocrLanguage {
         let mut cache = KvCache::with_codec(c.n_layers, kv_turbo::plan(&shape, device, free, headroom_bytes())?);
         let (h, kv) = dec.forward(&cache, &p.embeds, &p.pos, AttnMode::Causal)?;
         cache.commit(&kv, p.pos.len())?;
-        let first = top1(&dec.last_logits(&h)?);
+        let first = Pick::from_top3(top3(&dec.last_logits(&h)?));
         let prefill_ms = t.elapsed().as_secs_f64() * 1e3;
         let t = Instant::now();
         let mut session = Session { lang: self, dec, cache, next_pos: p.next_pos, device, pending: None };
@@ -225,12 +228,14 @@ impl GocrLanguage {
         let mean = if out.confs.is_empty() { 0.0 } else { out.confs.iter().sum::<f32>() / out.confs.len() as f32 };
         let min = out.confs.iter().copied().fold(1.0f32, f32::min);
         let char_confidence = char_confidences(text.chars().count(), &out.tokens, &out.confs, |ids| self.tokenizer.decode(ids))?;
+        let alt_pieces = alt_pieces(&text, &out.tokens, &out.confs, &out.alts, |id| self.tokenizer.token_bytes(id));
         Ok(OcrOutput {
             text,
             tokens: out.tokens,
             mean_confidence: mean,
             min_confidence: min,
             char_confidence,
+            alt_pieces,
             truncated: out.truncated,
             drafts: out.drafts,
             verifies: out.verifies,
@@ -241,6 +246,79 @@ impl GocrLanguage {
             decode_ms,
         })
     }
+}
+
+/// 이 확신 밑의 토큰만 대안을 봅니다 (OCR개선안 4.2 의 0.92: 그 위는 1위 토큰을 그대로 믿음)
+pub const SHADOW_CEIL: f32 = 0.92;
+/// 대안 토큰으로 인정할 최소 확률 (4.2 의 0.08: 모델이 거의 보지 않은 글자는 근거가 아님)
+pub const MIN_ALT_PROB: f32 = 0.08;
+
+/// 확신이 낮은 디코딩 스텝 하나에서 모델이 본 대안 토큰 (OCR개선안 4.2). 바이트 수준 BPE 라 한글 한 글자가 토큰 둘 셋에 걸치고,
+/// 다른 글자는 토큰 수부터 다릅니다 (" 입" = `Ġìŀ` + `ħ`, " 김" = `Ġê` + `¹` + `Ģ`). 그래서 대안 토큰 하나를 넣고 다시 풀어서는
+/// 다른 글자가 나오지 않고(깨진 글자), 글자가 아니라 바이트로 둡니다: '입' 자리 첫 스텝의 2위가 `Ġê` 면 모델은 그 자리에서
+/// EA 로 시작하는 글자(가 ~ 깋, 김 포함)를 본 것입니다.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AltPiece {
+    /// 이 스텝 토큰이 `text` 에서 시작하는 바이트 자리
+    pub at: usize,
+    /// 이 스텝 1위 토큰의 확률
+    pub conf: f32,
+    /// 2 · 3위 토큰의 바이트와 확률 ([`MIN_ALT_PROB`] 이상만)
+    pub alts: Vec<(Vec<u8>, f32)>,
+}
+
+/// 디코딩 스텝의 대안 토큰을 바이트 조각으로 옮깁니다. 토큰 바이트를 이어 붙인 것이 `text` 와 다르면(정리 · 특수 토큰) 자리를 믿을 수 없어 비웁니다.
+fn alt_pieces(text: &str, tokens: &[u32], confs: &[f32], alts: &[[(u32, f32); 2]], token_bytes: impl Fn(u32) -> Option<Vec<u8>>) -> Vec<AltPiece> {
+    if alts.len() != tokens.len() || confs.len() != tokens.len() {
+        return Vec::new();
+    }
+    let Some(bytes) = tokens.iter().map(|&t| token_bytes(t)).collect::<Option<Vec<Vec<u8>>>>() else { return Vec::new() };
+    if bytes.concat() != text.as_bytes() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut at = 0;
+    for (k, piece) in bytes.iter().enumerate() {
+        if confs[k] < SHADOW_CEIL {
+            let seen: Vec<(Vec<u8>, f32)> = alts[k].iter().filter(|(t, p)| *t != u32::MAX && *p >= MIN_ALT_PROB).filter_map(|&(t, p)| Some((token_bytes(t)?, p))).filter(|(b, _)| !b.is_empty()).collect();
+            if !seen.is_empty() {
+                out.push(AltPiece { at, conf: confs[k], alts: seen });
+            }
+        }
+        at += piece.len();
+    }
+    out
+}
+
+/// `text` 의 `i` 번째 글자를 `want` 로 읽을 판독 근거가 있는가 (OCR개선안 4.2 의 "철창 3"). 확신이 `max_conf` 밑인 스텝의 대안 조각이
+/// 그 글자를 `want` 로 바꾼 글과 같은 바이트 자리에서 이어지면 근거입니다: 조각이 그 글자 바이트에 닿아야 하고(앞 공백 `Ġ` 만 걸친 것은 아님),
+/// 글자 중간에서 시작한 조각은 그 앞 바이트가 두 글자에서 같아야 하며, 원래 글과도 이어지는 조각(대안이 아님)은 셈하지 않습니다.
+pub fn alt_supports(text: &str, pieces: &[AltPiece], i: usize, want: char, max_conf: f32) -> bool {
+    let Some((b0, ch)) = text.char_indices().nth(i) else { return false };
+    if ch == want {
+        return false;
+    }
+    let b1 = b0 + ch.len_utf8();
+    let base = text.as_bytes();
+    let mut buf = [0u8; 4];
+    let want = want.encode_utf8(&mut buf).as_bytes();
+    pieces.iter().filter(|p| p.conf < max_conf && p.at + 4 > b0 && p.at < b1).any(|p| {
+        let s = p.at;
+        // 바꾼 글의 s 부터: [s, b0) 원래 바이트 + want (s 가 글자 안이면 그 앞 바이트가 같아야 함) + b1 뒤 원래 바이트
+        let mut cand: Vec<u8> = Vec::with_capacity(base.len() - s + want.len());
+        if s < b0 {
+            cand.extend_from_slice(&base[s..b0]);
+            cand.extend_from_slice(want);
+        } else {
+            let k = s - b0;
+            if k >= want.len() || want[..k] != base[b0..s] {
+                return false;
+            }
+            cand.extend_from_slice(&want[k..]);
+        }
+        cand.extend_from_slice(&base[b1..]);
+        p.alts.iter().any(|(alt, prob)| *prob >= MIN_ALT_PROB && s + alt.len() > b0 && cand.starts_with(alt) && !base[s..].starts_with(alt))
+    })
 }
 
 /// 토큰 신뢰도를 글자 신뢰도로 옮깁니다. 글자 하나가 토큰 둘에 걸치면 둘 중 낮은 값을 씁니다.
@@ -275,23 +353,24 @@ impl Session<'_> {
         (0..n as u32).map(|i| [self.next_pos + i; 3]).collect()
     }
 
-    fn run(&self, ids: &[u32], mode: AttnMode) -> Result<(Vec<(u32, f32)>, PendingKv)> {
+    fn run(&self, ids: &[u32], mode: AttnMode) -> Result<(Vec<Pick>, PendingKv)> {
         let x = self.lang.embed(ids, self.device)?;
         let (h, kv) = self.dec.forward(&self.cache, &x, &self.positions(ids.len()), mode)?;
-        let top = self.dec.logits(&h)?.iter().map(|l| top1(l)).collect();
+        // 로짓은 이미 CPU 행이라 상위 셋을 뽑는 비용은 1위만 뽑을 때와 같은 한 번 훑기입니다
+        let top = self.dec.logits(&h)?.iter().map(|l| Pick::from_top3(top3(l))).collect();
         Ok((top, kv))
     }
 }
 
 impl BlockModel for Session<'_> {
-    fn draft(&mut self, first: u32, n: usize) -> Result<Vec<(u32, f32)>> {
+    fn draft(&mut self, first: u32, n: usize) -> Result<Vec<Pick>> {
         let mask = self.lang.diffusion.map(|d| d.mask_id).ok_or_else(|| anyhow!("블록 디퓨전 설정이 없습니다"))?;
         let mut ids = vec![mask; n];
         ids[0] = first;
         Ok(self.run(&ids, AttnMode::Block)?.0)
     }
 
-    fn verify(&mut self, candidates: &[u32]) -> Result<Vec<(u32, f32)>> {
+    fn verify(&mut self, candidates: &[u32]) -> Result<Vec<Pick>> {
         let (top, kv) = self.run(candidates, AttnMode::Causal)?;
         self.pending = Some(kv);
         Ok(top)
@@ -337,4 +416,62 @@ pub fn open(model_dir: &Path, residency: SharedResidency, max_tokens: usize, str
     };
     engine.announce();
     Ok(engine)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// gocr 어휘 그대로의 토큰 쪼개기 (tokenizer.json 실측): " 입" = Ġìŀ(20 EC 9E) + ħ(85), "래" = ëŀĺ(EB 9E 98), "현" = íĺ(ED 98) + Ħ(84)
+    const TEXT: &str = "2026-11-04 입래현";
+
+    fn pieces_for(alt_at_ip: &[u8], p_ip: f32, alt_at_rae: &[u8], p_rae: f32) -> Vec<AltPiece> {
+        let ip = TEXT.find('입').unwrap();
+        let rae = TEXT.find('래').unwrap();
+        vec![AltPiece { at: ip - 1, conf: 0.55, alts: vec![(alt_at_ip.to_vec(), p_ip)] }, AltPiece { at: rae, conf: 0.7, alts: vec![(alt_at_rae.to_vec(), p_rae)] }]
+    }
+
+    fn idx(c: char) -> usize {
+        TEXT.chars().position(|x| x == c).unwrap()
+    }
+
+    #[test]
+    fn a_byte_piece_supports_a_letter_that_needs_more_tokens_than_the_misread() {
+        // '입' 자리 첫 스텝의 2위 Ġê(20 EA) 는 " 김"(20 EA B9 80) 의 앞, '래' 자리의 2위 íĥ(ED 83) 은 '태'(ED 83 9C) 의 앞
+        let p = pieces_for(&[0x20, 0xEA], 0.21, &[0xED, 0x83], 0.12);
+        assert!(alt_supports(TEXT, &p, idx('입'), '김', 0.95));
+        assert!(alt_supports(TEXT, &p, idx('래'), '태', 0.95));
+        // 근거가 없는 글자 · 같은 글자 · 근거 조각이 없는 자리
+        assert!(!alt_supports(TEXT, &p, idx('입'), '박', 0.95), "박 = EB B0 95");
+        assert!(!alt_supports(TEXT, &p, idx('래'), '래', 0.95));
+        assert!(!alt_supports(TEXT, &p, idx('현'), '희', 0.95));
+        // 모델이 0.95 이상 확신한 스텝은 근거가 아님
+        assert!(!alt_supports(TEXT, &p, idx('입'), '김', 0.5));
+    }
+
+    #[test]
+    fn a_piece_that_only_repeats_the_reading_or_stops_before_the_letter_is_not_evidence() {
+        // 공백만(Ġ) 인 대안은 글자에 닿지 않고, 원래 바이트로 이어지는 대안(Ġìŀ)은 대안이 아님
+        let p = pieces_for(&[0x20], 0.3, &[0xEB, 0x9E], 0.3);
+        assert!(!alt_supports(TEXT, &p, idx('입'), '김', 0.95));
+        assert!(!alt_supports(TEXT, &p, idx('래'), '태', 0.95));
+        // 글자 중간에서 시작한 조각: 앞 바이트가 같은 글자(입 EC 9E 85 → 잎 EC 9E 8E)만
+        let mid = vec![AltPiece { at: TEXT.find('입').unwrap() + 2, conf: 0.6, alts: vec![(vec![0x8E], 0.2)] }];
+        assert!(alt_supports(TEXT, &mid, idx('입'), '잎', 0.95));
+        assert!(!alt_supports(TEXT, &mid, idx('입'), '김', 0.95));
+    }
+
+    #[test]
+    fn decoder_alternatives_become_byte_pieces_at_their_offsets() {
+        // 토큰: '2' · ' ' + EC 9E · 85 (= "2 입"), 둘째 스텝만 확신이 낮음
+        let text = "2 입";
+        let bytes: Vec<Vec<u8>> = vec![b"2".to_vec(), vec![0x20, 0xEC, 0x9E], vec![0x85], vec![0x20, 0xEA], vec![0x41]];
+        let tb = |id: u32| bytes.get(id as usize).cloned();
+        let alts = [[(4, 0.3), (u32::MAX, 0.0)], [(3, 0.21), (4, 0.01)], [(0, 0.5), (u32::MAX, 0.0)]];
+        let p = alt_pieces(text, &[0, 1, 2], &[0.99, 0.55, 0.98], &alts, tb);
+        assert_eq!(p, vec![AltPiece { at: 1, conf: 0.55, alts: vec![(vec![0x20, 0xEA], 0.21)] }], "확신 높은 스텝 · 0.08 밑 대안은 빠짐");
+        assert!(alt_supports(text, &p, 2, '김', 0.95));
+        // 토큰 바이트가 글과 다르면 자리를 믿지 않음
+        assert!(alt_pieces("2 입!", &[0, 1, 2], &[0.99, 0.55, 0.98], &alts, tb).is_empty());
+    }
 }

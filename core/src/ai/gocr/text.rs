@@ -13,7 +13,7 @@ use candle_core::{Device, Tensor};
 use candle_nn::ops::silu;
 
 use super::config::GocrConfig;
-pub use crate::ai::attention::{top1, AttnMode};
+pub use crate::ai::attention::{top1, top3, AttnMode};
 use crate::ai::attention::{rms_norm, LayerCache, StepMask};
 use crate::ai::kv_turbo::KvCodec;
 use crate::ai::residency::Loaded;
