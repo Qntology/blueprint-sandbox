@@ -1,4 +1,4 @@
-# 자연어 검색 (logis-center 방식을 발전소 원장에, 한국어 · 영어)
+# 자연어 검색 (logis-center 방식을 발전소 원장에, 12개 언어)
 
 주제어실 콘솔 아래 허브의 질의 줄(Enter · / 로 바로 들어감)에 "103동 2층 밸브", "과열기 온도 600도 이상", "주급수 유량조절밸브 상류 1홉", "승인 대기 MOC",
 "valves on floor 2 of building 103", "boiler feed pump" 처럼 씁니다. 결과를 누르면 그 설비로 세 뷰(도면 · Mermaid · 마인드맵)가 맞춰지고, 사건 · 보관 문서는 그 사건을 엽니다.
@@ -6,7 +6,11 @@
 품사 · 원형 실행기는 `core/src/nlp/stanza.rs`, 임베딩은 `core/src/ai/embed.rs`, 화면은 하단 허브의 커맨드 바 `app/src/cctv/CommandBar.tsx` 입니다 (2차 개선안: [overlay-console-plan.md](overlay-console-plan.md)).
 
 2026-11-08: logis-center 의 Stanza 전처리 · 슬라이딩 창 NMS 배틀(`parse_commerce_query` Stage-1) · 임베딩 경로(`fuse_whole_query`)를 옮겼고,
-영어 질의를 화면(`i18n/query.ts`)이 한국어 낱말로 옮겨 보내던 것을 엔진이 그대로 읽게 바꿨습니다. Stanza ONNX 는 `stanza-onnx-export` 를 다시 검증 · 수정한 판입니다 (5절).
+영어 질의를 화면(`i18n/query.ts`)이 한국어 낱말로 옮겨 보내던 것을 엔진이 그대로 읽게 바꿨습니다. Stanza ONNX 는 `stanza-onnx-export` 를 다시 검증 · 수정한 판입니다.
+
+2026-11-12: logis-center `a735ac75..f2e5cc87`(12개 언어 Stanza · 질의 언어 판정 · 굴절 · 합성어 · 아랍어 접어 · NMS)을 옮겨 독일어 · 프랑스어 · 스페인어 · 이탈리아어 ·
+포르투갈어 · 네덜란드어 · 체코어 · 아랍어 · 일본어 · 중국어 질의를 엔진이 직접 읽습니다. 원장이 한국어가 아닐 때(영어 · 일본어 · 독일어 원장)도 같은 규칙으로 찾고,
+12개 언어 질의 × 4개 데이터 언어 N:N 평가를 새로 만들었습니다 (5절).
 
 ## 1. logis-center 에서 가져온 규칙
 
@@ -86,7 +90,7 @@ logis-center(`commerce/src-tauri/src/lib.rs` 의 `ai_search_complex`, `search_fu
 
 | 모델 | 폴더 (`%LOCALAPPDATA%\blueprint\models`) | 가져오기 | 하는 일 |
 | --- | --- | --- | --- |
-| Stanza en · ko (ONNX, tract) | `stanza/{en,ko}` | `blueprint-models import stanza <stanza-onnx-export/onnx_final>` (공개 저장소 없음) | 품사 · 원형 → 줄기 · 원형 · 기능어 · 머리 낱말 |
+| Stanza en · ko + 10개 언어 (ONNX format 2, tract) | `stanza/<언어>` | `blueprint-models import stanza <stanza-onnx-export/onnx_final>`. 같은 변환본이 Hugging Face `Qntology/stanza-<언어>` 의 `format2/` 에 공개돼 있습니다 (2026-11-12 12개 언어 바이트 대조 같음, 받기 명령은 아직 없음) | 품사 · 원형 → 줄기 · 원형 · 기능어 · 머리 낱말 |
 | granite-embedding-97m-multilingual-r2 (candle, ModernBERT, CLS) | `embed` | `blueprint-models import embed` (logis-center 모델 폴더) 또는 `download embed` (Hugging Face) | 질의 벡터 · 유형 벡터 · NMS |
 
 - 앱은 시작 때 따로 읽고(1.7 s), 지금 원장으로 한 번 찾아 검색 표 · 개념 뱅크를 임베딩해 둡니다(약 7 s, 그 뒤 캐시). 읽는 동안의 검색은 규칙 · 글자 경로만 쓰고 그렇게 적습니다.
@@ -169,3 +173,54 @@ MRR · Hit@1 · 허용 순위 안 (괄호는 질의당 시간). 영어 묶음은
 - 후보 유형이 둘 이상일 때 모델로 고르지 않습니다 (규칙으로 둘 다 찾고 순위로 합침).
 - 시간 조건("어제 확정된", "최근 10분")은 아직 없습니다.
 - 같은 종류 조건은 하나만 맞아도 통과합니다 (질적 상태 둘, 예 "온도 높고 상승 중" 도 둘 중 하나). 둘 다를 요구하는 조합은 하지 않았습니다.
+
+## 5. 다국어 (12개 언어 질의 × 4개 데이터 언어, 2026-11-12)
+
+### 5-1. logis-center 에서 옮긴 것
+
+| logis-center (`a735ac75..f2e5cc87`) | 이 저장소 |
+| --- | --- |
+| 질의 언어 판정 `detect_query_lang`: 따옴표 이름 · 문장 속 다른 문자 이름(한중일 인명)을 빼고, 문자 체계 → 특수 글자 → 도메인 사전 낱말 투표 → whatlang | `search/lang.rs` `detect`. 투표는 굴절 · 합성어를 아는 사전 맞추기로 하고, 비기면 영어를 먼저(그다음 whatlang, 라틴 8개 언어만). 한자만인 질의는 신자체 · 간체 신호로 일본어 · 중국어. 식별자(`10LAB…` · `MOC-…`)의 글자는 세지 않음 |
+| 12개 언어 Stanza (format 2), 붙여 쓰는 언어는 토크나이저 | `nlp/stanza.rs` 에 일본어 · 중국어 토크나이저(문자 LSTM + 사전 특징)를 옮겼고, 12개 언어 모두 PyTorch Stanza 와 품사 · xpos · 원형 · 토큰 100 % (`reference_outputs_all_languages`, `--ignored`). fr · pt 의 xpos `<EMPTY>` 를 `_` 로 (처음 0 %). 앱은 ko · en 을 늘 올리고 나머지는 처음 질의 때 읽어 둘까지 둠 (`BLUEPRINT_STANZA_LANGS`) |
+| `search_relation::word_matches` · `arabic_bare_forms` · 합성어 꼬리 | `search/ml.rs`: 정확 → 굴절(공통 앞부분 4자 이상, 사전 낱말 쪽 모자람 1자 · 8자 이상 2자, 꼬리 3자 이하, 질의가 사전 낱말의 앞부분일 뿐이면 1자까지) → 독일어 · 네덜란드어 합성어 안(맨 앞 · 3자 이상 뒤 · 하이픈 뒤) → 일본어 · 중국어 부분 문자열(한 글자 낱말은 조사 · 숫자 경계) → 아랍어 접어(و ف ب ل ك ال)를 뗀 원문 꼴. 겹치면 긴 것 → 정확 → 질의 언어 사전 순 |
+| 도메인 사전 12개 언어 구역 | `search/lexicon_ml.json`: 언어마다 설비 종류 · 계측 · 질적 상태 · 비교어 · 부정어 · 공간(동 · 층 · 지하 · 옥외) · 연결(상류 · 하류 · 홉) · 문서 유형 · 상태 · 기능어 · 명령어 (영어는 판정 투표용, 영어 질의는 2절의 영어 규칙) |
+| NMS 조각(z ≥ 3, 2위와 0.015, 한 낱말 0.9) | 그대로. 창 길이를 내용어로 세고(긴 합성어 · 한자 줄은 2), 붙여 쓰는 언어는 낱말 사이를 붙여 임베딩 (`nms::ground(…, sep)`) |
+
+옮기지 않은 것: logis-center 의 관계 단계(고정점 → 묻는 유형)는 원장 그래프의 연결 조건(2절 3)과 같은 일이라 이미 있고, 행동 로그 · 무역 서식 규칙은 이 원장에 없습니다.
+
+### 5-2. 다국어 질의 처리
+
+1. **정규화** (`lang::fold`): 소문자, 라틴 악센트 제거(ß → ss), 아랍어 알리프 꼴 → ا · ى → ي · 모음 부호 제거, 전각 · 아랍 숫자 → 0-9.
+2. **분석** (`analyze::analyze_ml`): 낱말마다 원문 · Stanza 원형을 꼴로 둡니다. 기능어는 닫힌 품사(DET · ADP · AUX · CCONJ · SCONJ · PART · PRON · PUNCT · INTJ)이거나 사전의 기능어 · 명령어입니다
+   (Stanza 는 아랍어 'ذات'(…을 가진)을 명사로 달아 "مضخة التغذية ذات الضغط المرتفع" 의 '압력' 이 펌프 이름 안의 계측어로 읽혔음 → 사전 목록을 함께 봄).
+   아랍어 접어는 원문 꼴에서만 뗍니다 (원형 بخار 를 다시 떼면 خار 가 되어 خارجي '옥외' 에 걸렸음).
+3. **조건**: 사전 맞추기 결과를 2절과 같은 조건(공간 · 층 · 종류 · 계측 · 수치 · 질적 상태 · 상태 · 연결 · 부정)으로 바꿉니다. 머리 낱말은 언어마다 (로망스어 · 체코어 · 아랍어는 첫 명사, 독일어 · 네덜란드어는 첫 구의 끝, 일본어 · 중국어는 끝 내용어).
+   설비 이름 안의 계측어(`válvula de control de caudal` 의 caudal, `Durchflussregelventil` 의 Durchfluss, `流量調節弁` 의 流量)는 조건이 아닙니다. 동 번호는 "103동 · building 103 · Gebäude 103 · 103号棟 · المبنى 103" 모두 같은 공간 조건, 원장이 다른 언어면 라벨을 언어 사이 가장 긴 일치로 찾습니다 (`label_measures`).
+4. **연결 기준 설비**: 식별자 → 따옴표 이름 → NMS 개체 조각(종류 낱말이 든 창 우선) → 2글자 겹침 → 낱말 겹침.
+5. **글자 경로**: 붙여 쓰는 언어는 질의를 이어 붙인 n-gram, 라틴 언어는 굴절을 아는 낱말 일치.
+
+### 5-3. N:N 평가 (`examples/search_ml_eval.rs`)
+
+- 질의: `scripts/search_ml/queries.py` → `core/fixtures/search_ml/queries.json` 1,737개 = 12개 언어 질의(+ 언어 없는 식별자) × 데이터 언어 4개(ko · en · ja · de) × 틀.
+  **dev 1,161**(발전소 · 지금 계측 P2 · 따옴표 이름)로 규칙을 고치고, **held 576**(데이터센터 · 지금 계측 D2 · 뜻풀이)은 고친 뒤에만 봤습니다.
+- 데이터 언어 원장: `scripts/search_ml/gen_ledgers.py` 가 앱 원장의 이름 · 라벨 · 제목을 `ledger_tr.json` 으로 옮겨 `synthetic_db.{en,ja,de}.json` 을 만듭니다 (`--check` 로 바이트 같음 확인). 그 원장에는 그 언어 이름만 있습니다.
+- 채점: 2절의 화면 순서로 MRR · Hit@1 · 허용 순위 안, 그리고 언어 판정. `cargo run --release -p blueprint-core --no-default-features --features stanza --example search_ml_eval -- --split all --json out.json`
+
+| 묶음 · 경로 | main (옮기기 전) | 지금 |
+| --- | --- | --- |
+| dev · 규칙만 | 0.333 · Hit@1 288 · 허용 325/1,161 | **0.813** · 849 · 978 |
+| dev · +Stanza | 0.330 · 286 · 323 | **0.815** · 851 · 980 |
+| dev · +Stanza+임베딩 | 0.432 · 342 · 401 | **0.855** · 870 · 1,020 |
+| held · 규칙만 | 0.192 · 73 · 105/576 | **0.491** · 212 · 323 |
+| held · +Stanza | 0.193 · 73 · 105 | **0.493** · 213 · 322 |
+| held · +Stanza+임베딩 | 0.418 · 161 · 245 | **0.635** · 279 · 420 |
+| 언어 판정 | 295/1,737 (ko · en 만 판정) | **1,701/1,737** |
+
+held · +Stanza+임베딩, 질의 언어별 (main → 지금): ko 0.614 → 0.614 · en 0.706 → 0.698 · de 0.328 → 0.605 · fr 0.356 → 0.632 · es 0.343 → 0.600 · it 0.341 → 0.629 ·
+pt 0.305 → 0.611 · nl 0.281 → 0.501 · cs 0.319 → 0.625 · ar 0.401 → 0.665 · ja 0.519 → 0.709 · zh 0.503 → 0.729.
+
+- 한국어 · 영어는 그대로입니다 (영어 held 0.706 → 0.698 은 "power generated" 한 질의가 1위 → 2위). 2절의 `search_eval` 은 바뀌지 않았습니다.
+- +Stanza 는 규칙만과 거의 같습니다 (dev 0.813 → 0.815). 굴절 · 합성어 · 접어를 사전 맞추기가 이미 풀어서, 원형의 몫이 작습니다. 처음에는 아랍어가 Stanza 로 오히려 떨어졌습니다
+  (dev 0.761 → 0.731: 위 2의 두 결함). 고친 뒤 아랍어 +Stanza+임베딩 dev 0.827 → 0.869, held 0.620 → 0.665, 다른 언어는 그대로.
+- 남은 약점: 네덜란드어 held 0.501 (합성어가 사전 밖), 일본어 · 중국어 · 아랍어 규칙만 held 0.34 ~ 0.40 (뜻풀이를 임베딩이 받아 0.67 ~ 0.73). 뜻풀이는 4절처럼 원장 글에 설명이 없어 어렵습니다.
+- 질의 틀은 원장을 보며 만든 것이고 번역은 손으로 쓴 사전(ledger_tr.json · queries.py)입니다. 실제 사용자 질의로 잰 값이 아닙니다.

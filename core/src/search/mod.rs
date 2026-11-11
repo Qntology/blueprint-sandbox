@@ -19,7 +19,9 @@
 //! 판단(생성) 모델은 쓰지 않습니다. 모델이 하나도 없어도 규칙 · 글자 경로만으로 돕니다 (CI · 모델 없는 PC).
 
 pub mod analyze;
+pub mod lang;
 pub mod lexicon;
+pub mod ml;
 pub mod models;
 pub mod nms;
 
@@ -516,8 +518,10 @@ impl Corpus {
         let mut df = HashMap::new();
         for d in &mut docs {
             d.text = d.text.to_lowercase();
-            d.title_en = d.title_en.to_lowercase();
-            d.words = d.text.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty() && w.chars().any(|c| c.is_ascii_alphabetic())).map(str::to_string).collect();
+            // 영어 이름이 없는 원장(영어 · 일본어 · 독일어 원장)은 제목 그대로 (영어 원장은 제목이 곧 영어)
+            d.title_en = if d.title_en.trim().is_empty() { d.title.to_lowercase() } else { d.title_en.to_lowercase() };
+            // 낱말 (악센트를 뗀 꼴). 영어 낱말은 예전처럼 로마자 낱말 그대로, 다른 라틴 문자 낱말(Pumpe · válvula)도 낱말로 맞춥니다.
+            d.words = lang::fold(&d.text).split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty() && w.chars().any(|c| c.is_alphabetic())).map(str::to_string).collect();
             let terms: BTreeSet<String> = terms_of(&d.text).into_iter().collect();
             for t in terms {
                 *df.entry(t).or_insert(0) += 1;
@@ -617,8 +621,120 @@ fn measure_fits(word: &str, label: &str, unit: &str) -> bool {
     if label.contains(word) {
         return true;
     }
-    let unit = unit.to_lowercase();
-    MEASURE_WORDS.iter().find(|(w, _)| *w == word).is_some_and(|(_, units)| units.contains(&unit.as_str()) && word != "수위" && word != "개도")
+    let unit = lang::fold(unit);
+    if MEASURE_WORDS.iter().find(|(w, _)| *w == word).is_some_and(|(_, units)| units.contains(&unit.as_str()) && word != "수위" && word != "개도") {
+        return true;
+    }
+    // 원장 라벨이 다른 언어일 때 (영어 · 일본어 · 독일어 원장): 그 계측어의 낱말이 라벨 안에 있는가 ("Überhitzer-Austrittsdampftemperatur" → 온도)
+    label_measures(label).contains(&word)
+}
+
+/// 라벨 글에 든 계측어 (12개 언어 낱말, 부분 일치 — 라벨은 합성어 · 구). 겹치는 낱말은 긴 것만 봅니다:
+/// 독일어 'Füllstand'(수위) 안의 네덜란드어 'stand'(개도), 'Volumenstrom'(유량) 안의 'Strom'(전류)이 따로 잡히지 않게.
+fn label_measures(label: &str) -> Vec<&'static str> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, Vec<&'static str>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().ok().and_then(|c| c.get(label).cloned()) {
+        return v;
+    }
+    let f: Vec<char> = lang::fold(label).chars().collect();
+    let mut spans: Vec<(usize, usize, &'static str)> = Vec::new();
+    let mut find = |w: &str, m: &'static str| {
+        let w: Vec<char> = w.chars().collect();
+        if w.len() < 2 || w.len() > f.len() {
+            return;
+        }
+        for a in 0..=f.len() - w.len() {
+            if f[a..a + w.len()] == w[..] {
+                spans.push((a, a + w.len(), m));
+            }
+        }
+    };
+    for (en, m) in lexicon::MEASURE_WORDS_EN {
+        if en.len() >= 4 {
+            find(en, m);
+        }
+    }
+    for l in lang::LANGS {
+        if let Some(lex) = ml::lex(l) {
+            for (w, m) in lex.measure_words() {
+                // 라틴 문자 짧은 낱말(hub · tlak 의 일부 같은 우연)은 빼고, 한자 두 글자 이상은 그대로
+                if w.chars().all(|c| c.is_ascii_alphabetic()) && w.len() < 4 {
+                    continue;
+                }
+                find(&w, m);
+            }
+        }
+    }
+    spans.sort_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)).then(a.0.cmp(&b.0)));
+    let mut kept: Vec<(usize, usize, &'static str)> = Vec::new();
+    for s in spans {
+        if kept.iter().all(|k| s.1 <= k.0 || s.0 >= k.1 || (s.0 == k.0 && s.1 == k.1)) {
+            kept.push(s);
+        }
+    }
+    let mut out: Vec<&'static str> = Vec::new();
+    for (_, _, m) in kept {
+        if !out.contains(&m) {
+            out.push(m);
+        }
+    }
+    if let Ok(mut c) = cache.lock() {
+        c.insert(label.to_string(), out.clone());
+    }
+    out
+}
+
+/// 동 번호 (`101동` · `Building 101` · `101号棟` · `Gebäude 101` → 101)
+fn building_number(building: &str) -> Option<u32> {
+    let digits: String = building.chars().skip_while(|c| !c.is_ascii_digit()).take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// 동 번호로 공간(sector) 키를 찾습니다. 원장 언어와 상관없이 번호가 같으면 같은 동입니다.
+fn sector_by_number(db: &Lattice, n: u32) -> Option<String> {
+    db.sectors().iter().find(|s| building_number(&s.building) == Some(n)).map(|s| s.key.clone())
+}
+
+/// 따옴표 안 이름이 원장 설비 이름(또는 en.json 영어 이름)과 같은 설비 (공백 · 대소문자 · 악센트 무시)
+fn equipment_by_name(db: &Lattice, name: &str) -> Option<String> {
+    let squash = |s: &str| lang::fold(s).chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+    let want = squash(name);
+    if want.chars().count() < 2 {
+        return None;
+    }
+    let names = lexicon::names();
+    db.equipment_all().iter().find(|e| squash(&e.name) == want || names.en(&e.name).is_some_and(|en| squash(en) == want)).map(|e| e.kks.clone())
+}
+
+/// 원장 공간 이름(데이터 언어)이 질의에 있는 공간들 (한국어 · 영어 밖 질의). 붙여 쓰는 언어는 부분 일치,
+/// 띄어 쓰는 언어는 이름의 내용 낱말(4글자 이상)이 모두 질의 낱말에 있을 때 (굴절 앞머리: Kesselhauses ↔ Kesselhaus).
+fn sector_by_label(db: &Lattice, toks: &[QueryToken], glued: bool) -> Vec<String> {
+    let joined: String = toks.iter().map(|t| lang::fold(&t.text)).collect::<Vec<_>>().join(if glued { "" } else { " " });
+    let forms: Vec<String> = toks.iter().flat_map(|t| t.forms.iter().map(|f| lang::fold(f))).collect();
+    let mut out = Vec::new();
+    for s in db.sectors() {
+        let label = lang::fold(&s.label);
+        let hit = if glued {
+            let compact: String = label.chars().filter(|c| c.is_alphanumeric()).collect();
+            compact.chars().count() >= 2 && joined.replace(|c: char| !c.is_alphanumeric(), "").contains(&compact)
+        } else {
+            let words: Vec<&str> = label.split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() >= 4).collect();
+            !words.is_empty()
+                && words.iter().all(|w| {
+                    let wc: Vec<char> = w.chars().collect();
+                    forms.iter().any(|f| {
+                        let fc: Vec<char> = f.chars().collect();
+                        fc == wc || (fc.len() >= wc.len() && fc.len() <= wc.len() + 3 && fc[..wc.len()] == wc[..])
+                    })
+                })
+        };
+        if hit {
+            out.push(s.key.clone());
+        }
+    }
+    out
 }
 
 /// 숫자 + 단위 (`600도`, `30MPa`, `1,850`, `50%`)
@@ -836,21 +952,42 @@ fn nms_usable(toks: &[QueryToken]) -> Vec<bool> {
 
 /// NMS 후보 전부 (통과 못 한 것 포함). 문턱을 정할 때 보는 진단용 (`examples/search_eval.rs --nms`).
 pub fn nms_candidates(db: &Lattice, query: &str, models: &SearchModels) -> Vec<Candidate> {
-    let analysis = analyze::analyze(query.trim(), |lang| models.stanza_for(lang));
+    let analysis = analyze::analyze(&lang::normalize_query(query.trim()), |lang| models.stanza_for(lang));
+    let sep = if lang::glued(analysis.lang) { "" } else { " " };
     match (models.embedder.as_ref(), models.bank(db)) {
-        (Some(e), Some(b)) => nms::ground(&analysis.tokens, &nms_usable(&analysis.tokens), &b, e).map(|x| x.1).unwrap_or_default(),
+        (Some(e), Some(b)) => nms::ground(&analysis.tokens, &nms_usable(&analysis.tokens), &b, e, sep).map(|x| x.1).unwrap_or_default(),
         _ => Vec::new(),
     }
 }
 
 /// 자연어 질의 하나. `models` 가 있으면 Stanza 품사 · 원형과 임베딩(질의 벡터 경로 · NMS 조각)을 더합니다.
 pub fn search_with(db: &Lattice, corpus: &Corpus, query: &str, models: Option<&SearchModels>) -> SearchResult {
-    let q = query.trim().to_lowercase();
+    let normalized = lang::normalize_query(query.trim());
+    let q = normalized.to_lowercase();
     let words: Vec<String> = q.split_whitespace().map(str::to_string).collect();
-    let analysis = analyze::analyze(query.trim(), |lang| models.and_then(|m| m.stanza_for(lang)));
+    let analysis = analyze::analyze(&normalized, |lang| models.and_then(|m| m.stanza_for(lang)));
     let toks = &analysis.tokens;
     let en = analysis.lang == "en";
+    // 한국어 · 영어 밖 언어: 닫힌 낱말을 그 언어 사전(lexicon_ml.json)으로 (판정이 비긴 언어 사전도 함께)
+    let ml_lexes: Vec<&ml::Lex> = if matches!(analysis.lang, "ko" | "en") {
+        Vec::new()
+    } else {
+        std::iter::once(analysis.lang).chain(analysis.also.iter().copied()).filter_map(ml::lex).collect()
+    };
+    let parsed = (!ml_lexes.is_empty()).then(|| ml::parse(toks, &ml_lexes, db, &analysis.quoted));
     let mut notes = Vec::new();
+    if !matches!(analysis.lang, "ko" | "en") || !analysis.also.is_empty() {
+        notes.push(format!(
+            "질의 언어 {} ({}{})",
+            analysis.lang,
+            analysis.how,
+            if analysis.also.is_empty() { String::new() } else { format!(" · 함께 본 사전 {}", analysis.also.join(" · ")) }
+        ));
+    }
+    if let Some(p) = &parsed {
+        notes.extend(p.notes.iter().cloned());
+    }
+    let quoted_names = lang::quoted_names(&normalized);
     if let Some(tagger) = &analysis.tagger {
         let stems: Vec<String> = toks.iter().filter(|t| t.forms.len() > 1).map(|t| format!("{}→{}", t.text, t.forms[1..].join("/"))).collect();
         let function: Vec<&str> = toks.iter().filter(|t| t.function && !t.text.is_empty()).map(|t| t.text.as_str()).collect();
@@ -866,9 +1003,21 @@ pub fn search_with(db: &Lattice, corpus: &Corpus, query: &str, models: Option<&S
     let joined = format!(" {} ", toks.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "));
     let has_phrase = |p: &str| joined.contains(&format!(" {p} "));
 
-    // 1) 유형 먼저 (한국어는 부분 일치, 영어는 원형이 같을 때)
-    let mut types: Vec<DocKind> = TYPE_WORDS.iter().filter(|(_, ws)| ws.iter().any(|w| q.contains(w))).map(|(k, _)| *k).collect();
-    for (k, ws) in lexicon::TYPE_WORDS_EN.iter() {
+    // 1) 유형 먼저 (한국어는 부분 일치, 영어는 원형이 같을 때, 다른 언어는 그 언어 사전 · 언어와 상관없는 약어 · 번호 머리)
+    let mut types: Vec<DocKind> = if let Some(p) = &parsed {
+        let mut t = p.types.clone();
+        // 언어와 상관없는 약어 · 번호 머리 (moc · aop · p&id · pid-): 낱말 단위로 ('stroomopwaarts' 안의 'mop' 이 MOC 가 되지 않게)
+        for (k, ws) in TYPE_WORDS.iter() {
+            let hit = ws.iter().filter(|w| w.is_ascii()).any(|w| toks.iter().any(|t| t.text == *w || (w.ends_with('-') && t.text.starts_with(w))));
+            if hit && !t.contains(k) {
+                t.push(*k);
+            }
+        }
+        t
+    } else {
+        TYPE_WORDS.iter().filter(|(_, ws)| ws.iter().any(|w| q.contains(w))).map(|(k, _)| *k).collect()
+    };
+    for (k, ws) in lexicon::TYPE_WORDS_EN.iter().filter(|_| parsed.is_none()) {
         let hit = ws.iter().any(|w| {
             if w.ends_with('-') {
                 toks.iter().any(|t| t.text.starts_with(w))
@@ -885,7 +1034,11 @@ pub fn search_with(db: &Lattice, corpus: &Corpus, query: &str, models: Option<&S
     if types.is_empty() {
         // 한국어 명사구는 끝 낱말이 머리입니다 ("출구온도 비정상 과열기" 는 과열기를 묻습니다). 영어는 첫 명사 덩어리의 끝입니다
         // ("valves on floor 2" 의 valves). 머리가 설비 종류 낱말이면 설비만 찾습니다.
-        let (kind_head, head) = if en { head_en(toks) } else { head_ko(toks) };
+        let (kind_head, head) = match &parsed {
+            Some(p) => p.head.clone().unwrap_or((false, String::new())),
+            None if en => head_en(toks),
+            None => head_ko(toks),
+        };
         if kind_head {
             types = vec![DocKind::Equipment];
             notes.push(format!("유형 지시어 없음 · 머리 낱말 '{head}' → 설비"));
@@ -918,9 +1071,17 @@ pub fn search_with(db: &Lattice, corpus: &Corpus, query: &str, models: Option<&S
     // 2-1) NMS 조각 (임베딩 모델이 있을 때): 내용어로 시작 · 끝나는 창을 원장 개념에 대고, 겹치는 창은 점수 순으로 하나만 남깁니다.
     let emb = models.and_then(|m| m.embedder.as_ref());
     let bank = models.and_then(|m| m.bank(db));
-    let usable = nms_usable(toks);
+    let mut usable = nms_usable(toks);
+    if let Some(p) = &parsed {
+        for (i, closed) in p.closed.iter().enumerate() {
+            if *closed {
+                usable[i] = false;
+            }
+        }
+    }
+    let sep = if lang::glued(analysis.lang) { "" } else { " " };
     let (segments, _candidates) = match (emb, bank.as_deref()) {
-        (Some(e), Some(b)) => nms::ground(toks, &usable, b, e).unwrap_or_default(),
+        (Some(e), Some(b)) => nms::ground(toks, &usable, b, e, sep).unwrap_or_default(),
         _ => Default::default(),
     };
     for s in &segments {
@@ -940,11 +1101,30 @@ pub fn search_with(db: &Lattice, corpus: &Corpus, query: &str, models: Option<&S
     let measure_tok = |t: &QueryToken| -> Option<String> {
         t.forms.iter().find_map(measure_ko).or_else(|| lexicon::MEASURE_WORDS_EN.iter().find(|(e, _)| t.any(|f| f == *e)).map(|(_, m)| m.to_string()))
     };
-    let mut conds: Vec<Cond> = Vec::new();
-    for (i, w) in words.iter().enumerate() {
+    let mut conds: Vec<Cond> = parsed.as_ref().map(|p| p.conds.clone()).unwrap_or_default();
+    // 원장 공간 이름(데이터 언어)이 질의에 그대로 있으면 그 공간 ("Kesselhauses" ↔ Kesselhaus, ボイラー棟)
+    if parsed.is_some() {
+        for key in sector_by_label(db, toks, lang::glued(analysis.lang)) {
+            if !conds.contains(&Cond::Sector(key.clone())) {
+                conds.push(Cond::Sector(key));
+            }
+        }
+    }
+    for (i, w) in words.iter().enumerate().filter(|_| parsed.is_none()) {
         let t = &toks[i];
         if t.text.is_empty() {
             continue;
+        }
+        // 동 번호 (원장 동 이름의 언어와 상관없이 번호로: 103동 ↔ Gebäude 103 · 103号棟)
+        if !en {
+            let digits: String = w.chars().take_while(char::is_ascii_digit).collect();
+            if !digits.is_empty() && w[digits.len()..].starts_with('동') {
+                if let Some(key) = digits.parse().ok().and_then(|n| sector_by_number(db, n)) {
+                    if !conds.contains(&Cond::Sector(key.clone())) {
+                        conds.push(Cond::Sector(key));
+                    }
+                }
+            }
         }
         if negated(i) {
             notes.push(format!("부정어가 붙은 '{w}' 는 조건으로 쓰지 않습니다"));
@@ -963,10 +1143,11 @@ pub fn search_with(db: &Lattice, corpus: &Corpus, query: &str, models: Option<&S
             // 영어 동 · 여러 낱말 종류는 이 낱말에서 시작하는 구로 봅니다 ("building 103", "boiler building", "heat exchanger")
             let names = lexicon::names();
             for s in db.sectors() {
-                let num = s.building.trim_end_matches('동').to_lowercase();
-                let label_en = names.en(&s.label).map(str::to_lowercase).unwrap_or_default();
+                let num = building_number(&s.building).map(|n| n.to_string()).unwrap_or_default();
+                // 영어 이름: en.json (한국어 원장), 없으면 원장 이름 그대로 (영어 원장)
+                let label_en = names.en(&s.label).map(str::to_lowercase).unwrap_or_else(|| if s.label.is_ascii() { s.label.to_lowercase() } else { String::new() });
                 let at = |p: &str| phrase_at(toks, i, p);
-                if at(&format!("building {num}")) || at(&format!("bldg {num}")) || at(&format!("{num} building")) || (!label_en.is_empty() && at(&label_en)) {
+                if (!num.is_empty() && (at(&format!("building {num}")) || at(&format!("bldg {num}")) || at(&format!("{num} building")))) || (!label_en.is_empty() && at(&label_en)) {
                     conds.push(Cond::Sector(s.key.clone()));
                 }
             }
@@ -1065,10 +1246,18 @@ pub fn search_with(db: &Lattice, corpus: &Corpus, query: &str, models: Option<&S
     // 연결: "상류 · 하류 N홉" · "N hop upstream" 은 기준 설비가 있어야 합니다
     // (식별자, NMS 조각이 가리킨 설비, 이름이 가장 많이 겹치는 설비 차례)
     let word_is = |ws: &[&str]| toks.iter().any(|t| t.any(|f| ws.contains(&f)));
-    let up = q.contains("상류") || word_is(&["upstream"]);
-    let down = q.contains("하류") || word_is(&["downstream"]);
+    let (up, down, any_rel, ml_hops) = match parsed.as_ref().and_then(|p| p.relation) {
+        Some((dir, hops)) => (dir == Some(true), dir == Some(false), true, hops),
+        None if parsed.is_some() => (false, false, false, None),
+        None => {
+            let up = q.contains("상류") || word_is(&["upstream"]);
+            let down = q.contains("하류") || word_is(&["downstream"]);
+            let any = up || down || q.contains("주변") || q.contains("연결") || word_is(&["around", "near", "nearby", "connected", "neighbor", "neighbour", "adjacent"]);
+            (up, down, any, None)
+        }
+    };
     let mut near: BTreeMap<String, i32> = BTreeMap::new();
-    if up || down || q.contains("주변") || q.contains("연결") || word_is(&["around", "near", "nearby", "connected", "neighbor", "neighbour", "adjacent"]) {
+    if any_rel {
         let hops_en = toks.iter().enumerate().find_map(|(i, t)| {
             if matches!(t.text.as_str(), "hop" | "hops") {
                 i.checked_sub(1).and_then(|p| toks[p].text.parse::<usize>().ok())
@@ -1076,33 +1265,74 @@ pub fn search_with(db: &Lattice, corpus: &Corpus, query: &str, models: Option<&S
                 t.text.strip_suffix("-hop").or_else(|| t.text.strip_suffix("-hops")).and_then(|n| n.parse::<usize>().ok())
             }
         });
-        let hops = words.iter().find_map(|w| w.strip_suffix("홉").and_then(|n| n.parse::<usize>().ok())).or(hops_en).unwrap_or(crate::graph::MAX_HOPS).min(crate::graph::MAX_HOPS);
+        let hops = ml_hops
+            .or_else(|| words.iter().find_map(|w| w.strip_suffix("홉").and_then(|n| n.parse::<usize>().ok())))
+            .or(hops_en)
+            .unwrap_or(crate::graph::MAX_HOPS)
+            .min(crate::graph::MAX_HOPS);
         let names = lexicon::names();
-        let content: BTreeSet<String> = toks.iter().filter(|t| !t.function && !closed_word(&t.text)).flat_map(|t| t.forms.clone()).collect();
+        let closed_ml = |i: usize| parsed.as_ref().is_some_and(|p| p.closed.get(i).copied().unwrap_or(false));
+        // 하이픈 낱말은 조각도 (Hauptspeisewasser-Durchflussregelventil → hauptspeisewasser · durchflussregelventil)
+        let content: BTreeSet<String> = toks
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| !t.function && !closed_word(&t.text) && !closed_ml(*i))
+            .flat_map(|(_, t)| t.forms.iter().map(|f| lang::fold(f)).collect::<Vec<_>>())
+            .flat_map(|f| {
+                let mut v = vec![f.clone()];
+                if f.contains('-') {
+                    v.extend(f.split('-').filter(|p| !p.is_empty()).map(str::to_string));
+                }
+                v
+            })
+            .collect();
+        let glued = lang::glued(analysis.lang);
         let anchor = ids
             .iter()
             .find_map(|i| db.equipment(i).map(|e| e.kks.clone()).or_else(|| db.sensor(i).map(|s| s.kks.clone())))
-            .or_else(|| segments.iter().filter(|s| matches!(s.target, Target::Equipment(_))).max_by(|a, b| a.z.total_cmp(&b.z)).and_then(|s| if let Target::Equipment(k) = &s.target { Some(k.clone()) } else { None }))
+            // 따옴표로 묶은 원장 이름 (데이터 언어 이름을 질의 언어 문장에 그대로 넣은 것)
+            .or_else(|| quoted_names.iter().find_map(|n| equipment_by_name(db, n)))
             .or_else(|| {
-                // 한국어 이름과 2글자가 가장 많이 겹치는 설비 (영어 질의는 'upstream' 의 up · ps 가 '(UPS)' 에 걸려서 쓰지 않음)
-                if en {
+                // NMS 조각이 가리킨 설비 (z 순). 다른 언어 질의는 센서 조각도 그 센서의 설비로 받고("给水流量调节" → 급수 유량 센서 → 그 밸브),
+                // 질의에 설비 종류 낱말이 있으면 그 낱말을 품은 조각을 먼저 봅니다 — 연결 기준은 "…밸브 상류" 처럼 종류 낱말로 끝나는 이름이라
+                // 'eau alimentaire principale'(→ 주급수펌프 A) 같은 이름 조각보다 'vanne … principale' 가 기준입니다.
+                let kks_of = |s: &Segment| match &s.target {
+                    Target::Equipment(k) => Some(k.clone()),
+                    Target::Sensor(_, k) if parsed.is_some() => Some(k.clone()),
+                    _ => None,
+                };
+                let kind_hits: Vec<(usize, usize)> = parsed.as_ref().map(|p| p.hits.iter().filter(|h| matches!(h.cat, ml::Cat::Kind(_))).map(|h| (h.start, h.end)).collect()).unwrap_or_default();
+                let has_kind = |s: &Segment| kind_hits.iter().any(|(a, b)| *a >= s.start && *b <= s.end);
+                segments.iter().filter(|s| kks_of(s).is_some()).max_by(|a, b| has_kind(a).cmp(&has_kind(b)).then(a.z.total_cmp(&b.z))).and_then(kks_of)
+            })
+            .or_else(|| {
+                // 원장 이름과 2글자가 가장 많이 겹치는 설비: 한국어 · 일본어 · 중국어 질의만 (영어 질의는 'upstream' 의 up · ps 가 '(UPS)' 에 걸려서 쓰지 않음)
+                if en || (parsed.is_some() && !glued) {
                     return None;
                 }
+                let qg = bigrams(&lang::fold(&q));
                 db.equipment_all()
                     .iter()
-                    .map(|e| (bigrams(&e.name.to_lowercase()).intersection(&bigrams(&q)).count(), e))
+                    .map(|e| (bigrams(&lang::fold(&e.name)).intersection(&qg).count(), e))
                     .filter(|(n, _)| *n >= 2)
                     .max_by_key(|(n, _)| *n)
                     .map(|(_, e)| e.kks.clone())
             })
             .or_else(|| {
-                // 영어 이름과 겹치는 낱말 수 (2개 이상, 같으면 짧은 이름)
+                // 이름과 겹치는 낱말 수 (2개 이상, 같으면 짧은 이름). 영어 이름(en.json)과 원장 이름(데이터 언어) 둘 다
                 db.equipment_all()
                     .iter()
                     .filter_map(|e| {
-                        let name: Vec<String> = names.en(&e.name)?.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|x| !x.is_empty()).map(str::to_string).collect();
-                        let hit = name.iter().filter(|x| content.contains(*x) || content.contains(&lexicon::singular_en(x))).count();
-                        (hit >= 2).then_some((hit, usize::MAX - name.len(), e.kks.clone()))
+                        let mut best: Option<(usize, usize)> = None;
+                        for nm in [names.en(&e.name).map(str::to_string), Some(e.name.clone())].into_iter().flatten() {
+                            let name: Vec<String> = lang::fold(&nm).split(|c: char| !c.is_alphanumeric()).filter(|x| !x.is_empty()).map(str::to_string).collect();
+                            let hit = name.iter().filter(|x| content.contains(*x) || content.contains(&lexicon::singular_en(x)) || (parsed.is_some() && x.chars().count() >= 4 && content.iter().any(|c| c.starts_with(x.as_str())))).count();
+                            if best.is_none_or(|b| hit > b.0) {
+                                best = Some((hit, name.len()));
+                            }
+                        }
+                        let (hit, len) = best?;
+                        (hit >= 2).then_some((hit, usize::MAX - len, e.kks.clone()))
                     })
                     .max()
                     .map(|x| x.2)
@@ -1131,26 +1361,46 @@ pub fn search_with(db: &Lattice, corpus: &Corpus, query: &str, models: Option<&S
     //    힌트(가점)로 내립니다 (정답을 지우지 않게). 사용자가 직접 지목한 연결(상류 · 하류)을 먼저 겁니다.
     let in_scope: Vec<usize> = (0..corpus.docs.len()).filter(|i| types.contains(&corpus.docs[*i].kind)).collect();
     conds.sort_by_key(|c| u8::from(!matches!(c, Cond::Near { .. })));
-    let mut hard: Vec<Cond> = Vec::new();
-    let mut hints: Vec<Cond> = Vec::new();
-    let mut conditions = Vec::new();
-    for c in conds {
-        let mut trial = hard.clone();
-        trial.push(c.clone());
-        let satisfiable = in_scope.iter().any(|i| passes_all(&trial, &corpus.docs[*i], db, &near));
-        let (kind, text) = c.describe(db);
-        let note = if satisfiable {
-            "필터".to_string()
-        } else if matches!(c, Cond::Signal { .. }) && !corpus.live {
-            "지금 계측이 없어 힌트로 내림 (물리엔진 · 시나리오 재생 중에만 판정)".to_string()
-        } else {
-            "앞 조건과 함께 맞는 항목이 없어 힌트로 내림 (정답을 지우지 않게)".to_string()
-        };
-        conditions.push(Condition { kind, text, applied: satisfiable, note });
-        if satisfiable {
-            hard.push(c);
-        } else {
-            hints.push(c);
+    let ground = |conds: &[Cond]| -> (Vec<Cond>, Vec<Cond>, Vec<Condition>) {
+        let mut hard: Vec<Cond> = Vec::new();
+        let mut hints: Vec<Cond> = Vec::new();
+        let mut conditions = Vec::new();
+        for c in conds {
+            let mut trial = hard.clone();
+            trial.push(c.clone());
+            let satisfiable = in_scope.iter().any(|i| passes_all(&trial, &corpus.docs[*i], db, &near));
+            let (kind, text) = c.describe(db);
+            let note = if satisfiable {
+                "필터".to_string()
+            } else if matches!(c, Cond::Signal { .. }) && !corpus.live {
+                "지금 계측이 없어 힌트로 내림 (물리엔진 · 시나리오 재생 중에만 판정)".to_string()
+            } else {
+                "앞 조건과 함께 맞는 항목이 없어 힌트로 내림 (정답을 지우지 않게)".to_string()
+            };
+            conditions.push(Condition { kind, text, applied: satisfiable, note });
+            if satisfiable {
+                hard.push(c.clone());
+            } else {
+                hints.push(c.clone());
+            }
+        }
+        (hard, hints, conditions)
+    };
+    let (mut hard, mut hints, mut conditions) = ground(&conds);
+    // 설비 종류 조건이 모두 힌트로 내려갔으면(앞의 위치 · 상태 조건이 찾는 대상 자체를 밀어냄) 종류를 먼저 대어 다시 겁니다:
+    // "보일러동 지하 … 과열기" 를 다른 언어 원장(동 이름이 안 맞아 '보일러동' 이 빠짐)에서 찾으면 '지하' 가 필터가 되어 과열기가 힌트로
+    // 밀렸습니다. 종류 조건이 하나라도 걸리면("105동 밸브 유인통풍기": 밸브는 힌트, 통풍기는 필터) 나온 차례 그대로 둡니다.
+    if hints.iter().any(|c| matches!(c, Cond::Kind(_))) && !hard.iter().any(|c| matches!(c, Cond::Kind(_))) {
+        let mut reordered = conds.clone();
+        reordered.sort_by_key(|c| match c {
+            Cond::Near { .. } => 0u8,
+            Cond::Kind(_) => 1,
+            _ => 2,
+        });
+        let (h2, i2, c2) = ground(&reordered);
+        if h2.iter().any(|c| matches!(c, Cond::Kind(_))) {
+            notes.push("설비 종류가 앞 조건에 밀려 힌트가 되어, 종류를 먼저 대어 다시 걸었습니다".into());
+            (hard, hints, conditions) = (h2, i2, c2);
         }
     }
     let passes = |d: &Doc| -> bool { passes_all(&hard, d, db, &near) };
@@ -1161,8 +1411,14 @@ pub fn search_with(db: &Lattice, corpus: &Corpus, query: &str, models: Option<&S
     // "설비 · 장비 · equipment" 같은 일반 머리 낱말은 거의 모든 설비 글에 있어 글자 경로를 흐립니다 ("석탄을 가루로 만드는 설비" 가 "탈질 설비" 로)
     const GENERIC: [&str; 8] = ["설비", "장비", "기기", "equipment", "device", "asset", "unit", "system"];
     let mut qterms: Vec<String> = Vec::new();
-    for raw in terms_of(&q) {
-        let function = toks.iter().any(|t| (t.function || t.any(|f| GENERIC.contains(&f))) && t.text == raw);
+    // 일본어 · 중국어는 공백 덩어리가 아니라 낱말(문자 묶음 · Stanza 낱말)을 글자 경로 낱말로
+    let raw_terms: Vec<String> = if lang::glued(analysis.lang) {
+        toks.iter().enumerate().filter(|(i, t)| !t.function && t.text.chars().count() >= 2 && !parsed.as_ref().is_some_and(|p| p.closed[*i])).map(|(_, t)| t.text.clone()).collect()
+    } else {
+        terms_of(&q)
+    };
+    for raw in raw_terms {
+        let function = toks.iter().enumerate().any(|(i, t)| (t.function || t.any(|f| GENERIC.contains(&f)) || parsed.as_ref().is_some_and(|p| p.closed[i])) && t.text == raw);
         if !function && !GENERIC.contains(&raw.as_str()) && !qterms.contains(&raw) {
             qterms.push(raw);
         }
@@ -1184,10 +1440,24 @@ pub fn search_with(db: &Lattice, corpus: &Corpus, query: &str, models: Option<&S
             }
         }
     }
-    // 영어 낱말(로마자만)은 문서 낱말로 맞추고, 한국어 · 식별자는 부분 문자열로 맞춥니다 (교착어 · 하이픈 번호)
+    // 영어 낱말(로마자만)은 문서 낱말로 맞추고, 한국어 · 식별자는 부분 문자열로 맞춥니다 (교착어 · 하이픈 번호).
+    // 다른 라틴 문자 언어 낱말은 악센트를 뗀 문서 낱말과 같거나, 굴절 앞머리(Pumpen ↔ pumpe)이거나, 합성어 안(독일어 · 네덜란드어)이면 맞음
+    let compound = ml_lexes.first().is_some_and(|l| l.compound);
+    let latin_ml = parsed.is_some() && !lang::glued(analysis.lang);
     let term_hits = |d: &Doc, t: &str| -> bool {
-        if t.chars().all(|c| c.is_ascii_alphabetic()) {
+        if t.chars().all(|c| c.is_ascii_alphabetic()) && !latin_ml {
             d.words.contains(t)
+        } else if latin_ml && t.chars().all(char::is_alphabetic) {
+            let f = lang::fold(t);
+            let n = f.chars().count();
+            d.words.contains(&f)
+                || d.words.iter().any(|w| {
+                    let wn = w.chars().count();
+                    (n >= 5 && wn >= n.saturating_sub(2) && wn <= n + 3 && {
+                        let common = w.chars().zip(f.chars()).take_while(|(a, b)| a == b).count();
+                        common >= 4.max(n.saturating_sub(2)).min(wn)
+                    }) || (compound && n >= 5 && wn > n + 2 && w.contains(f.as_str()))
+                })
         } else {
             d.text.contains(t)
         }
@@ -1197,10 +1467,10 @@ pub fn search_with(db: &Lattice, corpus: &Corpus, query: &str, models: Option<&S
         s += ids.iter().filter(|id| d.id.eq_ignore_ascii_case(id) || d.text.contains(&id.to_lowercase())).count() as f32 * 10.0;
         s
     };
-    let qgrams = bigrams(&q);
+    let qgrams = bigrams(&lang::fold(&q));
     let gram_score = |d: &Doc| -> f32 {
         // 영어 질의는 영어 제목에 댑니다 (로마자 2글자가 한국어 제목 옆의 식별자에 우연히 겹치지 않게)
-        let title = if en { d.title_en.as_str() } else { &d.title.to_lowercase() };
+        let title = if en { d.title_en.as_str() } else { &lang::fold(&d.title) };
         let g = bigrams(&format!("{} {}", title, d.id.to_lowercase()));
         let inter = g.intersection(&qgrams).count() as f32;
         if inter == 0.0 {
@@ -1475,6 +1745,62 @@ mod tests {
     }
 
     use super::EVAL_QUERIES as QUERIES;
+
+    /// 다국어 질의 (모델 없이 규칙만): 그 언어 사전의 닫힌 낱말이 같은 조건이 됩니다. 정답 · 허용 순위는 N:N 평가 질의(core/fixtures/search_ml)와 같습니다.
+    #[test]
+    fn multilingual_queries_ground_the_same_conditions_without_models() {
+        let db = Lattice::embedded().unwrap();
+        let still = Corpus::build(&db, None, None);
+        let cases: [(&str, &str, &str, usize); 12] = [
+            ("103号棟2階のバルブ", "ja", "10LAB20AA102", 2),
+            ("103号楼2层的阀门", "zh-hans", "10LAB20AA102", 2),
+            ("Pumpen im Keller", "de", "10LCA10AP001", 2),
+            ("vannes du bâtiment 103 au 2e étage", "fr", "10LAB20AA102", 2),
+            ("válvulas del edificio 103 en la planta 2", "es", "10LAB20AA102", 2),
+            ("valvole dell'edificio 103 al secondo piano", "it", "10LAB20AA102", 2),
+            ("válvulas do edifício 103 no 2º andar", "pt", "10LAB20AA102", 2),
+            ("kleppen in gebouw 103 op de 2e verdieping", "nl", "10LAB20AA102", 2),
+            ("ventily v budově 103 ve 2. patře", "cs", "10LAB20AA102", 2),
+            ("الصمامات في المبنى 103 الطابق الثاني", "ar", "10LAB20AA102", 2),
+            ("MOC en attente d'approbation", "fr", "MOC-2026-1021", 1),
+            ("Überhitzer mit abnormaler Austrittstemperatur im Keller des Kesselhauses", "de", "10HAH10BB001", 1),
+        ];
+        for (q, lang, want, allow) in cases {
+            let r = search(&db, &still, q);
+            assert_eq!(r.lang, lang, "{q}");
+            assert!(rank(&r, want).is_some_and(|k| k <= allow), "{q} → {want} 순위 {:?} · 위 {:?} · 조건 {:?}", rank(&r, want), top(&r, 5), r.conditions);
+        }
+        // 지금 계측(P2): 질적 상태 낱말이 필터가 됩니다 (고착 · 낮음)
+        let live = live_corpus(&db, EVAL_LIVE_SCENARIO).unwrap();
+        for q in ["festsitzende Ventile", "vannes bloquées", "固着したバルブ", "卡涩的阀门", "zaseknuté ventily"] {
+            let r = search(&db, &live, q);
+            assert_eq!(r.hits[0].doc.id, "10LAB20AA102", "{q} · 위 {:?} · 조건 {:?}", top(&r, 5), r.conditions);
+        }
+        // 부정어: 앞(de nicht · fr pas) · 뒤(ja ない) 모두 조건이 아님
+        for q in ["nicht festsitzende Ventile", "vannes qui ne sont pas bloquées", "固着していないバルブ"] {
+            let r = search(&db, &live, q);
+            assert!(!r.conditions.iter().any(|c| c.text.contains("고착")), "{q}: {:?}", r.conditions);
+        }
+    }
+
+    /// 다른 언어 원장(독일어): 동은 번호로, 계측 종류는 라벨 낱말(Überhitzer-Austrittsdampftemperatur → 온도)로 맞춥니다.
+    #[test]
+    fn a_german_ledger_answers_korean_and_english_queries() {
+        let db = Lattice::from_json(include_str!("../../fixtures/search_ml/synthetic_db.de.json")).unwrap();
+        let still = Corpus::build(&db, None, None);
+        let r = search(&db, &still, "103동 2층 밸브");
+        assert!(r.conditions.iter().any(|c| c.kind == "공간" && c.applied && c.text.contains("103")), "{:?}", r.conditions);
+        assert!(rank(&r, "10LAB20AA102").is_some_and(|k| k <= 2), "{:?}", top(&r, 5));
+        let r = search(&db, &still, "superheater temperature sensor");
+        assert_eq!(r.hits[0].doc.id, "10HAH10CT001", "{:?} · {:?}", top(&r, 5), r.conditions);
+        let r = search(&db, &still, "Temperatursensor Überhitzer");
+        assert_eq!(r.hits[0].doc.id, "10HAH10CT001", "{:?} · {:?}", top(&r, 5), r.conditions);
+        // 원장 이름을 따옴표로 넣은 질의: 그 설비가 연결 기준 (일본어 문장 속 독일어 이름)
+        let r = search(&db, &still, "「Hauptspeisewasserpumpe A」の下流1ホップ");
+        assert_eq!(r.lang, "ja");
+        assert!(r.conditions.iter().any(|c| c.kind == "연결" && c.text.starts_with("10LAB10AP001")), "{:?}", r.conditions);
+        assert!(rank(&r, "10LAB20AA102").is_some_and(|k| k <= 2), "{:?}", top(&r, 5));
+    }
 
     #[test]
     fn qualitative_conditions_wait_for_live_values_and_then_filter() {
