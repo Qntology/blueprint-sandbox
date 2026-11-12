@@ -152,7 +152,7 @@ pub const CATALOG: [ModelEntry; 5] = [
     },
     ModelEntry {
         name: "stanza",
-        label: "검색 품사 · 원형 (Stanza en · ko ONNX)",
+        label: "검색 품사 · 원형 (Stanza ONNX: en · ko + 있으면 de · fr · es · it · pt · nl · cs · ar · ja · zh-hans)",
         license: "Apache-2.0",
         repo: None,
         files: &[
@@ -170,10 +170,26 @@ pub const CATALOG: [ModelEntry; 5] = [
             file("en/vocab.json", 197_296),
             file("ko/vocab.json", 272_693),
         ],
-        extras: &[],
+        // 나머지 10개 언어: 가져올 곳에 있으면 가져옵니다 (언어마다 0.3 ~ 0.8 GB). 일본어 · 중국어는 띄어 쓰지 않아 토크나이저도.
+        // 언어마다 vocab.json 을 마지막에 둡니다 (그 언어를 여는 표시라, 큰 파일을 다 가져오기 전에 열리지 않게).
+        extras: STANZA_EXTRA_FILES,
         required: false,
         source: Source::StanzaExport,
     },
+];
+
+/// Stanza 의 한국어 · 영어 밖 언어 파일 (있으면 가져옴)
+const STANZA_EXTRA_FILES: &[&str] = &[
+    "de/pos.onnx", "de/pretrain_vocab.json", "de/lemma_encoder.onnx", "de/lemma_decoder.onnx", "de/lemma_dict.json", "de/vocab.json",
+    "fr/pos.onnx", "fr/pretrain_vocab.json", "fr/lemma_encoder.onnx", "fr/lemma_decoder.onnx", "fr/lemma_dict.json", "fr/vocab.json",
+    "es/pos.onnx", "es/pretrain_vocab.json", "es/lemma_encoder.onnx", "es/lemma_decoder.onnx", "es/lemma_dict.json", "es/vocab.json",
+    "it/pos.onnx", "it/pretrain_vocab.json", "it/lemma_encoder.onnx", "it/lemma_decoder.onnx", "it/lemma_dict.json", "it/vocab.json",
+    "pt/pos.onnx", "pt/pretrain_vocab.json", "pt/lemma_encoder.onnx", "pt/lemma_decoder.onnx", "pt/lemma_dict.json", "pt/vocab.json",
+    "nl/pos.onnx", "nl/pretrain_vocab.json", "nl/lemma_encoder.onnx", "nl/lemma_decoder.onnx", "nl/lemma_dict.json", "nl/vocab.json",
+    "cs/pos.onnx", "cs/pretrain_vocab.json", "cs/lemma_encoder.onnx", "cs/lemma_decoder.onnx", "cs/lemma_dict.json", "cs/vocab.json",
+    "ar/pos.onnx", "ar/pretrain_vocab.json", "ar/lemma_encoder.onnx", "ar/lemma_decoder.onnx", "ar/lemma_dict.json", "ar/vocab.json",
+    "ja/tokenizer.onnx", "ja/tokenize_lexicon.json", "ja/pos.onnx", "ja/pretrain_vocab.json", "ja/lemma_encoder.onnx", "ja/lemma_decoder.onnx", "ja/lemma_dict.json", "ja/vocab.json",
+    "zh-hans/tokenizer.onnx", "zh-hans/tokenize_lexicon.json", "zh-hans/pos.onnx", "zh-hans/pretrain_vocab.json", "zh-hans/lemma_encoder.onnx", "zh-hans/lemma_decoder.onnx", "zh-hans/lemma_dict.json", "zh-hans/vocab.json",
 ];
 
 pub fn entry(name: &str) -> Option<&'static ModelEntry> {

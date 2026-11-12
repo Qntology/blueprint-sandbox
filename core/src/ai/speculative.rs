@@ -189,12 +189,34 @@ pub fn decode_stream(model: &mut impl StreamModel, first: (u32, f32), opts: &Str
     Ok(out)
 }
 
+/// 디코딩 한 자리: 고른 토큰과 그 확률, 그리고 모델이 그 자리에서 본 대안 둘 (2 · 3위, 없으면 `(u32::MAX, 0.0)`).
+/// 대안은 디코딩을 바꾸지 않고 기록만 합니다 — 판독 뒤 원장 교정이 "모델이 실제로 본 글자" 인지 확인하는 근거입니다.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pick {
+    pub token: u32,
+    pub conf: f32,
+    pub alt: [(u32, f32); 2],
+}
+
+impl Pick {
+    pub const NO_ALT: [(u32, f32); 2] = [(u32::MAX, 0.0), (u32::MAX, 0.0)];
+
+    pub fn new(token: u32, conf: f32) -> Self {
+        Self { token, conf, alt: Self::NO_ALT }
+    }
+
+    /// 상위 셋 (1위가 고른 토큰)
+    pub fn from_top3(top: [(u32, f32); 3]) -> Self {
+        Self { token: top[0].0, conf: top[0].1, alt: [top[1], top[2]] }
+    }
+}
+
 /// 디코딩 루프가 모델에 바라는 세 가지
 pub trait BlockModel {
-    /// `first` 와 마스크 `n−1` 개를 읽어 위치 1..=n 의 (토큰, 확률) 을 돌려줍니다. 문맥은 바뀌지 않습니다.
-    fn draft(&mut self, first: u32, n: usize) -> Result<Vec<(u32, f32)>>;
-    /// `candidates` 를 왼쪽부터 읽어 각 토큰 다음 토큰의 (토큰, 확률) 을 돌려줍니다.
-    fn verify(&mut self, candidates: &[u32]) -> Result<Vec<(u32, f32)>>;
+    /// `first` 와 마스크 `n−1` 개를 읽어 위치 1..=n 의 자리를 돌려줍니다. 문맥은 바뀌지 않습니다.
+    fn draft(&mut self, first: u32, n: usize) -> Result<Vec<Pick>>;
+    /// `candidates` 를 왼쪽부터 읽어 각 토큰 다음 자리를 돌려줍니다.
+    fn verify(&mut self, candidates: &[u32]) -> Result<Vec<Pick>>;
     /// 방금 검증한 토큰 앞 `keep` 개를 문맥에 넣습니다.
     fn commit(&mut self, keep: usize) -> Result<()>;
 }
@@ -214,6 +236,8 @@ pub struct DecodeOptions<'a> {
 pub struct Decoded {
     pub tokens: Vec<u32>,
     pub confs: Vec<f32>,
+    /// 토큰마다 모델이 본 대안 둘 ([`decode`] 만 채웁니다. [`decode_stream`] 은 비어 있음 = 대안 없음)
+    pub alts: Vec<[(u32, f32); 2]>,
     pub truncated: bool,
     pub drafts: usize,
     pub verifies: usize,
@@ -225,72 +249,80 @@ pub struct Decoded {
     pub accepted: usize,
 }
 
-/// `first` 는 프리필의 마지막 출력에서 고른 첫 토큰과 그 확률입니다.
-pub fn decode(model: &mut impl BlockModel, first: (u32, f32), opts: &DecodeOptions<'_>) -> Result<Decoded> {
+impl Decoded {
+    fn push(&mut self, p: Pick) {
+        self.tokens.push(p.token);
+        self.confs.push(p.conf);
+        self.alts.push(p.alt);
+    }
+}
+
+/// `first` 는 프리필의 마지막 출력에서 고른 첫 자리입니다.
+pub fn decode(model: &mut impl BlockModel, first: Pick, opts: &DecodeOptions<'_>) -> Result<Decoded> {
     let mut out = Decoded { truncated: true, ..Decoded::default() };
-    let (mut next, mut next_conf) = first;
+    let mut next = first;
     while out.tokens.len() < opts.max_tokens {
-        if opts.eos.contains(&next) {
+        if opts.eos.contains(&next.token) {
             out.truncated = false;
             break;
         }
         let n = opts.block.max(1).min(opts.max_tokens - out.tokens.len());
-        // 후보: next 와 초안이 내놓은 토큰들 (끝 토큰 앞까지)
+        // 후보: next 와 초안이 내놓은 자리들 (끝 토큰 앞까지)
         let mut cand = vec![next];
-        let mut cand_conf = vec![next_conf];
         let mut reached_end = false;
         if n > 1 {
-            let draft = model.draft(next, n)?;
+            let draft = model.draft(next.token, n)?;
             out.drafts += 1;
             let mut end_conf = 1.0f32;
-            for &(t, c) in &draft[..n - 1] {
-                if opts.eos.contains(&t) {
+            for p in &draft[..n - 1] {
+                if opts.eos.contains(&p.token) {
                     reached_end = true;
-                    end_conf = c;
+                    end_conf = p.conf;
                     break;
                 }
-                cand.push(t);
-                cand_conf.push(c);
+                cand.push(*p);
             }
             if !reached_end {
                 // 블록의 마지막 출력은 블록 다음 자리의 토큰입니다.
-                let (t, c) = draft[n - 1];
-                if opts.eos.contains(&t) {
+                let p = draft[n - 1];
+                if opts.eos.contains(&p.token) {
                     reached_end = true;
-                    end_conf = c;
+                    end_conf = p.conf;
                 }
             }
             if let Some(tau) = opts.early_exit {
-                if reached_end && end_conf >= tau && cand_conf[1..].iter().all(|&c| c >= tau) {
-                    out.tokens.extend_from_slice(&cand);
-                    out.confs.extend_from_slice(&cand_conf);
+                if reached_end && end_conf >= tau && cand[1..].iter().all(|p| p.conf >= tau) {
+                    for p in &cand {
+                        out.push(*p);
+                    }
                     out.truncated = false;
                     out.early_exit = true;
                     return Ok(out);
                 }
             }
         }
-        let ar = model.verify(&cand)?;
+        let ids: Vec<u32> = cand.iter().map(|p| p.token).collect();
+        let ar = model.verify(&ids)?;
         out.verifies += 1;
         // 왼쪽부터 자기회귀 예측과 일치하는 만큼 채택합니다.
         let mut m = 0;
-        while m + 1 < cand.len() && ar[m].0 == cand[m + 1] {
+        while m + 1 < cand.len() && ar[m].token == cand[m + 1].token {
             m += 1;
         }
         out.drafted += cand.len() - 1;
         out.accepted += m;
         for i in 0..=m {
-            out.tokens.push(cand[i]);
-            out.confs.push(if i == 0 { cand_conf[0] } else { ar[i - 1].1 });
+            // 첫 자리는 앞 검증(또는 프리필)이 고른 것, 나머지는 이번 검증의 자기회귀 출력(토큰이 같음)의 확률 · 대안
+            out.push(if i == 0 { cand[0] } else { ar[i - 1] });
             if opts.halt.is_some_and(|halt| halt(&out.tokens)) {
                 out.halted = true;
                 return Ok(out);
             }
         }
         model.commit(m + 1)?;
-        (next, next_conf) = ar[m];
+        next = ar[m];
     }
-    if out.tokens.len() >= opts.max_tokens && opts.eos.contains(&next) {
+    if out.tokens.len() >= opts.max_tokens && opts.eos.contains(&next.token) {
         out.truncated = false;
     }
     Ok(out)
@@ -326,19 +358,20 @@ mod tests {
     }
 
     impl BlockModel for Oracle {
-        fn draft(&mut self, first: u32, n: usize) -> Result<Vec<(u32, f32)>> {
+        fn draft(&mut self, first: u32, n: usize) -> Result<Vec<Pick>> {
             self.drafts.push((first, n));
             Ok((1..=n)
                 .map(|i| {
                     let p = self.at + i;
-                    if self.wrong.contains(&p) { (500 + p as u32, self.draft_conf) } else { (self.truth_at(p), self.draft_conf) }
+                    if self.wrong.contains(&p) { Pick::new(500 + p as u32, self.draft_conf) } else { Pick::new(self.truth_at(p), self.draft_conf) }
                 })
                 .collect())
         }
 
-        fn verify(&mut self, candidates: &[u32]) -> Result<Vec<(u32, f32)>> {
+        fn verify(&mut self, candidates: &[u32]) -> Result<Vec<Pick>> {
             self.verified.push(candidates.to_vec());
-            Ok((1..=candidates.len()).map(|i| (self.truth_at(self.at + i), 0.5)).collect())
+            // 대안 하나를 남겨 디코딩 결과에 자리마다 따라오는지 봅니다
+            Ok((1..=candidates.len()).map(|i| Pick { token: self.truth_at(self.at + i), conf: 0.5, alt: [(900, 0.3), (u32::MAX, 0.0)] }).collect())
         }
 
         fn commit(&mut self, keep: usize) -> Result<()> {
@@ -355,7 +388,7 @@ mod tests {
     fn run(truth: &[u32], wrong: &[usize], conf: f32, block: usize, early: Option<f32>) -> (Decoded, Oracle) {
         let mut o = Oracle::new(truth, wrong, conf);
         let first = o.truth[0];
-        let out = decode(&mut o, (first, 0.9), &opts(block, early)).unwrap();
+        let out = decode(&mut o, Pick::new(first, 0.9), &opts(block, early)).unwrap();
         (out, o)
     }
 
@@ -375,6 +408,7 @@ mod tests {
         let (out, o) = run(&truth, &[2, 7], 0.5, 4, None);
         assert_eq!(out.tokens, truth, "초안이 틀려도 결과는 자기회귀와 같습니다");
         assert_eq!(out.confs.len(), truth.len());
+        assert_eq!(out.alts.len(), out.tokens.len(), "대안은 토큰마다 하나씩 따라옵니다");
         // 첫 블록: [1, 2, wrong, ..] → 위치 0,1 만 채택
         assert_eq!(o.verified[0][..2], [1, 2]);
         assert_ne!(o.verified[0][2], 3);
@@ -434,7 +468,7 @@ mod tests {
     fn the_token_limit_truncates() {
         let truth: Vec<u32> = (1..=30).collect();
         let mut o = Oracle::new(&truth, &[], 0.5);
-        let out = decode(&mut o, (1, 0.9), &DecodeOptions { max_tokens: 10, block: 4, ..opts(4, None) }).unwrap();
+        let out = decode(&mut o, Pick::new(1, 0.9), &DecodeOptions { max_tokens: 10, block: 4, ..opts(4, None) }).unwrap();
         assert_eq!(out.tokens, (1..=10).collect::<Vec<u32>>());
         assert!(out.truncated);
     }
@@ -442,7 +476,7 @@ mod tests {
     #[test]
     fn an_immediate_end_gives_nothing() {
         let mut o = Oracle::new(&[], &[], 0.5);
-        let out = decode(&mut o, (EOS, 0.9), &opts(8, None)).unwrap();
+        let out = decode(&mut o, Pick::new(EOS, 0.9), &opts(8, None)).unwrap();
         assert!(out.tokens.is_empty());
         assert!(!out.truncated);
         assert_eq!((out.drafts, out.verifies), (0, 0));
@@ -456,7 +490,7 @@ mod tests {
         let truth: Vec<u32> = (1..=20).collect();
         for block in [1, 2, 4, 8] {
             let mut o = Oracle::new(&truth, &[5], 0.5);
-            let out = decode(&mut o, (1, 0.9), &DecodeOptions { halt: Some(at_seven), ..opts(block, None) }).unwrap();
+            let out = decode(&mut o, Pick::new(1, 0.9), &DecodeOptions { halt: Some(at_seven), ..opts(block, None) }).unwrap();
             assert_eq!(out.tokens, (1..=7).collect::<Vec<u32>>(), "블록 {block}");
             assert_eq!(out.confs.len(), 7);
             assert!(out.halted && out.truncated, "끝 토큰으로 끝난 글이 아닙니다");

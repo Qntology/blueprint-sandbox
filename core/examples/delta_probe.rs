@@ -68,11 +68,24 @@ fn crop(img: &RgbImage, t: &Tile) -> RgbImage {
 }
 
 fn texts(r: &PageReading) -> Vec<Value> {
-    r.crops.iter().map(|c| json!({ "kind": c.kind.name(), "bbox": [c.bbox.0, c.bbox.1, c.bbox.2, c.bbox.3], "text": c.output.text })).collect()
+    r.crops
+        .iter()
+        .map(|c| {
+            // 확신 0.95 밑 글자와 판독 대안 조각 (OCR개선안 4.2 근거 확인용)
+            let low: Vec<Value> = c.output.text.chars().zip(&c.output.char_confidence).enumerate().filter(|(_, (_, p))| **p < 0.95).map(|(i, (ch, p))| json!([i, ch.to_string(), p])).collect();
+            let alts: Vec<Value> = c
+                .output
+                .alt_pieces
+                .iter()
+                .map(|a| json!({ "at": a.at, "conf": a.conf, "alts": a.alts.iter().map(|(b, p)| json!([b.iter().map(|x| format!("{x:02X}")).collect::<Vec<_>>().join(" "), String::from_utf8_lossy(b), p])).collect::<Vec<_>>() }))
+                .collect();
+            json!({ "kind": c.kind.name(), "bbox": [c.bbox.0, c.bbox.1, c.bbox.2, c.bbox.3], "text": c.output.text, "tokens": c.output.tokens.len(), "low": low, "alts": alts })
+        })
+        .collect()
 }
 
 fn values(x: &Extracted) -> Value {
-    json!({ "kind": x.kind.map(|k| k.label()), "drawing": x.drawing, "rev": x.drawing_rev, "kks": x.kks, "tag": x.tag, "reading": x.reading, "moc_no": x.moc_no, "old": x.old_value, "new": x.new_value, "worker": x.worker_id, "signed": x.signed, "kks_hits": x.kks_hits.len() })
+    json!({ "kind": x.kind.map(|k| k.label()), "drawing": x.drawing, "rev": x.drawing_rev, "kks": x.kks, "tag": x.tag, "reading": x.reading, "moc_no": x.moc_no, "old": x.old_value, "new": x.new_value, "worker": x.worker_id, "signed": x.signed, "kks_hits": x.kks_hits.len(), "corrections": x.corrections.iter().map(|c| format!("{}: {} → {}", c.field, c.raw, c.fixed)).collect::<Vec<_>>() })
 }
 
 /// 분포 요약 (최소 · 1 · 5 · 50 · 95 백분위 · 최대)

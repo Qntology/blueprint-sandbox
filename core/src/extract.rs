@@ -24,7 +24,12 @@ pub struct PageCrop {
     pub text: String,
     /// 글자별 신뢰도. 없으면 글자를 모두 믿지 않습니다.
     pub confs: Vec<f32>,
+    /// 확신이 낮은 디코딩 스텝에서 모델이 본 대안 토큰 바이트 (`OcrOutput::alt_pieces`, 비어 있으면 대안 없음)
+    pub alts: Vec<crate::ai::gocr::AltPiece>,
 }
+
+/// 원장 교정에서 고치지 않는 확신: 모델이 이만큼 확신한 글자는 대안이 있어도 바꾸지 않습니다 (OCR개선안 4.2 의 0.95)
+pub const IMMUTABLE_CONF: f32 = 0.95;
 
 /// 페이지 한 장의 읽기 결과
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -42,7 +47,13 @@ impl PageText {
         let crops = r
             .crops
             .iter()
-            .map(|c| PageCrop { title: c.kind == CropKind::Title, bbox: [c.bbox.0, c.bbox.1, c.bbox.2, c.bbox.3], text: c.output.text.clone(), confs: c.output.char_confidence.clone() })
+            .map(|c| PageCrop {
+                title: c.kind == CropKind::Title,
+                bbox: [c.bbox.0, c.bbox.1, c.bbox.2, c.bbox.3],
+                text: c.output.text.clone(),
+                confs: c.output.char_confidence.clone(),
+                alts: c.output.alt_pieces.clone(),
+            })
             .collect();
         let signs = r.plan.crops.iter().filter(|c| c.kind == CropKind::Sign).map(|c| [c.bbox.0, c.bbox.1, c.bbox.2, c.bbox.3]).collect();
         Self { hash: hash.to_string(), width: size.0, height: size.1, crops, signs }
@@ -648,14 +659,75 @@ fn redline(db: &Lattice, page: &PageText, out: &mut Extracted) {
     // 서명자: 수기 메모 끝의 이름. 손글씨라 한 글자가 다르게 읽히면, 날짜가 함께 적힌 서명 줄(`2026-11-04 김태현`)에서만
     // 원장에 한 명뿐인 비슷한 이름으로 고치고 교정 기록에 남깁니다.
     let mut name = text.lines().rev().filter_map(hangul_name).find(|n| db.person_named(n).is_some());
+    let dated = |l: &&str| l.split(|c: char| !c.is_ascii_digit() && c != '-').any(|w| w.len() == 10 && w.matches('-').count() == 2);
     if name.is_none() {
-        let dated = |l: &&str| l.split(|c: char| !c.is_ascii_digit() && c != '-').any(|w| w.len() == 10 && w.matches('-').count() == 2);
         if let Some((raw, p)) = text.lines().rev().filter(dated).filter_map(hangul_name).find_map(|n| db.person_one_off(&n).map(|p| (n, p))) {
             out.corrections.push(Correction { field: "서명자 이름".into(), distance: 1, raw, fixed: p.name.clone() });
             name = Some(p.name.clone());
         }
     }
+    if name.is_none() {
+        // 두 글자 차이는 판독 근거가 있을 때만 (OCR개선안 4.2): 다른 글자마다 확신이 IMMUTABLE_CONF 밑이고, 모델이 그 자리에서 원장 이름의 글자를
+        // 대안(2 · 3위, 확률 ≥ 0.08)으로 본 경우. A0 B4 의 '입래현'(김태현과 두 글자 차이)은 예전엔 비워 두었습니다.
+        if let Some((raw, p, diff)) = signer_with_evidence(db, page, &dated) {
+            out.corrections.push(Correction { field: "서명자 이름 (판독 대안 근거)".into(), distance: diff, raw, fixed: p.name.clone() });
+            name = Some(p.name.clone());
+        }
+    }
     resolve_worker(db, name, None, out);
+}
+
+/// 날짜가 함께 적힌 서명 줄의 한글 이름을 조각 글자 단위로 보고, 판독 대안 글자가 받쳐 주는 원장 이름(두 글자 차이까지)을 찾습니다.
+fn signer_with_evidence<'a>(db: &'a Lattice, page: &PageText, dated: &dyn Fn(&&str) -> bool) -> Option<(String, &'a crate::lattice::PersonRow, usize)> {
+    for crop in page.crops.iter().rev() {
+        if crop.alts.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = crop.text.chars().collect();
+        // 줄과 표 칸(`<td>…</td>`)으로 나눈 조각 (시작 글자 자리, 글). 글자 자리는 원문 그대로라 확신 · 대안과 맞습니다
+        let mut lines: Vec<(usize, String)> = Vec::new();
+        let (mut start, mut cur, mut in_tag) = (0usize, String::new(), false);
+        for (i, c) in chars.iter().enumerate() {
+            match (in_tag, *c) {
+                (true, '>') => {
+                    in_tag = false;
+                    start = i + 1;
+                }
+                (true, _) => {}
+                (false, '<' | '\n') => {
+                    if !cur.is_empty() {
+                        lines.push((start, std::mem::take(&mut cur)));
+                    }
+                    in_tag = *c == '<';
+                    start = i + 1;
+                }
+                (false, c) => cur.push(c),
+            }
+        }
+        if !cur.is_empty() {
+            lines.push((start, cur));
+        }
+        for (start, line) in lines.into_iter().rev() {
+            if !dated(&line.as_str()) {
+                continue;
+            }
+            // 이 줄의 한글 글자 자리 (hangul_name 과 같은 글자들)
+            let at: Vec<usize> = line.chars().enumerate().filter(|(_, c)| ('가'..='힣').contains(c)).map(|(i, _)| start + i).collect();
+            if !(3..=4).contains(&at.len()) {
+                continue;
+            }
+            let raw: String = at.iter().filter_map(|&i| chars.get(i)).collect();
+            let seen = |k: usize, want: char| -> bool {
+                let i = at[k];
+                crop.confs.get(i).is_some_and(|c| *c < IMMUTABLE_CONF) && crate::ai::gocr::alt_supports(&crop.text, &crop.alts, i, want, IMMUTABLE_CONF)
+            };
+            if let Some(p) = db.person_with_evidence(&raw, 2, seen) {
+                let diff = raw.chars().zip(p.name.chars()).filter(|(a, b)| a != b).count();
+                return Some((raw, p, diff));
+            }
+        }
+    }
+    None
 }
 
 /// 한 장에서 문서 종류와 항목을 뽑습니다.
@@ -691,7 +763,46 @@ mod tests {
     }
 
     fn crop(text: &str, conf: f32) -> PageCrop {
-        PageCrop { title: false, bbox: [100, 200, 900, 400], text: text.to_string(), confs: vec![conf; text.chars().count()] }
+        PageCrop { title: false, bbox: [100, 200, 900, 400], text: text.to_string(), confs: vec![conf; text.chars().count()], alts: Vec::new() }
+    }
+
+    /// 손글씨 서명 '입래현'(김태현과 두 글자 차이, A0 B4 실측): 모델이 두 자리 모두에서 원장 글자 쪽 바이트를 대안으로 봤을 때만 고칩니다.
+    /// gocr 는 " 입" 을 Ġìŀ + ħ, " 김" 을 Ġê + ¹ + Ģ 로 쪼개므로 근거는 글자가 아니라 바이트 조각입니다 (`gocr::alt_supports`).
+    #[test]
+    fn a_two_letter_signer_misread_is_fixed_only_with_decoder_evidence() {
+        use crate::ai::gocr::AltPiece;
+        for body in [
+            "MOC-2026-1104\n10LAB10AP001 토출압력 경보\n29.0 MPa → 31.0 MPa\n2026-11-04 입래현",
+            // 표로 읽힌 조각: 서명 줄이 칸 하나
+            "<table><tr><td>MOC-2026-1104</td></tr><tr><td>10LAB10AP001 토출압력 경보</td></tr><tr><td>29.0 MPa → 31.0 MPa</td></tr><tr><td>2026-11-04 입래현</td></tr></table>",
+        ] {
+            let at = |c: char| body.chars().position(|x| x == c).unwrap();
+            // '입' 자리는 앞 공백부터 Ġê(20 EA → 김), '래' 자리는 íĥ(ED 83 → 태)
+            let ip = (body.find('입').unwrap() - 1, vec![0x20u8, 0xEA]);
+            let rae = (body.find('래').unwrap(), vec![0xEDu8, 0x83]);
+            let with = |pieces: &[(&(usize, Vec<u8>), f32)], conf: f32| {
+                let mut c = crop(body, 0.92);
+                for ((byte, alt), p) in pieces {
+                    c.alts.push(AltPiece { at: *byte, conf, alts: vec![(alt.clone(), *p)] });
+                }
+                for ch in ['입', '래'] {
+                    c.confs[at(ch)] = conf;
+                }
+                page(vec![PageCrop { title: true, ..crop("도면번호: PID-103-LAB (Rev.3)", 0.99) }, c], true)
+            };
+            // 두 자리 모두 근거 (0.21 · 0.12), 확신 0.6 → 김태현 (E102)
+            let x = extract(&with(&[(&ip, 0.21), (&rae, 0.12)], 0.6), &db());
+            assert_eq!(x.worker_id.as_deref(), Some("E102"), "{body}: {:?}", x.corrections);
+            assert!(x.corrections.iter().any(|c| c.field.starts_with("서명자 이름 (판독") && c.raw == "입래현" && c.fixed == "김태현" && c.distance == 2), "{:?}", x.corrections);
+            // 한 자리만 근거가 있으면(래 → 태 없음) 고치지 않습니다 — 원장에 비슷한 이름이 있다는 것만으로 두 글자를 바꾸지 않음
+            let x = extract(&with(&[(&ip, 0.21)], 0.6), &db());
+            assert_eq!(x.worker_id, None, "{:?}", x.corrections);
+            // 대안 확률이 0.08 밑이거나, 모델이 0.95 이상 확신한 스텝이면 고치지 않습니다
+            let x = extract(&with(&[(&ip, 0.05), (&rae, 0.12)], 0.6), &db());
+            assert_eq!(x.worker_id, None);
+            let x = extract(&with(&[(&ip, 0.21), (&rae, 0.12)], 0.97), &db());
+            assert_eq!(x.worker_id, None);
+        }
     }
 
     fn page(crops: Vec<PageCrop>, signed: bool) -> PageText {

@@ -28,8 +28,8 @@ export interface SearchResult {
   conditions: { kind: string; text: string; applied: boolean; note: string }[];
   notes: string[];
   hits: SearchHit[];
-  /** 질의 언어 (엔진이 판단) */
-  lang?: "ko" | "en";
+  /** 질의 언어 (엔진이 판단, 12개 언어: core/src/search/lang.rs) */
+  lang?: "ko" | "en" | "de" | "fr" | "es" | "it" | "pt" | "nl" | "cs" | "ar" | "ja" | "zh-hans";
   /** 쓴 모델 ("Stanza en · ko · 임베딩 granite-97m", 없으면 "규칙만") */
   engine?: string;
   /** 낱말마다 품사 · 원형 · 줄기 */
@@ -53,7 +53,12 @@ const KIND_EN: Record<SearchDoc["kind"], string> = { equipment: "Equipment", sen
 export const kindLabel = (k: SearchDoc["kind"]) => tr(KIND_KO[k], KIND_EN[k]);
 
 const HISTORY_KEY = "blueprint.search-history";
-const RELATIVE = ["상류", "하류", "주변", "연결", "관련", "이 설비", "여기", "upstream", "downstream", "around", "near", "connected", "related", "this"];
+// 관계 낱말 (한국어 · 영어 + 엔진 다국어 사전 lexicon_ml.json 의 상류 · 하류 낱말): 자기 기준이 없는 관계 질의에 선택 설비 코드를 붙입니다
+const RELATIVE = [
+  "상류", "하류", "주변", "연결", "관련", "이 설비", "여기", "upstream", "downstream", "around", "near", "connected", "related", "this",
+  "stromaufwärts", "stromabwärts", "amont", "aval", "aguas arriba", "aguas abajo", "a monte", "a valle", "montante", "jusante",
+  "stroomopwaarts", "stroomafwaarts", "proti proudu", "po proudu", "أعلى التيار", "أسفل التيار", "上流", "下流", "上游", "下游",
+];
 
 const bigrams = (text: string) => {
   const chars = [...text.toLowerCase()].filter((c) => !/\s/.test(c) && !"·()[],.".includes(c));
@@ -69,11 +74,18 @@ export function contextual(query: string, kks: string, plant: Plant): string {
   const q = query.trim();
   const words = q.split(/\s+/).filter(Boolean);
   const ownId = words.some((w) => /^[0-9A-Z][0-9A-Z-]{7,}$/i.test(w.replace(/[^0-9A-Za-z-]/g, "")) && /[0-9]/.test(w));
-  const building = plant.sectors.some((s) => q.includes(s.building)) || /\d+동/.test(q) || /\b(?:bldg\.?|building)\s*\d+/i.test(q);
+  // 동 번호: 한국어 · 영어 + 엔진 다국어 사전의 동 낱말 (Gebäude 103 · bâtiment 103 · 103号棟 · 103号楼 · المبنى 103 …)
+  const building =
+    plant.sectors.some((s) => q.includes(s.building)) ||
+    /\d+동/.test(q) ||
+    /\b(?:bldg\.?|building)\s*\d+/i.test(q) ||
+    /\d+\s*(?:号棟|号館|棟|号楼|栋)/.test(q) ||
+    /(?:gebäude|bâtiment|batiment|edificio|edifício|gebouw|budov\S*|مبنى|المبنى)\s*\d+/i.test(q);
   const qg = bigrams(q);
-  // 한글 이름은 두 글자 조각 둘 이상이 겹치면 이름을 부른 것으로 봅니다. 영어는 글자 조각이 너무 흔해("upstream" ↔ "Main Steam")
+  // 한글 · 한자 · 가나 이름은 두 글자 조각 둘 이상이 겹치면 이름을 부른 것으로 봅니다. 로마자는 글자 조각이 너무 흔해("upstream" ↔ "Main Steam")
   // 이름 전체가 들어 있거나 이름의 세 글자 이상 낱말이 둘 이상 들어 있을 때만 봅니다.
-  const latin = !/[가-힣]/.test(q);
+  const cjk = /[぀-ヿ一-鿿]/.test(q);
+  const latin = !/[가-힣]/.test(q) && !cjk;
   const lower = q.toLowerCase();
   const named = plant.equipment.some((e) => {
     if (!latin) return [...bigrams(e.name)].filter((g) => qg.has(g)).length >= 2;
@@ -84,8 +96,10 @@ export function contextual(query: string, kks: string, plant: Plant): string {
   if (ownId || building || named) return q;
   const relative = RELATIVE.some((w) => q.toLowerCase().includes(w));
   // 짧은 질의: 한국어 "관련 MOC" · "절차서" 처럼 두 낱말까지. 영어는 관계 낱말(related · upstream …)을 따로 쓰므로 한 낱말만
-  // ("pending MOC" 는 상태로 거른 유형 질의라 선택 설비 문맥을 붙이지 않습니다)
-  return relative || words.length <= (latin ? 1 : 2) ? `${kks} ${q}` : q;
+  // ("pending MOC" 는 상태로 거른 유형 질의라 선택 설비 문맥을 붙이지 않습니다). 일본어 · 중국어는 띄어 쓰지 않아 낱말 수가 늘 하나라
+  // 글자 수로 봅니다 (네 글자까지: "手順書" · "上流1跳" 는 짧고 "103号棟2階のバルブ" 는 아님).
+  const short = cjk ? [...q.replace(/\s/g, "")].length <= 4 : words.length <= (latin ? 1 : 2);
+  return relative || short ? `${kks} ${q}` : q;
 }
 
 /** 결과에서 도면 위 Top-3 표시 (설비 코드가 있는 조건 통과 항목, 같은 설비는 한 번) */

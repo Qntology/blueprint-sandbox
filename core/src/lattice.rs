@@ -737,6 +737,27 @@ impl Lattice {
         hits.next().is_none().then_some(first)
     }
 
+    /// 판독 근거가 있는 이름 교정 (OCR개선안 4.2 의 '원장 교집합 게이트'를 글자 단위로): 같은 길이의 원장 이름 가운데
+    /// 1 ~ `max_diff` 글자만 다르고, 다른 글자마다 `seen(자리, 원장 글자)` 가 참인(= 모델이 그 자리에서 그 글자를 대안으로 본) 이름이
+    /// 하나뿐일 때만 돌려줍니다. 근거 없는 두 글자 교정(환각)은 하지 않습니다 — `person_one_off` 는 한 글자 차이를 근거 없이 고치므로
+    /// 두 글자 차이는 이 함수만 고칩니다.
+    pub fn person_with_evidence(&self, name: &str, max_diff: usize, seen: impl Fn(usize, char) -> bool) -> Option<&PersonRow> {
+        let want: Vec<char> = name.trim().chars().collect();
+        if want.len() < 3 {
+            return None;
+        }
+        let mut hits = self.seed.personnel.iter().filter(|p| {
+            let have: Vec<char> = p.name.chars().collect();
+            if have.len() != want.len() {
+                return false;
+            }
+            let diff: Vec<usize> = (0..have.len()).filter(|&i| have[i] != want[i]).collect();
+            !diff.is_empty() && diff.len() <= max_diff && diff.iter().all(|&i| seen(i, have[i]))
+        });
+        let first = hits.next()?;
+        hits.next().is_none().then_some(first)
+    }
+
     /// 근무자가 이 섹터를 관할하는가
     pub fn authorized(&self, person: &str, sector: &str) -> bool {
         self.person(person).is_some_and(|p| p.authorized_sectors.iter().any(|s| s == "*" || s == sector))

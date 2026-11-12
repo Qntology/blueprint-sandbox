@@ -221,18 +221,29 @@ pub struct Candidate {
 }
 
 /// `usable[i]`: 창의 처음 · 끝이 될 수 있는 낱말 (내용어). 반환: (이긴 조각, 모든 후보)
-pub fn ground(tokens: &[QueryToken], usable: &[bool], bank: &ConceptBank, emb: &CachedEmbedder) -> Result<(Vec<Segment>, Vec<Candidate>)> {
+/// `sep`: 창 안 낱말을 이을 글 (띄어 쓰는 언어 " ", 일본어 · 중국어 "")
+pub fn ground(tokens: &[QueryToken], usable: &[bool], bank: &ConceptBank, emb: &CachedEmbedder, sep: &str) -> Result<(Vec<Segment>, Vec<Candidate>)> {
     let mut spans: Vec<(usize, usize, String)> = Vec::new();
     let limit = tokens.len().min(MAX_TOKENS);
     for s in 0..limit {
         if !usable[s] {
             continue;
         }
-        for e in s + 1..=(s + MAX_SPAN).min(limit) {
+        // 창 길이는 내용 낱말 수로 셉니다 (안의 기능어는 세지 않음, 낱말은 MAX_SPAN × 2 까지): 프랑스어 · 스페인어 이름은 'de · d'' 가 끼어
+        // "vanne de régulation de débit d'eau alimentaire principale" 가 아홉 낱말이라, 낱말 다섯 개 창으로는 전체 이름이 창이 되지 못하고
+        // 조각 'eau alimentaire principale'(→ 주급수펌프 A)이 이겼습니다.
+        let mut content = 0;
+        for e in s + 1..=(s + MAX_SPAN * 2).min(limit) {
+            if !tokens[e - 1].function {
+                content += 1;
+            }
+            if content > MAX_SPAN {
+                break;
+            }
             if !usable[e - 1] {
                 continue;
             }
-            let text = tokens[s..e].iter().map(|t| t.text.as_str()).filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" ");
+            let text = tokens[s..e].iter().map(|t| t.text.as_str()).filter(|t| !t.is_empty()).collect::<Vec<_>>().join(sep);
             spans.push((s, e, text));
         }
     }
@@ -253,7 +264,21 @@ pub fn ground(tokens: &[QueryToken], usable: &[bool], bank: &ConceptBank, emb: &
         let margin = scores[best] - rival;
         let target = &bank.concepts[best].target;
         let entity = matches!(target, Target::Equipment(_) | Target::Sensor(..));
-        let words = tokens[s..e].iter().filter(|t| !t.function).count();
+        // 내용 낱말 수. 긴 합성어 한 낱말(독일어 Hauptspeisewasser-Durchflussregelventil, 열두 글자 이상)과 네 글자 이상 한자 · 가나 묶음
+        // (主給水流量調節弁)은 여러 낱말 이름이라 두 낱말로 셉니다 — 한 낱말 문턱(코사인 0.9)은 'steam' 같은 짧은 낱말을 막으려는 것
+        let words: usize = tokens[s..e]
+            .iter()
+            .filter(|t| !t.function)
+            .map(|t| {
+                let n = t.text.chars().count();
+                let cjk = t.text.chars().any(|c| ('\u{3040}'..='\u{9FFF}').contains(&c));
+                if (cjk && n >= 4) || (!cjk && n >= 12) {
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum();
         let passed = entity && z >= Z_GATE && margin >= MARGIN_GATE && (words >= 2 || scores[best] >= SINGLE_WORD_COS);
         log.push(Candidate { text: text.clone(), label: bank.concepts[best].label.clone(), cos: scores[best], z, margin, passed });
         if passed {

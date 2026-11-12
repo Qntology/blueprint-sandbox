@@ -413,6 +413,26 @@ pub fn attend(q: &Tensor, kt: &Tensor, v: &Tensor, past: &[(&Tensor, &Tensor)], 
     Ok(if outs.len() == 1 { outs.remove(0) } else { Tensor::cat(&outs, 1)? })
 }
 
+/// 로짓에서 확률이 큰 토큰 셋과 그 확률 (소프트맥스는 전체 행). 모자라면 `(u32::MAX, 0.0)`.
+/// OCR 디코딩이 1위 말고도 모델이 '본' 대안 글자를 남길 때 씁니다 (원장 교집합 교정의 시각 근거).
+pub fn top3(logits: &[f32]) -> [(u32, f32); 3] {
+    let mut best = [(u32::MAX, f32::MIN); 3];
+    for (i, &l) in logits.iter().enumerate() {
+        if l > best[2].1 {
+            best[2] = (i as u32, l);
+            if best[2].1 > best[1].1 {
+                best.swap(1, 2);
+                if best[1].1 > best[0].1 {
+                    best.swap(0, 1);
+                }
+            }
+        }
+    }
+    let max = best[0].1;
+    let z: f32 = logits.iter().map(|l| (l - max).exp()).sum();
+    best.map(|(t, l)| if t == u32::MAX { (t, 0.0) } else { (t, (l - max).exp() / z) })
+}
+
 /// 로짓에서 가장 큰 토큰과 그 확률
 pub fn top1(logits: &[f32]) -> (u32, f32) {
     let (mut best, mut max) = (0usize, f32::MIN);

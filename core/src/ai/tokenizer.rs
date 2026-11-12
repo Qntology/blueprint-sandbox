@@ -43,6 +43,33 @@ impl ModelTokenizer {
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
         self.inner.token_to_id(token)
     }
+
+    /// 토큰 하나의 원래 바이트. 바이트 수준 BPE 는 한글 한 글자를 토큰 둘 셋으로 쪼개므로(`입` = `Ġìŀ` + `ħ`), 토큰 하나만
+    /// `decode` 하면 깨진 글자(U+FFFD)가 됩니다. 어휘 글자를 GPT-2 바이트 표로 되돌리고, 표에 없는 글자가 있는 토큰(추가 · 특수 토큰)은 글 그대로입니다.
+    pub fn token_bytes(&self, id: u32) -> Option<Vec<u8>> {
+        let piece = self.inner.id_to_token(id)?;
+        let table = byte_level_table();
+        let bytes: Option<Vec<u8>> = piece.chars().map(|c| table.get(&c).copied()).collect();
+        bytes.or_else(|| Some(piece.into_bytes()))
+    }
+}
+
+/// GPT-2 바이트 수준 BPE 의 글자 → 바이트 표 (`bytes_to_unicode` 의 역)
+fn byte_level_table() -> &'static std::collections::HashMap<char, u8> {
+    static TABLE: std::sync::OnceLock<std::collections::HashMap<char, u8>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut printable: Vec<u32> = (b'!' as u32..=b'~' as u32).chain(0xA1..=0xAC).chain(0xAE..=0xFF).collect();
+        let mut chars = printable.clone();
+        let mut n = 0;
+        for b in 0..256u32 {
+            if !printable.contains(&b) {
+                printable.push(b);
+                chars.push(256 + n);
+                n += 1;
+            }
+        }
+        printable.iter().zip(&chars).map(|(&b, &c)| (char::from_u32(c).unwrap(), b as u8)).collect()
+    })
 }
 
 /// 원문의 `byte` 번째 바이트를 덮는 토큰의 번호. 같은 바이트를 덮는 토큰이 여럿이면 마지막 것입니다
@@ -120,5 +147,23 @@ mod tests {
     #[test]
     fn missing_files_are_reported() {
         assert!(ModelTokenizer::from_file(Path::new("does-not-exist.json")).is_err());
+    }
+
+    /// 바이트 토큰 하나는 decode 하면 깨지지만(U+FFFD) token_bytes 는 원래 바이트를 돌려주고, 이어 붙이면 원문입니다.
+    #[test]
+    fn token_bytes_give_the_raw_bytes_of_split_hangul() -> Result<()> {
+        let tk = byte_tokenizer();
+        let text = "2026-11-04 입래현";
+        let enc = tk.encode(text)?;
+        let joined: Vec<u8> = enc.ids.iter().flat_map(|&id| tk.token_bytes(id).unwrap()).collect();
+        assert_eq!(joined, text.as_bytes());
+        let space = enc.ids[text.find(' ').unwrap()];
+        assert_eq!(tk.token_bytes(space), Some(vec![b' ']));
+        let lead = enc.ids[text.find('입').unwrap()];
+        assert_eq!(tk.token_bytes(lead), Some(vec![0xEC]));
+        assert!(tk.decode(&[lead])?.contains('\u{FFFD}'));
+        // 특수 토큰은 글 그대로
+        assert_eq!(tk.token_bytes(tk.token_to_id("<|im_end|>").unwrap()), Some(b"<|im_end|>".to_vec()));
+        Ok(())
     }
 }

@@ -206,9 +206,177 @@ struct LemmaModel {
     dict: HashMap<String, HashMap<String, String>>,
 }
 
-/// 한 언어의 Stanza (품사 + 원형)
+/// 토크나이저 사전 특징 (stanza tokenization `create_dictionary` · `extract_dict_feat`): 낱말 · 접두(마지막 글자 뺀) · 접미(첫 글자 뺀)
+#[cfg(feature = "stanza")]
+struct DictLexicon {
+    words: std::collections::HashSet<String>,
+    prefixes: std::collections::HashSet<String>,
+    suffixes: std::collections::HashSet<String>,
+}
+
+#[cfg(feature = "stanza")]
+impl DictLexicon {
+    fn new(list: Vec<String>) -> Self {
+        let mut prefixes = std::collections::HashSet::new();
+        let mut suffixes = std::collections::HashSet::new();
+        for w in &list {
+            let cs: Vec<char> = w.chars().collect();
+            for i in 1..cs.len() {
+                prefixes.insert(cs[..i].iter().collect::<String>());
+                suffixes.insert(cs[cs.len() - i..].iter().collect::<String>());
+            }
+        }
+        Self { words: list.into_iter().collect(), prefixes, suffixes }
+    }
+
+    /// 앞으로 · 뒤로 1 ~ n 글자 창이 사전 낱말인가 (첫 글자는 그대로, 붙이는 글자는 소문자)
+    fn feats(&self, para: &[char], idx: usize, n: usize) -> Vec<f32> {
+        let mut fwd = vec![0f32; n];
+        let mut bwd = vec![0f32; n];
+        let mut fw = para[idx].to_string();
+        let mut bw = para[idx].to_string();
+        let (mut prefix, mut suffix) = (true, true);
+        for win in 1..=n {
+            if idx + win < para.len() && prefix {
+                fw.push_str(&para[idx + win].to_lowercase().to_string());
+                fwd[win - 1] = f32::from(u8::from(self.words.contains(&fw)));
+                if !self.prefixes.contains(&fw) {
+                    prefix = false;
+                }
+            }
+            if idx >= win && suffix {
+                bw = format!("{}{}", para[idx - win].to_lowercase(), bw);
+                bwd[win - 1] = f32::from(u8::from(self.words.contains(&bw)));
+                if !self.suffixes.contains(&bw) {
+                    suffix = false;
+                }
+            }
+            if !prefix && !suffix {
+                break;
+            }
+        }
+        fwd.extend(bwd);
+        fwd
+    }
+}
+
+/// Stanza 토크나이저 (글자마다 낱말 끝 · 문장 끝 분류). 일본어 · 중국어처럼 띄어 쓰지 않는 언어의 검색 질의를 낱말로 나눌 때만 씁니다.
+/// 규약은 logis-center `stanza.rs` 의 Tokenizer(= stanza-onnx-export `verify_onnx.py` RefRuntime)와 같습니다. 질의에는 이메일 · URL 이 없으므로
+/// 정규식 가리개(MASK_RE)와 구조 특징(labeled_field 등 — 일본어 · 중국어 변환본의 특징 목록에 없음)은 옮기지 않았습니다.
+#[cfg(feature = "stanza")]
+struct TokenizerModel {
+    plan: engine::Plan,
+    ids: HashMap<char, i64>,
+    lower: bool,
+    layout: Vec<String>,
+    num_dict_feat: usize,
+    lexicon: Option<DictLexicon>,
+}
+
+#[cfg(feature = "stanza")]
+impl TokenizerModel {
+    fn load(dir: &Path, e: &Value) -> Result<Self> {
+        let lexicon = match e.get("lexicon_file").and_then(Value::as_str) {
+            Some(f) if dir.join(f).exists() => {
+                let raw = std::fs::read_to_string(dir.join(f)).with_context(|| format!("{f} 읽기"))?;
+                Some(DictLexicon::new(serde_json::from_str(&raw)?))
+            }
+            _ => None,
+        };
+        let mut ids = HashMap::new();
+        for (i, u) in units(&e["main"])?.iter().enumerate() {
+            let mut it = u.chars();
+            if let (Some(c), None) = (it.next(), it.next()) {
+                ids.insert(c, i as i64);
+            }
+        }
+        Ok(Self {
+            plan: engine::load(&dir.join("tokenizer.onnx"), &strings(&e["inputs"]))?,
+            ids,
+            lower: e["lower"].as_bool().unwrap_or(false),
+            layout: units(&e["feat_layout"])?,
+            num_dict_feat: e["num_dict_feat"].as_u64().unwrap_or(0) as usize,
+            lexicon,
+        })
+    }
+
+    fn tokenize(&self, text: &str) -> Result<Vec<String>> {
+        // TokenizationDataset: 오른쪽 공백 제거, 공백류는 ' ', 연속 공백은 하나
+        let mut para: Vec<char> = Vec::new();
+        for c in text.trim_end().chars() {
+            let c = if c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c) || ('\u{80}'..='\u{9f}').contains(&c) { ' ' } else { c };
+            if c == ' ' && para.last() == Some(&' ') {
+                continue;
+            }
+            para.push(c);
+        }
+        let n = para.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut x: Vec<i64> = para
+            .iter()
+            .map(|c| {
+                let c = if self.lower { c.to_lowercase().next().unwrap_or(*c) } else { *c };
+                *self.ids.get(&c).unwrap_or(&UNK)
+            })
+            .collect();
+        x.push(0);
+        let l = self.layout.len();
+        let mut f = vec![0f32; (n + 1) * l];
+        for (i, &c) in para.iter().enumerate() {
+            let dict = self.lexicon.as_ref().filter(|_| self.num_dict_feat > 0).map(|lex| lex.feats(&para, i, self.num_dict_feat));
+            for (k, name) in self.layout.iter().enumerate() {
+                let v = match name.as_str() {
+                    "space_before" => c == ' ',
+                    "capitalized" => c.is_uppercase(),
+                    "numeric" => c.is_numeric(),
+                    "end_of_para" => i == n - 1,
+                    "start_of_para" => i == 0,
+                    other => {
+                        let d = dict.as_ref();
+                        let val = if let Some(k1) = other.strip_prefix("dict_forward_") {
+                            d.map(|d| d[k1.parse::<usize>().unwrap_or(1) - 1]).unwrap_or(0.0)
+                        } else if let Some(k1) = other.strip_prefix("dict_backward_") {
+                            d.map(|d| d[self.num_dict_feat + k1.parse::<usize>().unwrap_or(1) - 1]).unwrap_or(0.0)
+                        } else {
+                            0.0
+                        };
+                        f[i * l + k] = val;
+                        continue;
+                    }
+                };
+                f[i * l + k] = f32::from(u8::from(v));
+            }
+        }
+        let xt = engine::i64_2d(1, n + 1, x)?;
+        let ft: tract_onnx::prelude::Tensor = tract_onnx::prelude::tract_ndarray::Array3::from_shape_vec((1, n + 1, l), f)?.into();
+        let out = engine::run(&self.plan, vec![xt, ft])?;
+        let mut pred: Vec<usize> = engine::argmax_rows(&out[0])?.into_iter().take(n).collect();
+        // 마지막 글자는 문장 끝 (MWT 표시는 그대로)
+        let last = pred[n - 1];
+        pred[n - 1] = if last > 2 { 4 } else { 2 };
+        let mut words = Vec::new();
+        let mut cur = String::new();
+        for (c, p) in para.iter().zip(pred.iter()) {
+            cur.push(*c);
+            if *p >= 1 {
+                let t: String = cur.trim_start().chars().map(|ch| if ch.is_whitespace() { ' ' } else { ch }).collect();
+                cur.clear();
+                if !t.is_empty() {
+                    words.push(t);
+                }
+            }
+        }
+        Ok(words)
+    }
+}
+
+/// 한 언어의 Stanza (품사 + 원형, 일본어 · 중국어는 토크나이저도)
 pub struct StanzaLang {
     pub lang: String,
+    #[cfg(feature = "stanza")]
+    tokenizer: Option<TokenizerModel>,
     #[cfg(feature = "stanza")]
     pretrain: Option<HashMap<String, i64>>,
     #[cfg(feature = "stanza")]
@@ -300,12 +468,26 @@ impl StanzaLang {
             }
             None => None,
         };
-        Ok(Self { lang, pretrain, pos, lemma })
+        // 토크나이저는 띄어 쓰지 않는 언어만 가져옵니다 (모델 폴더에 tokenizer.onnx 가 있을 때)
+        let tokenizer = match v.get("tokenize") {
+            Some(t) if dir.join("tokenizer.onnx").exists() => Some(TokenizerModel::load(dir, t)?),
+            _ => None,
+        };
+        Ok(Self { lang, tokenizer, pretrain, pos, lemma })
     }
 
     #[cfg(not(feature = "stanza"))]
     pub fn load(dir: &Path) -> Result<Self> {
         bail!("이 빌드는 stanza 기능 없이 만들어졌습니다 ({})", dir.display())
+    }
+
+    /// 원문을 Stanza 토크나이저로 낱말로 나눕니다 (토크나이저를 가져온 언어만 — 일본어 · 중국어처럼 띄어 쓰지 않는 언어).
+    #[cfg(feature = "stanza")]
+    pub fn tokenize(&self, text: &str) -> Result<Vec<String>> {
+        match &self.tokenizer {
+            Some(t) => t.tokenize(text),
+            None => bail!("{} 토크나이저를 가져오지 않았습니다", self.lang),
+        }
     }
 
     /// 공백으로 나눈 낱말들 (한 문장)에 품사 · 원형을 붙입니다.
@@ -330,6 +512,12 @@ impl StanzaLang {
 
     #[cfg(not(feature = "stanza"))]
     pub fn tag(&self, _words: &[&str]) -> Result<Vec<Tagged>> {
+        bail!("stanza 기능 없음")
+    }
+
+    /// 원문을 Stanza 토크나이저로 낱말로 나눕니다 (토크나이저를 가져온 언어만 — 일본어 · 중국어처럼 띄어 쓰지 않는 언어).
+    #[cfg(not(feature = "stanza"))]
+    pub fn tokenize(&self, _text: &str) -> Result<Vec<String>> {
         bail!("stanza 기능 없음")
     }
 
@@ -383,7 +571,8 @@ impl StanzaLang {
             } else {
                 (0..spec.heads()).map(|k| argmax_rows(by_name.get(format!("{name}_{k}").as_str()).ok_or_else(|| anyhow!("{name}_{k} 출력이 없습니다"))?)).collect::<Result<_>>()?
             };
-            let col: Vec<String> = (0..n).map(|i| spec.unit(&per_head.iter().map(|h| h[i]).collect::<Vec<_>>())).collect();
+            // 프랑스어 · 포르투갈어 xpos 는 사전이 비어 있고(ignore ['_']) 모델이 늘 EMPTY 를 냅니다 → stanza 처럼 '_' (예전에 xpos 0 %)
+            let col: Vec<String> = (0..n).map(|i| spec.unit(&per_head.iter().map(|h| h[i]).collect::<Vec<_>>())).map(|u| if u == "<EMPTY>" { "_".to_string() } else { u }).collect();
             cols.push((name.clone(), col));
         }
         Ok((upos, cols))
@@ -527,5 +716,63 @@ mod tests {
         assert_eq!(got[0].lemma, "valve");
         let got = en.tag(&["building", "105", "valve", "ID", "fan"]).unwrap();
         assert_eq!(got[0].upos, "VERB", "PyTorch Stanza 도 building 을 동사로 봅니다 (질의 조각이라)");
+    }
+
+    /// 12개 언어 기준 출력(stanza-onnx-export `reference_outputs.json`, PyTorch Stanza 전체 파이프라인)과 대조:
+    /// 문장마다 기준 낱말(MWT 펼친 뒤)을 넣어 upos · xpos · 원형이 같은지, 일본어 · 중국어는 토크나이저 낱말도.
+    ///   BLUEPRINT_STANZA_REF=<reference_outputs.json> cargo test -p blueprint-core --release -- --ignored reference_outputs_all_languages --nocapture
+    #[cfg(feature = "stanza")]
+    #[test]
+    #[ignore]
+    fn reference_outputs_all_languages() {
+        let base = std::env::var_os("BLUEPRINT_STANZA_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| crate::ai::model_store::model_dir("stanza"));
+        let Some(reference) = std::env::var_os("BLUEPRINT_STANZA_REF") else {
+            eprintln!("BLUEPRINT_STANZA_REF 가 없어 건너뜁니다");
+            return;
+        };
+        let refs: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(reference).unwrap()).unwrap();
+        let mut failures = Vec::new();
+        for (lang, docs) in refs.as_object().unwrap() {
+            let dir = base.join(lang);
+            if !dir.join("vocab.json").exists() {
+                eprintln!("{lang}: 모델 없음 — 건너뜀");
+                continue;
+            }
+            let m = StanzaLang::load(&dir).unwrap_or_else(|e| panic!("{lang}: {e:#}"));
+            let (mut n, mut upos, mut xpos, mut lemma, mut tok_ok, mut tok_n) = (0, 0, 0, 0, 0, 0);
+            for doc in docs.as_array().unwrap() {
+                let text = doc["text"].as_str().unwrap();
+                if m.tokenizer.is_some() {
+                    let want: Vec<String> = doc["sentences"].as_array().unwrap().iter().flat_map(|s| strings(&s["tokens"])).collect();
+                    tok_n += 1;
+                    if m.tokenize(text).unwrap() == want {
+                        tok_ok += 1;
+                    } else {
+                        failures.push(format!("{lang} 토큰: {text}"));
+                    }
+                }
+                for s in doc["sentences"].as_array().unwrap() {
+                    let words = strings(&s["words"]);
+                    let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+                    let got = m.tag(&refs).unwrap();
+                    for (i, g) in got.iter().enumerate() {
+                        n += 1;
+                        upos += usize::from(g.upos == s["upos"][i].as_str().unwrap_or(""));
+                        xpos += usize::from(g.xpos == s["xpos"][i].as_str().unwrap_or("_"));
+                        let want_lemma = s["lemma"][i].as_str().unwrap_or("_");
+                        if g.lemma == want_lemma {
+                            lemma += 1;
+                        } else {
+                            failures.push(format!("{lang} 원형: {} → {} (기준 {want_lemma})", g.text, g.lemma));
+                        }
+                    }
+                }
+            }
+            eprintln!("{lang}: 낱말 {n} · upos {upos} · xpos {xpos} · 원형 {lemma}{}", if tok_n > 0 { format!(" · 토큰 문단 {tok_ok}/{tok_n}") } else { String::new() });
+            if upos != n || xpos != n {
+                failures.push(format!("{lang}: upos {upos}/{n} · xpos {xpos}/{n}"));
+            }
+        }
+        assert!(failures.is_empty(), "기준과 다름 {}건:\n{}", failures.len(), failures.join("\n"));
     }
 }

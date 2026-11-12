@@ -589,3 +589,53 @@ tract 는 ONNX 에 적힌 동적 축 이름으로 모델당 한 번만 최적화
 | --- | --- | --- |
 | 한국어 | **통과** | 앱 시작 때 검색 모델 읽기 3.5 s (Stanza ko 0.4 · en 1.8 · 임베딩 1.3), 검색 표 · 개념 뱅크 임베딩 4.2 s. 머리줄에 `🧠 Stanza en · ko · 임베딩 granite-97m`, 기록에 `NMS 조각 '주급수 유량조절밸브' → 주급수 유량조절밸브 (설비 · 코사인 1.000 · z 4.6)`. 문맥 질의 `상류 1홉` → `문맥 10LAB10AP001 + '상류 1홉'` · 4건 |
 | 영어 (화면 번역 없이 엔진이 영어를 읽음) | **통과** | `main feedwater flow control valve 1 hop upstream` → `NMS segment … → Main Feedwater Flow Control Valve (equipment · cosine 0.988 · z 3.7)` · 기준 설비 10LAB20AA102 · 1위 Main Feedwater Pump A. 문맥 `1 hop upstream` → `context 10LAB10AP001 + '1 hop upstream'` · 4 hits. 화면 감사가 찾은 한글은 새 모델 설정 이름 두 줄 → 번역 표에 더함 |
+
+## 14. 다국어 검색 (12개 언어 N:N) · OCR 개선안 (2026-11-12)
+
+logis-center `a735ac75..f2e5cc87` 의 다국어 전처리 · 검색을 옮기고 ([search.md 5절](search.md)), OCR 개선안을 실측으로 대조했습니다 ([ocr-plan-review.md](ocr-plan-review.md)).
+
+### 14.1 Stanza 12개 언어 Rust 실행기 대조 (모델 필요, `--ignored`)
+
+`nlp::stanza::tests::reference_outputs_all_languages` (`BLUEPRINT_STANZA_REF=<stanza-onnx-export/reference_outputs.json>`, PyTorch Stanza 출력): 12개 언어 낱말 1,924개의
+upos · xpos · 원형이 모두 같고(ar 122 · cs 115 · de 144 · en 307 · es 154 · fr 157 · it 155 · ja 157 · ko 205 · nl 139 · pt 154 · zh-hans 115), 일본어 · 중국어 토크나이저는
+문단 19/19 가 같습니다. 처음에는 fr · pt xpos 가 0 % 였습니다 (format 2 의 빈 xpos `<EMPTY>` 를 `_` 로 바꾸지 않았음).
+
+### 14.2 N:N 검색 평가 (`search_ml_eval`, CPU release, `--features stanza`)
+
+질의 1,737 (12개 언어 × 데이터 언어 ko · en · ja · de, dev 1,161 · held 576). 표는 search.md 5-3. 고친 차례 (dev +Stanza+임베딩 MRR):
+
+| 실행 | dev | held | 바꾼 것 |
+| --- | --- | --- | --- |
+| main | 0.432 | 0.418 | 다른 언어 질의를 한국어 · 영어 규칙으로 읽음 (언어 판정 295/1,737) |
+| v2 ~ v6 | → 0.851 | - | 12개 언어 사전 · 굴절 · 합성어 · 접어, 언어 판정, 동 번호 · 라벨 언어 사이 일치, 개념 뱅크 캐시 열쇠(독일어 원장 뱅크를 한국어 원장에 다시 쓰던 결함), NMS 창 내용어 세기 |
+| v7 (held 처음) | 0.851 | 0.631 | held 는 여기서 처음 봄 |
+| v9 (확인) | 0.851 | 0.631 | v8 은 `--no-default-features` 로 Stanza 가 빠진 실행이라 버림 (그 실행에서 아랍어가 Stanza 없이 더 높은 것을 발견) |
+| **v10** | **0.855** | **0.635** | 아랍어 두 결함: 원형에 접어 떼기(بخار → خار → خارجي '옥외'), Stanza 가 'ذات' 를 명사로 달아 '압력' 조건이 사라짐 → 사전 기능어를 함께 봄, 질의가 사전 낱말의 앞부분일 뿐이면 한 글자 모자람까지. v9 대비 25건 올라가고 내려간 것 0 |
+
+`search_eval`(한국어 · 영어 묶음)은 세 모드 모두 v7 과 같은 값입니다 (시간만 다름).
+
+### 14.3 OCR 개선안 4.2 (실제 모델, ROCm · RX 6600, `delta_probe`)
+
+| 항목 | 결과 |
+| --- | --- |
+| P3 · P3F · P1 값 | 기준(`out/delta_pre_plant.json`)과 같음. P3F 델타의 한 글자 교정 `김래현 → 김태현` 그대로 |
+| A0 B4 델타 `2026-11-04 입래현` | 교정 안 함 (작업자 비움). '입' 자리 대안 `20 EA`(0.20) 는 김을 받치지만 '래' 자리 2위는 '력'(0.15), '태' 는 상위 3 밖 |
+| 처음 구현 (대안 토큰을 넣고 다시 풀어 글자 비교) | A0 B4 근거 0건: 바이트 수준 BPE 라 " 입" (2토큰) 자리에 " 김" (3토큰)이 나올 수 없음 → 바이트 조각 대조로 바꿈 |
+| 판독 시간 | 기준과 같은 범위 (P3 전부 36.6 → 36.8 s, A0 델타 12.1 → 12.4 s) |
+
+### 14.4 OCR 개선안 전제 실측 (모델 파일, CPU)
+
+| 항목 | 결과 |
+| --- | --- |
+| 1.1 어휘 자르기 (개선안 규칙 그대로) | 16,384개 = 아스키 16,139 · 공백 117 · 바이트 조각 128. 한글 0/232 · 한자 0/14,572 · 가나 0/471 · 아랍 0/948 · 키릴 0/4,882 |
+| 1.1 "연산량 72.4 % 절감" | `lm_head` 91.1M 은 토큰마다 곱하는 가중치 581.9M 의 15.6 % → 잘라도 11.3 % |
+| 1.2 Q4 | `gocr/active.json` `q4_pass: false` (이미 정밀도 기준에서 떨어짐), 언어 모델 BF16 원본 없음 |
+| 3.1 입력 임베딩 ↔ `lm_head` 직교 회전 | 맞춤 18,000 토큰 · 시험 6,000: 최근접 1위 97.6 % (회전 없음 0.1 %, 무작위 회전 0.0 %), 코사인 평균 0.295 |
+| 5 판단 프롬프트 공유 앞부분 | plant_probe 24번 · 앱 28번: 중앙값 265.5 토큰, 기준 질문과 같은 앞부분 19.0 ~ 21.9 %, 공통 지시문 39 토큰(14.7 %) |
+
+### 14.5 시험
+
+- CI 조건 `cargo test --locked --workspace --exclude blueprint-app --no-default-features --features blueprint-models/download` (debug, Stanza 끔): 코어 388 · 발전소 시나리오 14 · 데이터센터 8 · 엔진 잠금 4 · 모델 도구 21 통과.
+- `cargo test --locked -p blueprint-core --release --no-default-features --features stanza`: 코어 389 (+ 다국어 검색 · 언어 판정 · 사전 맞추기 · 독일어 원장 · 아랍어 접어 · 판독 대안 바이트 조각 3 · 두 글자 서명 교정 · 토큰 바이트) · 발전소 14 · 데이터센터 8 · 엔진 잠금 4 통과.
+- `npm run build` (app, tsc + vite): 통과 (커맨드 바의 다국어 관계 낱말 · 동 번호 정규식).
+- Hugging Face `Qntology/stanza-<언어>` 12개의 `format2/` 를 로컬 `onnx_final` 과 대조: 모든 파일 sha256 · 바이트 같음, 모델 카드 12개 모두 format2 절 있음.
