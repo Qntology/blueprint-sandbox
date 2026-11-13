@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Result};
+use candle_core::quantized::ggml_file::qtensor_from_ggml;
 use candle_core::quantized::QMatMul;
 use candle_core::{DType, Device, Module, Tensor};
 use serde_json::json;
@@ -43,6 +44,11 @@ pub const HEADROOM_ENV: &str = "BLUEPRINT_VRAM_HEADROOM_MB";
 const DEFAULT_HEADROOM_MB: u64 = 640;
 /// siglip2 토큰 임베딩 표. [`Group::Embedding`] 과 같은 이유로 올리지 않고 필요한 행만 파일에서 읽습니다.
 pub const TEXT_TOKEN_TABLE: &str = "text_model.embeddings.token_embedding.weight";
+/// 잘라 둔 출력 투영에서 남기지 않은 행 (`ai::pyramid`). 디코딩마다 이 행들이 이기는지만 봅니다.
+pub const OUTPUT_REST: &str = "output_rest.weight";
+/// 묶인 임베딩을 쓰는 모델(zoro)의 피라미드 파일이 따로 두는 출력 투영 (남긴 행 · 잘린 행). [`Group::Head`]
+pub const HEAD_KEPT: &str = "head.weight";
+pub const HEAD_REST: &str = "head_rest.weight";
 /// 호스트에 남은 가중치가 있어도 계속 진행하도록 허용하는 환경 변수 (`1`). 수치가 실행마다 달라질 수 있어 진단용으로만 씁니다.
 pub const ALLOW_HOST_ENV: &str = "BLUEPRINT_ALLOW_HOST_WEIGHTS";
 /// 모델이 바뀌어도 남겨 둘 묶음 (`siglip2` = SigLIP2 비전 타워). 없거나 `off` 면 한 번에 한 모델입니다.
@@ -104,10 +110,13 @@ pub enum Group {
     Embedding,
     /// 텍스트 블록 `[start, end)` (`blk.N.*`)
     Blocks { start: u32, end: u32 },
-    /// 출력 정규화와, 있으면 출력 투영 (`output_norm.weight`, `output.weight`)
+    /// 출력 정규화와, 있으면 출력 투영 (`output_norm.weight`, `output.weight`). 출력 투영을 잘라 둔 파일(`ai::pyramid`)이면
+    /// 잘린 행(`output_rest.weight`)도 함께입니다.
     Output,
     /// 비전 타워 (`model.visual.*`, `vision_model.*`). 이미지를 읽을 때만 필요합니다.
     Vision,
+    /// 묶인 임베딩 대신 따로 둔 출력 투영 (`head.weight` 남긴 행, `head_rest.weight` 잘린 행, `ai::pyramid`). zoro 피라미드 파일의 글쓰기에만 필요합니다.
+    Head,
     /// siglip2 텍스트 타워 (`text_model.*`, 토큰 임베딩 표 제외). 앵커 문구를 새로 인코딩할 때만 필요합니다.
     Text,
 }
@@ -121,9 +130,8 @@ impl Group {
     pub fn tensor_names(&self, file: &WeightFile) -> Vec<String> {
         match *self {
             Self::Embedding => ["token_embd.weight"].iter().filter(|n| file.has(n)).map(|n| n.to_string()).collect(),
-            Self::Output => {
-                ["output_norm.weight", "output.weight"].iter().filter(|n| file.has(n)).map(|n| n.to_string()).collect()
-            }
+            Self::Output => ["output_norm.weight", "output.weight", OUTPUT_REST].iter().filter(|n| file.has(n)).map(|n| n.to_string()).collect(),
+            Self::Head => [HEAD_KEPT, HEAD_REST].iter().filter(|n| file.has(n)).map(|n| n.to_string()).collect(),
             Self::Vision => {
                 let mut names = file.names_with_prefix("model.visual.");
                 names.extend(file.names_with_prefix("vision_model."));
@@ -145,6 +153,7 @@ impl fmt::Display for Group {
             Self::Embedding => f.write_str("임베딩"),
             Self::Output => f.write_str("출력"),
             Self::Vision => f.write_str("비전"),
+            Self::Head => f.write_str("출력 투영"),
             Self::Text => f.write_str("텍스트 타워"),
             Self::Blocks { start, end } => write!(f, "블록 {start}..{end}"),
         }
@@ -212,6 +221,9 @@ impl Loaded {
 
     /// `y = x Wᵀ`. 양자화 가중치와 일반 2차원 가중치 모두 받습니다. 일반 가중치가 BF16 이면(ROCm) 행렬곱만 그 dtype 으로 합니다.
     pub fn linear(&self, name: &str, x: &Tensor) -> Result<Tensor> {
+        if imatrix::on() {
+            imatrix::record(name, x)?;
+        }
         match self.get(name)? {
             // CUDA 의 기본 곱은 활성값을 8비트로 줄입니다. 판단 스케일을 맞춘 ROCm · Vulkan 과 같은 값이 나오도록 정확한 곱을 씁니다.
             Weight::Quant(m) if x.device().is_cuda() => Ok(m.forward_exact(x)?),
@@ -219,6 +231,52 @@ impl Loaded {
             Weight::Dense(w) if w.rank() == 2 => dense_linear(x, w),
             Weight::Dense(w) => bail!("{name}: 선형 가중치가 아닙니다 (모양 {:?})", w.dims()),
         }
+    }
+}
+
+/// 중요도 행렬 모으기: 선형 층마다 입력의 열별 제곱 평균 (llama.cpp `imatrix` 와 같은 뜻). 켰을 때만 [`Loaded::linear`] 가 모읍니다.
+/// K 형식으로 다시 양자화할 때 열마다의 가중으로 씁니다 (`ai::pyramid`). 측정 · 파일 만들기 전용이고 앱은 켜지 않습니다.
+pub mod imatrix {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    use anyhow::Result;
+    use candle_core::{DType, Device, Tensor, D};
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static SUMS: Mutex<Option<HashMap<String, (Vec<f64>, u64)>>> = Mutex::new(None);
+
+    pub fn on() -> bool {
+        ON.load(Ordering::Relaxed)
+    }
+
+    /// 모으기 시작 (이전 값은 버림)
+    pub fn start() {
+        *SUMS.lock().unwrap_or_else(|p| p.into_inner()) = Some(HashMap::new());
+        ON.store(true, Ordering::Relaxed);
+    }
+
+    /// 모으기를 멈추고 텐서마다 (열별 제곱 평균, 본 행 수)를 돌려줍니다.
+    pub fn stop() -> HashMap<String, (Vec<f32>, u64)> {
+        ON.store(false, Ordering::Relaxed);
+        let taken = SUMS.lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_default();
+        taken.into_iter().map(|(k, (s, n))| (k, (s.iter().map(|v| (v / n.max(1) as f64) as f32).collect(), n))).collect()
+    }
+
+    pub(super) fn record(name: &str, x: &Tensor) -> Result<()> {
+        let cols = x.dim(D::Minus1)?;
+        let rows = x.elem_count() / cols.max(1);
+        let s = x.reshape((rows, cols))?.to_dtype(DType::F32)?.sqr()?.sum(0)?.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+        let mut g = SUMS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(map) = g.as_mut() {
+            let e = map.entry(name.to_string()).or_insert_with(|| (vec![0.0; cols], 0));
+            if e.0.len() == cols {
+                e.0.iter_mut().zip(&s).for_each(|(a, b)| *a += *b as f64);
+                e.1 += rows as u64;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -242,6 +300,11 @@ pub struct Prepare {
     pub apply: PrepareFn,
 }
 
+/// 올릴 때 양자화할 형식 (텐서 목차 → 형식, `None` 이면 저장된 그대로). 정밀도 배분을 파일을 새로 쓰지 않고 재 볼 때 씁니다
+/// (`ai::pyramid`, `examples/quant_screen`). 파일로 만든 피라미드 GGUF 와 같은 함수(`pyramid::quantize_tensor`)로, 원본 BF16
+/// ([`ModelSpec::with_original`]) 또는 원본 그대로 저장된 BF16 값에서 한 번 양자화합니다. 저장된 Q8_0 을 다시 양자화하지 않습니다.
+pub type Requant = Arc<dyn Fn(&TensorMeta) -> Option<candle_core::quantized::GgmlDType> + Send + Sync>;
+
 /// 어느 모델의 어느 파일을 쓰는지. 같은 모델이라도 파일이 다르면 다른 상주로 칩니다.
 #[derive(Clone)]
 pub struct ModelSpec {
@@ -250,11 +313,29 @@ pub struct ModelSpec {
     /// 비전 타워를 따로 둔 파일 (`mmproj-*.gguf`). 없으면 비전 타워도 `file` 에 있습니다.
     pub mmproj: Option<Arc<WeightFile>>,
     pub prepare: Option<Prepare>,
+    /// 올릴 때 다시 양자화하는 배분과 그 이름. 이름이 다르면 같은 파일이어도 다른 상주로 칩니다.
+    pub requant: Option<(String, Requant)>,
+    /// 양자화할 때 쓰는 중요도 행렬 (텐서 이름 → 열마다 가중, [`imatrix`])
+    pub imatrix: Option<Arc<super::pyramid::Imatrix>>,
+    /// 양자화 재료인 원본 BF16 (`ai::original`). 없으면 원본 그대로 저장된(BF16 · F16 · F32) 텐서만 양자화할 수 있습니다.
+    pub original: Option<Arc<super::original::Original>>,
 }
 
 impl ModelSpec {
     pub fn new(id: ModelId, file: Arc<WeightFile>) -> Self {
-        Self { id, file, mmproj: None, prepare: None }
+        Self { id, file, mmproj: None, prepare: None, requant: None, imatrix: None, original: None }
+    }
+
+    /// 양자화할 때 이 중요도 행렬로 K 형식의 블록 오차를 가중합니다.
+    pub fn with_imatrix(mut self, imatrix: Arc<super::pyramid::Imatrix>) -> Self {
+        self.imatrix = Some(imatrix);
+        self
+    }
+
+    /// 올릴 때 양자화하는 텐서의 재료를 이 원본 BF16 에서 읽습니다.
+    pub fn with_original(mut self, original: Arc<super::original::Original>) -> Self {
+        self.original = Some(original);
+        self
     }
 
     pub fn with_prepare(mut self, prepare: Prepare) -> Self {
@@ -265,6 +346,28 @@ impl ModelSpec {
     pub fn with_mmproj(mut self, mmproj: Arc<WeightFile>) -> Self {
         self.mmproj = Some(mmproj);
         self
+    }
+
+    /// 올릴 때 `requant` 이 정한 형식으로 다시 양자화합니다 (진단 · 배분 측정용).
+    pub fn with_requant(mut self, label: impl Into<String>, requant: Requant) -> Self {
+        self.requant = Some((label.into(), requant));
+        self
+    }
+
+    /// 상주를 가르는 이름: 다시 양자화하는 배분의 이름 (없으면 빈 글)
+    pub fn variant(&self) -> &str {
+        self.requant.as_ref().map_or("", |(label, _)| label.as_str())
+    }
+
+    /// 이 텐서를 장치에 둘 목차 (다시 양자화하면 그 형식과 크기로). 2차원보다 큰 텐서(합성곱)는 [첫 차원, 나머지] 로 펴서 양자화합니다
+    /// (`ai::pyramid` 의 파일과 같은 모양). 열이 블록 크기의 배수가 아니면 다시 양자화하지 않습니다.
+    fn effective(&self, meta: TensorMeta) -> TensorMeta {
+        let cols: usize = meta.dims.iter().skip(1).product();
+        let target = self.requant.as_ref().and_then(|(_, f)| f(&meta)).filter(|d| *d != meta.dtype && meta.dims.len() >= 2 && cols.is_multiple_of(d.block_size()));
+        match target {
+            Some(dtype) => TensorMeta { bytes: (meta.elems() / dtype.block_size() * dtype.type_size()) as u64, dtype, dims: vec![meta.dims[0], cols], ..meta },
+            None => meta,
+        }
     }
 
     /// 이 묶음의 텐서가 있는 파일
@@ -436,6 +539,8 @@ pub struct Snapshot {
 struct Current {
     id: ModelId,
     file: Arc<WeightFile>,
+    /// [`ModelSpec::variant`]
+    variant: String,
     groups: BTreeMap<Group, Arc<Loaded>>,
 }
 
@@ -476,7 +581,14 @@ impl Coexist {
 /// 모델이 바뀐 뒤에도 남겨 둔 묶음
 struct Pinned {
     file: Arc<WeightFile>,
+    variant: String,
     loaded: Arc<Loaded>,
+}
+
+impl Pinned {
+    fn serves(&self, spec: &ModelSpec) -> bool {
+        self.file.path() == spec.file.path() && self.variant == spec.variant()
+    }
 }
 
 /// 모델 하나, 단계 하나의 가중치만 장치에 두는 관리자
@@ -649,13 +761,14 @@ impl Residency {
         phase
             .groups
             .iter()
-            .map(|g| self.pinned.get(&(spec.id, *g)).filter(|p| p.file.path() == spec.file.path()).map(|p| Arc::clone(&p.loaded)))
+            .map(|g| self.pinned.get(&(spec.id, *g)).filter(|p| p.serves(spec)).map(|p| Arc::clone(&p.loaded)))
             .collect()
     }
 
     fn switch_model(&mut self, spec: &ModelSpec, phase: &Phase) -> Result<()> {
         // 같은 모델의 같은 파일이면 이미 올라온 가중치를 그대로 씁니다 (파일을 다시 열어 만든 `WeightFile` 도 같은 파일로 봅니다).
-        let same = matches!(&self.current, Some(c) if c.id == spec.id && c.file.path() == spec.file.path());
+        // 다시 양자화하는 배분이 다르면 다른 가중치입니다.
+        let same = matches!(&self.current, Some(c) if c.id == spec.id && c.file.path() == spec.file.path() && c.variant == spec.variant());
         if same {
             return Ok(());
         }
@@ -667,7 +780,7 @@ impl Residency {
         let mut groups = BTreeMap::new();
         let mut other_file = false;
         for key in mine {
-            if self.pinned[&key].file.path() == spec.file.path() {
+            if self.pinned[&key].serves(spec) {
                 if let Some(p) = self.pinned.remove(&key) {
                     groups.insert(key.1, p.loaded);
                 }
@@ -678,7 +791,7 @@ impl Residency {
         if other_file {
             self.release_pinned()?;
         }
-        self.current = Some(Current { id: spec.id, file: Arc::clone(&spec.file), groups });
+        self.current = Some(Current { id: spec.id, file: Arc::clone(&spec.file), variant: spec.variant().to_string(), groups });
         self.make_room(spec, phase)
     }
 
@@ -692,7 +805,7 @@ impl Residency {
         for g in keep {
             if let Some(loaded) = cur.groups.remove(&g) {
                 trace::record(cur.id.name(), "공존 남김", 0.0, json!({ "group": g.to_string(), "bytes": loaded.device_bytes }));
-                self.pinned.insert((cur.id, g), Pinned { file: Arc::clone(&cur.file), loaded });
+                self.pinned.insert((cur.id, g), Pinned { file: Arc::clone(&cur.file), variant: cur.variant.clone(), loaded });
             }
         }
     }
@@ -704,9 +817,8 @@ impl Residency {
         }
         let (mut need, mut on_device) = (0u64, 0u64);
         for g in phase.groups.iter().filter(|g| !self.is_resident(**g)) {
-            let file = spec.file_of(*g);
-            need += estimate_group_bytes(file, *g, &self.device)?;
-            on_device += estimate_device_heap_bytes(file, *g, &self.device)?;
+            need += spec_group_bytes(spec, *g, &self.device)?;
+            on_device += spec_heap_bytes(spec, *g, &self.device)?;
         }
         let fits_budget = self.budget.allows(self.resident_bytes() + self.pinned_bytes(), need);
         let fits_device = self.free_bytes().is_none_or(|free| free >= on_device + headroom_bytes() + self.coexist.margin);
@@ -741,7 +853,7 @@ impl Residency {
     }
 
     fn load_one(&mut self, spec: &ModelSpec, group: Group) -> Result<()> {
-        let need = estimate_group_bytes(spec.file_of(group), group, &self.device)?;
+        let need = spec_group_bytes(spec, group, &self.device)?;
         if !self.pinned.is_empty() && !self.budget.allows(self.resident_bytes() + self.pinned_bytes(), need) {
             // 남겨 둔 묶음 때문에 예산을 넘으면 그것부터 내립니다.
             self.release_pinned()?;
@@ -751,10 +863,15 @@ impl Residency {
             return Err(OverBudget { group, need, resident, max: self.budget.max_bytes().unwrap_or(u64::MAX) }.into());
         }
         // 올리기 전에 장치에 실제로 자리가 있는지 봅니다. 다른 프로세스가 같은 GPU 를 쓰고 있으면 예산을 잡은 때와 여유가 달라졌을 수 있습니다.
-        let on_device = estimate_device_heap_bytes(spec.file_of(group), group, &self.device)?;
-        // Metal 은 다 쓴 작업 버퍼를 동기화할 때 돌려줍니다. 먼저 돌려받아야 올리기 전후의 차이가 이 묶음의 크기가 됩니다.
-        if self.device.is_metal() {
+        let on_device = spec_heap_bytes(spec, group, &self.device)?;
+        // 앞 계산이 놓은 작업 버퍼는 메모리 풀에 남아 있다가 이 묶음을 올릴 때 다시 쓰입니다. 그러면 올린 만큼 여유가 줄지 않아
+        // 가중치가 호스트에 남은 것처럼 보이므로, 먼저 돌려받아야 올리기 전후의 차이가 이 묶음의 크기가 됩니다
+        // (Metal 은 동기화할 때 돌려주고, ROCm · CUDA · Vulkan 은 풀을 비워야 돌려줍니다).
+        if !self.device.is_cpu() {
             let _ = self.device.synchronize_all();
+            if !self.device.is_metal() {
+                let _ = self.device.trim_memory_pool(0);
+            }
         }
         let (mut free_before, mut buffers_before) = (self.free_bytes(), self.tensor_buffer_bytes());
         // 남겨 둔 묶음이 있으면 공존 여유까지 남아야 올립니다. 모자라면 남겨 둔 묶음을 먼저 내립니다 (저사양 GPU 는 예전과 같아짐).
@@ -864,7 +981,7 @@ fn plan_tensor(meta: &TensorMeta, device: &Device) -> Plan {
         if meta.dtype == candle_core::quantized::GgmlDType::F32 {
             Plan::Dense(DType::F32)
         } else {
-            Plan::Dense(accel::model_dtype(device))
+            Plan::Dense(accel::dense_dtype(device))
         }
     } else if meta.dims.len() == 2 {
         Plan::Quant
@@ -880,36 +997,48 @@ fn device_bytes_of(meta: &TensorMeta, device: &Device) -> u64 {
     }
 }
 
-/// 묶음이 **장치 힙**에 차지할 바이트 수 (Vulkan 은 일반 텐서가 호스트 메모리라 제외, Q8_0 은 블록마다 스케일을 F32 로 펴서 34 → 36 바이트).
-/// 장치 여유 메모리(`mem_info`)와 비교하는 값입니다.
+/// 텐서 하나가 **장치 힙**에 차지할 바이트 수 (아래 [`estimate_device_heap_bytes`])
+fn heap_bytes_of(meta: &TensorMeta, device: &Device) -> u64 {
+    match (plan_tensor(meta, device), device) {
+        (_, Device::Cpu) => 0,
+        (Plan::Quant, Device::Vulkan(_)) => {
+            if meta.dtype == candle_core::quantized::GgmlDType::Q8_0 { meta.bytes / 34 * 36 } else { 0 }
+        }
+        (Plan::Quant, _) => meta.bytes,
+        (Plan::Dense(_), Device::Vulkan(_)) => 0,
+        (Plan::Dense(dtype), _) => (meta.elems() * dtype.size_in_bytes()) as u64,
+    }
+}
+
+/// 묶음이 **장치 힙**에 차지할 바이트 수 (Vulkan 은 일반 텐서가 호스트 메모리라 제외, Q8_0 은 블록마다 스케일을 F32 로 펴서 34 → 36 바이트,
+/// Q8_0 밖의 양자화 형식은 포크의 Vulkan 이 호스트에서 곱하므로 제외). 장치 여유 메모리(`mem_info`)와 비교하는 값입니다.
 pub fn estimate_device_heap_bytes(file: &WeightFile, group: Group, device: &Device) -> Result<u64> {
-    if device.is_cpu() {
-        return Ok(0);
-    }
-    let mut total = 0u64;
-    for n in group.tensor_names(file) {
-        let meta = file.info(&n)?;
-        total += match (plan_tensor(&meta, device), device) {
-            (Plan::Quant, Device::Vulkan(_)) => {
-                if meta.dtype == candle_core::quantized::GgmlDType::Q8_0 { meta.bytes / 34 * 36 } else { 0 }
-            }
-            (Plan::Quant, _) => meta.bytes,
-            (Plan::Dense(_), Device::Vulkan(_)) => 0,
-            (Plan::Dense(dtype), _) => (meta.elems() * dtype.size_in_bytes()) as u64,
-        };
-    }
-    Ok(total)
+    sum_group(file, group, |meta| heap_bytes_of(&meta, device))
 }
 
 /// 묶음을 `device` 에 올렸을 때의 바이트 수를 파일 목차만으로 계산합니다 (아무것도 읽지 않음).
 pub fn estimate_group_bytes(file: &WeightFile, group: Group, device: &Device) -> Result<u64> {
+    sum_group(file, group, |meta| device_bytes_of(&meta, device))
+}
+
+/// [`estimate_group_bytes`] 에 올릴 때의 다시 양자화([`ModelSpec::with_requant`])를 반영한 값
+fn spec_group_bytes(spec: &ModelSpec, group: Group, device: &Device) -> Result<u64> {
+    sum_group(spec.file_of(group), group, |meta| device_bytes_of(&spec.effective(meta), device))
+}
+
+/// [`estimate_device_heap_bytes`] 에 다시 양자화를 반영한 값
+fn spec_heap_bytes(spec: &ModelSpec, group: Group, device: &Device) -> Result<u64> {
+    sum_group(spec.file_of(group), group, |meta| heap_bytes_of(&spec.effective(meta), device))
+}
+
+fn sum_group(file: &WeightFile, group: Group, bytes: impl Fn(TensorMeta) -> u64) -> Result<u64> {
     let names = group.tensor_names(file);
     if names.is_empty() {
         bail!("{group} 에 해당하는 텐서가 파일에 없습니다");
     }
     let mut total = 0u64;
     for n in names {
-        total += device_bytes_of(&file.info(&n)?, device);
+        total += bytes(file.info(&n)?);
     }
     Ok(total)
 }
@@ -924,11 +1053,29 @@ fn load_group(spec: &ModelSpec, group: Group, device: &Device) -> Result<Loaded>
     let mut weights = HashMap::with_capacity(names.len());
     let (mut device_bytes, mut file_bytes) = (0u64, 0u64);
     for name in names {
-        let meta = file.info(&name)?;
-        file_bytes += meta.bytes;
+        let stored = file.info(&name)?;
+        file_bytes += stored.bytes;
+        let meta = spec.effective(stored.clone());
         device_bytes += device_bytes_of(&meta, device);
         let weight = match plan_tensor(&meta, device) {
+            // 배분이 형식을 바꾸는 텐서: 원본 BF16 (없으면 원본 그대로 저장된 값)을 그 형식으로 한 번 양자화한 바이트를 올립니다
+            // (`ai::pyramid` 의 파일과 같은 함수). 저장된 Q8_0 만 있고 원본이 없으면 거부합니다.
+            Plan::Quant if meta.dtype != stored.dtype => {
+                let weights = spec.imatrix.as_ref().and_then(|m| m.get(&name)).map(Vec::as_slice);
+                let raw = super::pyramid::quantize_tensor(file, &name, spec.original.as_deref(), meta.dtype, weights)?;
+                Weight::Quant(QMatMul::from_qtensor(qtensor_from_ggml(meta.dtype, &raw, meta.dims.clone(), device)?)?)
+            }
             Plan::Quant => Weight::Quant(QMatMul::from_qtensor(file.read_qtensor(&name, device)?)?),
+            // 배분이 일반 형식(F32 등)으로 바꾸는 텐서: 저장된 Q8_0 을 풀지 않고 원본 값을 그대로 올립니다.
+            Plan::Dense(dtype) if meta.dtype != stored.dtype => {
+                let (rows, cols) = super::original::rows_cols(&stored.dims);
+                let values = super::pyramid::material_rows(file, &name, spec.original.as_deref(), 0, rows)?;
+                let t = Tensor::from_vec(values, (rows, cols), &Device::Cpu)?.reshape(stored.dims.clone())?.to_dtype(dtype)?;
+                Weight::Dense(match spec.prepare.filter(|p| (p.touches)(&name)) {
+                    Some(p) => (p.apply)(&name, t)?.to_device(device)?,
+                    None => t.to_device(device)?,
+                })
+            }
             // 변환은 CPU 에서 한 번만 하고 결과를 장치로 옮깁니다 (장치에서 작은 연산을 여러 번 돌리지 않습니다).
             Plan::Dense(dtype) => match spec.prepare.filter(|p| (p.touches)(&name)) {
                 Some(p) => Weight::Dense((p.apply)(&name, file.read_dense(&name, &Device::Cpu, dtype)?)?.to_device(device)?),

@@ -27,7 +27,9 @@ fn main() -> Result<()> {
                 } else {
                     "없음"
                 };
-                println!("  {:<8} {:<16} {}", s.entry.name, state, gb(s.bytes_on_disk));
+                let pyramid = blueprint_models::pyramid_plan(s.entry.name).map(|p| format!(" · 피라미드 {p}")).unwrap_or_default();
+                let original = if blueprint_models::has_original(s.entry.name) { " · BF16 원본 있음" } else { "" };
+                println!("  {:<8} {:<16} {}{pyramid}{original}", s.entry.name, state, gb(s.bytes_on_disk));
             }
         }
         Some("import") => {

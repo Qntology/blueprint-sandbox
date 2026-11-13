@@ -23,13 +23,14 @@ use super::gocr::image::prepare as gocr_prepare;
 use super::gocr::{open as open_gocr, GocrEngine, GocrInput, OcrOutput, Strategy, EARLY_EXIT, TEXT_PROMPT};
 use super::residency::SharedResidency;
 use super::siglip2::config::DEFAULT_MAX_PATCHES;
-use super::siglip2::delta::{clip_to_changes, ink_changes, moved, retain_changed, trim_ignored, DeltaParams, Master, MasterSet};
+use super::siglip2::delta::{clip_to_changes_keeping, ink_changes, moved, retain_changed, trim_ignored, DeltaParams, Master, MasterSet, MatchMethod};
 use super::siglip2::image::{prepare as siglip2_prepare, PatchInput};
 use super::siglip2::ink::{deskew, estimate_skew, Bbox, InkPage};
-use super::siglip2::plan::{plan_page, plan_unfiltered, CropKind, CropPlan, PagePlan, PlanParams, Scores};
+use super::siglip2::plan::{plan_page, plan_unfiltered, protected, CropKind, CropPlan, PagePlan, PlanParams, Scores};
 use super::siglip2::probe::ProbeBank;
 use super::siglip2::{PatchGrid, Siglip2};
 use super::trace;
+use super::zoro::{vision as zoro_vision, ImageReading, ZoroBackbone, TRANSCRIBE};
 
 /// 시각 앵커 파일 이름 (siglip2 모델 폴더 안)
 pub const PROBE_FILE: &str = "crop_probe.bin";
@@ -46,6 +47,42 @@ pub struct CropReading {
     /// 곧게 편 페이지의 좌표
     pub bbox: Bbox,
     pub output: OcrOutput,
+    /// gocr 대신 Zoro-1 비전이 읽었는가 ([`VlmFallback`])
+    pub by_vlm: bool,
+}
+
+/// gocr 가 읽은 조각을 Zoro-1 비전(mmproj)으로 다시 읽을 조건. 기본은 꺼짐입니다 (`BLUEPRINT_VLM`).
+/// Zoro-1 은 다국어 어휘(248,078)를 가진 비전 언어 모델이라 한국어 · 영어 밖 문서와 gocr 가 확신하지 못한 조각을 맡습니다
+/// (`docs/verification.md` 15절의 12개 언어 실측). 판단 프롬프트(jev_head)는 이 경로와 상관없이 한국어 고정입니다.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum VlmFallback {
+    #[default]
+    Off,
+    /// gocr 의 최소 토큰 확신이 이 값 밑인 조각만
+    Below(f32),
+    /// 모든 조각 (외국어 문서)
+    All,
+}
+
+/// `BLUEPRINT_VLM`: `off`(기본) · `all` · 확신 기준 숫자(예: `0.5`)
+pub const VLM_ENV: &str = "BLUEPRINT_VLM";
+
+impl VlmFallback {
+    pub fn from_env() -> Self {
+        match std::env::var(VLM_ENV).map(|v| v.trim().to_ascii_lowercase()) {
+            Ok(v) if v == "all" => Self::All,
+            Ok(v) => v.parse::<f32>().ok().filter(|t| *t > 0.0 && *t <= 1.0).map_or(Self::Off, Self::Below),
+            Err(_) => Self::Off,
+        }
+    }
+
+    fn wants(self, o: &OcrOutput) -> bool {
+        match self {
+            Self::Off => false,
+            Self::All => true,
+            Self::Below(t) => o.min_confidence < t,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -103,6 +140,10 @@ pub struct DeltaReading {
     pub changed_boxes: Vec<Bbox>,
     /// 고정 안내문 자리(`ignore_zones`)를 잘라 낸 조각 수
     pub trimmed: usize,
+    /// 마스터 고르기 방식마다 (방식, 고른 마스터, 유사도, 2위와의 차이). 진단용 (`MatchMethod`)
+    pub methods: Vec<(String, String, f32, f32)>,
+    /// 표제란 · 서명란 자리라서 통째로 읽은 조각 수 (`DeltaParams::protect`)
+    pub protected: usize,
 }
 
 /// 계획까지 마친 페이지
@@ -130,10 +171,15 @@ fn straighten(pages: &[&RgbImage]) -> Vec<(RgbImage, f32, InkPage)> {
 
 /// 바뀐 곳에 걸치지 않는 조각을 계획에서 뺍니다. 마스터를 고르지 못했거나 너무 많이 바뀌었으면 계획을 그대로 둡니다.
 fn apply_delta(plan: &mut PagePlan, grid: &PatchGrid, ink: &InkPage, baseline: &Baseline<'_>, page: usize, p: &DeltaParams) -> DeltaReading {
-    let mut out = DeltaReading { master: None, similarity: 0.0, margin: 0.0, changed: 0, blocks: 0, skipped: Vec::new(), clipped: 0, clipped_blank: Vec::new(), fallback: None, cosines: Vec::new(), changed_boxes: Vec::new(), trimmed: 0 };
+    let mut out = DeltaReading { master: None, similarity: 0.0, margin: 0.0, changed: 0, blocks: 0, skipped: Vec::new(), clipped: 0, clipped_blank: Vec::new(), fallback: None, cosines: Vec::new(), changed_boxes: Vec::new(), trimmed: 0, methods: Vec::new(), protected: 0 };
     let master = match baseline {
         Baseline::Best(set) => {
-            let Some(m) = set.best_match(grid) else {
+            for method in [MatchMethod::Mean, MatchMethod::Centered, MatchMethod::Chamfer] {
+                if let Some(m) = set.best_match_by(grid, method) {
+                    out.methods.push((format!("{method:?}"), set.pages[m.index].id().to_string(), m.similarity, m.margin));
+                }
+            }
+            let Some(m) = set.best_match_by(grid, p.method) else {
                 out.fallback = Some("격자가 같은 마스터가 없습니다".into());
                 return out;
             };
@@ -169,9 +215,14 @@ fn apply_delta(plan: &mut PagePlan, grid: &PatchGrid, ink: &InkPage, baseline: &
         out.fallback = Some(format!("바뀐 칸이 {}/{} 로 많아 전부 읽습니다", out.changed, out.blocks));
         return out;
     }
-    out.skipped = retain_changed(plan, |b| diff.touches(b, p.ink_threshold));
+    // 표제란 · 서명란 자리는 바뀌지 않았어도 통째로 읽습니다 (스캔 한 장일 때만: A0 타일의 위 띠 · 오른쪽 아래는 표제란이 아님).
+    let (w, h) = (plan.width, plan.height);
+    let protect = p.protect && matches!(baseline, Baseline::Best(_));
+    let whole = move |b: Bbox| protect && protected(b, w, h);
+    out.skipped = retain_changed(plan, |b| diff.touches(b, p.ink_threshold) || whole(b));
+    out.protected = plan.crops.iter().filter(|c| whole(c.bbox)).count();
     if p.clip {
-        (out.clipped, out.clipped_blank) = clip_to_changes(plan, ink, &diff, p.ink_threshold);
+        (out.clipped, out.clipped_blank) = clip_to_changes_keeping(plan, ink, &diff, p.ink_threshold, &whole);
     }
     // 고정 안내문 자리는 서명란과 한 띠로 묶여도 읽지 않습니다 (개선안 1-1). 자리는 마스터 좌표라 도각 이동만큼 옮겨 댑니다.
     out.trimmed = trim_ignored(plan, ink, &moved(&master.ignore, diff.offset));
@@ -191,6 +242,27 @@ pub struct ReadOptions {
 impl Default for ReadOptions {
     fn default() -> Self {
         Self { plan: PlanParams::default(), forms_as_tables: true, symbols: false }
+    }
+}
+
+/// Zoro-1 비전이 읽은 글을 조각 판독 결과 모양으로. 글자별 확신은 최소 토큰 확신을 고르게 둡니다 (대안 조각 없음).
+fn vlm_output(r: ImageReading) -> OcrOutput {
+    let chars = r.text.chars().count();
+    OcrOutput {
+        char_confidence: vec![r.min_confidence; chars],
+        text: r.text,
+        tokens: Vec::new(),
+        mean_confidence: r.min_confidence,
+        min_confidence: r.min_confidence,
+        alt_pieces: Vec::new(),
+        truncated: !r.finished,
+        drafts: 0,
+        verifies: 0,
+        early_exit: false,
+        image_tokens: r.image_tokens,
+        vision_ms: r.vision_ms,
+        prefill_ms: r.prefill_ms,
+        decode_ms: r.decode_ms,
     }
 }
 
@@ -219,6 +291,8 @@ pub struct DocumentReader {
     symbols: Option<SymbolDict>,
     gocr: GocrEngine,
     options: ReadOptions,
+    /// gocr 조각을 다시 읽는 Zoro-1 비전과 그 조건
+    vlm: Option<(std::sync::Arc<ZoroBackbone>, VlmFallback)>,
 }
 
 /// 이미지의 상자를 잘라 배율만큼 키웁니다.
@@ -248,7 +322,18 @@ impl DocumentReader {
         let dict = dir.join(DICT_FILE);
         let symbols = dict.exists().then(|| SymbolDict::from_file(&dict)).transpose()?;
         let gocr = open_gocr(&models_dir.join("gocr"), residency, MAX_TOKENS, Strategy::Speculative { early_exit: Some(EARLY_EXIT) })?;
-        Ok(Self { siglip2, probes, symbols, gocr, options: ReadOptions::default() })
+        Ok(Self { siglip2, probes, symbols, gocr, options: ReadOptions::default(), vlm: None })
+    }
+
+    /// gocr 조각을 Zoro-1 비전으로 다시 읽게 합니다 ([`VlmFallback`]). 백본은 판단 · 글쓰기와 같은 것이고 상주 관리자를 함께 씁니다.
+    pub fn with_vlm(mut self, backbone: std::sync::Arc<ZoroBackbone>, when: VlmFallback) -> Self {
+        self.vlm = (when != VlmFallback::Off).then_some((backbone, when));
+        self
+    }
+
+    /// 문서 인식 엔진 (진단 · 측정)
+    pub fn gocr(&self) -> &GocrEngine {
+        &self.gocr
     }
 
     pub fn with_options(mut self, options: ReadOptions) -> Self {
@@ -453,10 +538,25 @@ impl DocumentReader {
         let t = Instant::now();
         let crops: Vec<(&RgbImage, &CropPlan)> = planned.iter().flat_map(|p| p.plan.crops.iter().filter(|c| c.kind != CropKind::Sign).map(move |c| (&p.image, c))).collect();
         let inputs: Vec<GocrInput> = crops
-            .into_par_iter()
+            .par_iter()
             .map(|(straight, c)| Ok(GocrInput { image: gocr_prepare(&cut(straight, c.bbox, c.upscale), GOCR_PATCH, GOCR_MERGE)?, prompt: self.prompt_of(c.kind).to_string() }))
             .collect::<Result<_>>()?;
-        let outputs = self.gocr.recognize(&inputs)?;
+        let mut outputs = self.gocr.recognize(&inputs)?;
+        // 다시 읽을 조각은 Zoro-1 비전으로 (비전 단계 한 번 → 텍스트 블록 한 번, 상주 관리자가 gocr 를 먼저 내림)
+        let mut by_vlm = vec![false; outputs.len()];
+        if let Some((zoro, when)) = &self.vlm {
+            let picks: Vec<usize> = outputs.iter().enumerate().filter(|(_, o)| when.wants(o)).map(|(i, _)| i).collect();
+            if !picks.is_empty() {
+                let images: Vec<RgbImage> = picks.par_iter().map(|&i| cut(crops[i].0, crops[i].1.bbox, crops[i].1.upscale)).collect();
+                let read = zoro.read_images(&images, TRANSCRIBE, MAX_TOKENS, zoro_vision::MAX_PIXELS)?;
+                for (&i, r) in picks.iter().zip(read) {
+                    outputs[i] = vlm_output(r);
+                    by_vlm[i] = true;
+                }
+                trace::record("zoro", "조각 다시 읽기", 0.0, json!({ "crops": picks.len() }));
+            }
+        }
+        let mut by_vlm = by_vlm.into_iter();
         let ocr_ms = t.elapsed().as_secs_f64() * 1e3 / pages.max(1) as f64;
         if trace::enabled() {
             let texts: Vec<_> = if trace::with_text() { outputs.iter().map(|o| json!({ "text": o.text, "conf": o.min_confidence })).collect() } else { Vec::new() };
@@ -481,7 +581,7 @@ impl DocumentReader {
                     .iter()
                     .filter(|c| c.kind != CropKind::Sign)
                     .zip(outputs.by_ref())
-                    .map(|(c, output)| CropReading { kind: c.kind, bbox: c.bbox, output })
+                    .map(|(c, output)| CropReading { kind: c.kind, bbox: c.bbox, output, by_vlm: by_vlm.next().unwrap_or(false) })
                     .collect();
                 PageReading { skew, plan, crops, symbols: symbols.next().unwrap_or_default(), timings, delta }
             })

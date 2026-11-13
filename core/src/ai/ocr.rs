@@ -16,7 +16,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::json;
 
 use super::gguf_model::load_active;
-use super::residency::{Group, Loaded, ModelId, ModelSpec, Phase, Prepare, Residency, SharedResidency};
+use super::residency::{Group, Loaded, ModelId, ModelSpec, Phase, Prepare, Requant, Residency, SharedResidency};
 use super::trace;
 use super::weights::WeightFile;
 
@@ -105,8 +105,34 @@ where
         self
     }
 
+    /// 올릴 때 이 배분으로 다시 양자화합니다 (정밀도 배분 측정용, [`ModelSpec::with_requant`]).
+    pub fn with_requant(mut self, label: impl Into<String>, requant: Requant) -> Self {
+        self.spec = self.spec.with_requant(label, requant);
+        self
+    }
+
+    /// 다시 양자화할 때 이 중요도 행렬을 씁니다 ([`ModelSpec::with_imatrix`]).
+    pub fn with_imatrix(mut self, imatrix: Arc<super::pyramid::Imatrix>) -> Self {
+        self.spec = self.spec.with_imatrix(imatrix);
+        self
+    }
+
+    /// 올릴 때 양자화하는 텐서의 재료를 이 원본 BF16 에서 읽습니다 ([`ModelSpec::with_original`]).
+    pub fn with_original(mut self, original: Arc<super::original::Original>) -> Self {
+        self.spec = self.spec.with_original(original);
+        self
+    }
+
     pub fn spec(&self) -> &ModelSpec {
         &self.spec
+    }
+
+    pub fn decoder(&self) -> &D {
+        &self.decoder
+    }
+
+    pub fn residency(&self) -> &SharedResidency {
+        &self.residency
     }
 
     /// 쓸 단계의 파일을 배경에서 미리 읽습니다.
@@ -123,6 +149,16 @@ where
     }
 
     pub fn recognize_locked(&self, res: &mut Residency, inputs: &[E::Input]) -> Result<Vec<D::Output>> {
+        self.run_locked(res, inputs, |_, decoder, ctx, weights, f| decoder.decode(ctx, weights, f))
+    }
+
+    /// 비전 단계 → 비전을 내림 → 언어 단계에서 입력마다 `each(입력 번호, 디코더, …)` 를 부릅니다. 디코딩 말고 다른 계산(진단 점수 등)을 할 때 씁니다.
+    pub fn run<R>(&self, inputs: &[E::Input], each: impl FnMut(usize, &D, &PhaseCtx<'_>, &LanguageWeights, E::Features) -> Result<R>) -> Result<Vec<R>> {
+        let mut res = self.residency.lock().unwrap_or_else(|p| p.into_inner());
+        self.run_locked(&mut res, inputs, each)
+    }
+
+    fn run_locked<R>(&self, res: &mut Residency, inputs: &[E::Input], mut each: impl FnMut(usize, &D, &PhaseCtx<'_>, &LanguageWeights, E::Features) -> Result<R>) -> Result<Vec<R>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
@@ -140,8 +176,8 @@ where
         let weights = LanguageWeights { blocks: Arc::clone(&handles[0]), output: Arc::clone(&handles[1]) };
         drop(handles);
         let mut out = Vec::with_capacity(features.len());
-        for f in features {
-            out.push(self.decoder.decode(&PhaseCtx { residency: &*res }, &weights, f)?);
+        for (i, f) in features.into_iter().enumerate() {
+            out.push(each(i, &self.decoder, &PhaseCtx { residency: &*res }, &weights, f)?);
         }
         trace::record("gocr", "언어", t.elapsed().as_secs_f64() * 1e3, json!({ "inputs": inputs.len() }));
         Ok(out)

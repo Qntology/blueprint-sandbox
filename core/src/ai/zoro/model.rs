@@ -22,10 +22,12 @@ use candle_core::{Device, Tensor};
 use candle_nn::ops::{sigmoid, silu};
 
 use super::config::{LayerKind, ZoroConfig};
+use super::vision;
 use super::ops::{gated_delta_state, gated_delta_state_on_host, gated_delta_step, gated_delta_step_on_host, gdn_config, gdn_on_device, GdnState, GdnWeights};
-use crate::ai::attention::{causal_attention, rms_norm, top1, AttnMode, Causal, LayerCache, Rope, StepMask, ATTN_QUERY_CHUNK};
+use crate::ai::attention::{causal_attention, rms_norm, AttnMode, Causal, LayerCache, Rope, StepMask, ATTN_QUERY_CHUNK};
+use crate::ai::head::{self, HeadMap};
 use crate::ai::kv_turbo::{self, KvCodec, KvShape};
-use crate::ai::residency::{estimate_group_bytes, headroom_bytes, Budget, Group, Loaded, ModelId, ModelSpec, Phase, Prepare, SharedResidency};
+use crate::ai::residency::{estimate_group_bytes, headroom_bytes, Budget, Group, Loaded, ModelId, ModelSpec, Phase, Prepare, Requant, Residency, SharedResidency};
 use crate::ai::speculative::{decode_stream, BlockDiffusion, Speculation, StreamModel, StreamOptions};
 use crate::ai::weights::WeightFile;
 
@@ -60,11 +62,14 @@ const ZERO_CENTERED: [&str; 5] =
     [".attn_norm.weight", ".post_attention_norm.weight", ".attn_q_norm.weight", ".attn_k_norm.weight", "output_norm.weight"];
 
 fn prepared(name: &str) -> bool {
-    name.ends_with(".ssm_a") || ZERO_CENTERED.iter().any(|s| name.ends_with(s))
+    name.ends_with(".ssm_a") || name == vision::PATCH_EMBED || ZERO_CENTERED.iter().any(|s| name.ends_with(s))
 }
 
 fn prepare(name: &str, t: Tensor) -> candle_core::Result<Tensor> {
-    if name.ends_with(".ssm_a") {
+    if name == vision::PATCH_EMBED {
+        // 비전 패치 임베딩: 같은 프레임 두 장의 시간축을 더해 선형 가중치로 (`zoro::vision`)
+        vision::prepare_patch_embed(t)
+    } else if name.ends_with(".ssm_a") {
         t.exp()?.neg()
     } else if ZERO_CENTERED.iter().any(|s| name.ends_with(s)) {
         t.affine(1.0, 1.0)
@@ -212,6 +217,9 @@ enum LayerState {
 pub struct ZoroState {
     layers: Vec<LayerState>,
     len: usize,
+    /// 다음 토큰의 RoPE 위치 − 읽은 토큰 수. 글만 읽었으면 0 이고, 이미지를 읽었으면 이미지 토큰 수보다 위치가 적게 늘어 음수입니다
+    /// (이미지 토큰은 격자 위치를 갖고, 다음 글은 격자 최댓값 + 1 부터: transformers `get_rope_index` 의 `rope_deltas`).
+    delta: i64,
 }
 
 impl ZoroState {
@@ -222,6 +230,76 @@ impl ZoroState {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// 다음 토큰의 RoPE 위치
+    fn position(&self) -> usize {
+        (self.len as i64 + self.delta).max(0) as usize
+    }
+}
+
+/// 토큰마다 (시간, 높이, 너비) 위치. 글은 세 축이 같고, 이미지 토큰은 (시작, 시작 + 행, 시작 + 열) 입니다.
+pub type Pos3 = [u32; 3];
+
+/// 인터리브 M-RoPE 의 주파수 i 가 쓰는 축 (transformers `apply_interleaved_mrope`): 높이는 i % 3 == 1 이고 i < 3 × 높이 몫,
+/// 너비는 i % 3 == 2 이고 i < 3 × 너비 몫, 나머지는 시간 축. 글만 읽으면 세 축이 같아 1차원 RoPE 와 같습니다.
+pub fn mrope_axis(i: usize, sections: [usize; 3]) -> usize {
+    if i % 3 == 1 && i < 3 * sections[1] {
+        1
+    } else if i % 3 == 2 && i < 3 * sections[2] {
+        2
+    } else {
+        0
+    }
+}
+
+/// 3축 위치의 RoPE 표 (앞쪽 `rope_dim` 차원을 앞뒤 절반으로 회전, 주파수마다 축은 [`mrope_axis`])
+pub fn mrope(pos: &[Pos3], rope_dim: usize, theta: f64, sections: [usize; 3], device: &Device) -> Result<Rope> {
+    let half = rope_dim / 2;
+    let (mut cos, mut sin) = (Vec::with_capacity(pos.len() * half), Vec::with_capacity(pos.len() * half));
+    for p in pos {
+        for i in 0..half {
+            let inv = theta.powf(-(2.0 * i as f64) / rope_dim as f64);
+            let a = p[mrope_axis(i, sections)] as f64 * inv;
+            cos.push(a.cos() as f32);
+            sin.push(a.sin() as f32);
+        }
+    }
+    Rope::from_tables(Tensor::from_vec(cos, (pos.len(), half), device)?, Tensor::from_vec(sin, (pos.len(), half), device)?)
+}
+
+/// 프롬프트 안 이미지 한 장의 자리: `ids[at..at + rows × cols]` 가 `<|image_pad|>` 이고, 그 자리에 이미지 토큰을 넣습니다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSlot {
+    pub at: usize,
+    /// 병합 뒤 이미지 토큰 격자
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl ImageSlot {
+    pub fn tokens(&self) -> usize {
+        self.rows * self.cols
+    }
+
+    /// 프롬프트 `n` 토큰의 3축 위치와, 프롬프트 다음 토큰의 위치 − n (`ZoroState::delta`)
+    pub fn positions(&self, n: usize) -> (Vec<Pos3>, i64) {
+        let mut out = Vec::with_capacity(n);
+        for t in 0..self.at as u32 {
+            out.push([t; 3]);
+        }
+        let base = self.at as u32;
+        for r in 0..self.rows as u32 {
+            for c in 0..self.cols as u32 {
+                out.push([base, base + r, base + c]);
+            }
+        }
+        let after = base + self.rows.max(self.cols) as u32;
+        for j in 0..(n - self.at - self.tokens()) as u32 {
+            out.push([after + j; 3]);
+        }
+        let next = after as i64 + (n - self.at - self.tokens()) as i64;
+        (out, next - n as i64)
     }
 }
 
@@ -330,6 +408,8 @@ pub struct ZoroModel {
     diffusion: Option<BlockDiffusion>,
     /// 장치 커널이 없을 때 쓰는 선형 주의 작은 텐서(층당 약 130 KB)의 CPU 사본. 가중치 상주와 별개로 RAM 에 남습니다.
     host: Mutex<HashMap<usize, Arc<GdnWeights>>>,
+    /// 피라미드 파일의 따로 둔 출력 투영 (`head.weight` · `head_rest.weight`, `ai::pyramid`). 없으면 묶인 임베딩 표로 곱합니다.
+    head: Option<HeadMap>,
 }
 
 impl ZoroModel {
@@ -343,7 +423,31 @@ impl ZoroModel {
         };
         let plan = plan_phases(&cfg, &file, &device, budget, mode)?;
         let diffusion = BlockDiffusion::from_file(&file)?.map(|d| d.validate(cfg.vocab)).transpose()?;
-        Ok(Self { cfg, spec, residency, plan, diffusion, host: Mutex::new(HashMap::new()) })
+        let head = HeadMap::from_file(&file, "zoro", cfg.vocab)?;
+        Ok(Self { cfg, spec, residency, plan, diffusion, host: Mutex::new(HashMap::new()), head })
+    }
+
+    /// 올릴 때 이 배분으로 다시 양자화합니다 (정밀도 배분 측정용, [`ModelSpec::with_requant`]).
+    pub fn with_requant(mut self, label: impl Into<String>, requant: Requant) -> Self {
+        self.spec = self.spec.with_requant(label, requant);
+        self
+    }
+
+    /// 출력 투영을 잘라 둔 피라미드 파일인가
+    pub fn head(&self) -> Option<&HeadMap> {
+        self.head.as_ref()
+    }
+
+    /// 다시 양자화할 때 이 중요도 행렬을 씁니다.
+    pub fn with_imatrix(mut self, imatrix: Arc<crate::ai::pyramid::Imatrix>) -> Self {
+        self.spec = self.spec.with_imatrix(imatrix);
+        self
+    }
+
+    /// 올릴 때 양자화하는 텐서의 재료를 이 원본 BF16 에서 읽습니다.
+    pub fn with_original(mut self, original: Arc<crate::ai::original::Original>) -> Self {
+        self.spec = self.spec.with_original(original);
+        self
     }
 
     /// 블록 디퓨전 설정을 정합니다.
@@ -463,9 +567,36 @@ impl ZoroModel {
         self.spec.announce(&self.generation_phase());
     }
 
-    /// 글쓰기에 쓰는 묶음: 텍스트 블록 전부 · 출력 정규화 · 임베딩 표 (출력 투영과 공유)
+    /// 글쓰기에 쓰는 묶음: 텍스트 블록 전부 · 출력 정규화 · 출력 투영. 출력 투영은 임베딩 표(묶임) 전체이고,
+    /// 피라미드 파일이면 따로 둔 출력 투영(남긴 행 · 잘린 행, `Group::Head`)입니다.
     pub fn generation_phase(&self) -> Phase {
-        Phase::new("zoro:글쓰기", [Group::blocks(0..self.cfg.n_layers), Group::Output, Group::Embedding])
+        let projection = if self.head.is_some() { Group::Head } else { Group::Embedding };
+        Phase::new("zoro:글쓰기", [Group::blocks(0..self.cfg.n_layers), Group::Output, projection])
+    }
+
+    /// 정규화한 은닉 상태의 행마다 다음 토큰과 확률. `table` 은 글쓰기 단계의 출력 투영 묶음입니다.
+    fn next_tokens(&self, table: &Loaded, h: &Tensor) -> Result<Vec<(u32, f32)>> {
+        let l = head::logits(table, "token_embd.weight", self.head.as_ref(), &h.contiguous()?, true)?;
+        Ok(l.rows.iter().zip(l.rest).map(|(row, rest)| head::top1(row, rest, self.head.as_ref())).collect())
+    }
+
+    /// teacher forcing 진단: 프롬프트 뒤에 `targets` 를 한 번에 읽어, 자리마다 (그 토큰의 음의 로그 확률, 모델의 1위 토큰).
+    /// 같은 프롬프트를 기준 모델(q8)이 쓴 글로 다른 양자화 배분을 견줄 때 씁니다 (`examples/quant_screen.rs`).
+    pub fn score_text(&self, prompt: &[u32], targets: &[u32]) -> Result<Vec<(f32, u32)>> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut ids = prompt.to_vec();
+        ids.extend_from_slice(&targets[..targets.len() - 1]);
+        self.check_ids(&ids)?;
+        let mut res = self.residency.lock().unwrap_or_else(|p| p.into_inner());
+        let device = res.device().clone();
+        let loaded = res.enter(&self.spec, &self.generation_phase())?;
+        let (blocks, output, table) = (&loaded[0], &loaded[1], &loaded[2]);
+        let mut state = self.new_state();
+        let h = self.advance(blocks, output, &device, &mut state, &ids)?;
+        let rows = h.narrow(0, prompt.len() - 1, targets.len())?.contiguous()?;
+        head::score(table, "token_embd.weight", self.head.as_ref(), &rows, targets)
     }
 
     pub fn new_state(&self) -> ZoroState {
@@ -480,7 +611,7 @@ impl ZoroModel {
                 LayerKind::FullAttention => LayerState::Full(LayerCache::new(codec.clone())),
             })
             .collect();
-        ZoroState { layers, len: 0 }
+        ZoroState { layers, len: 0, delta: 0 }
     }
 
     /// `tokens` 토큰을 쓰는 동안의 KV 크기
@@ -511,11 +642,18 @@ impl ZoroModel {
     /// 새 토큰을 읽습니다. 상태는 바꾸지 않고, 상태에 넣을 값을 돌려줍니다.
     fn read(&self, blocks: &Loaded, output: &Loaded, device: &Device, state: &ZoroState, ids: &[u32], partial: bool) -> Result<(Tensor, PendingRead)> {
         self.check_ids(ids)?;
-        let n = ids.len();
-        let mut x = self.spec.file.gather_rows("token_embd.weight", ids, device)?;
+        let x = self.spec.file.gather_rows("token_embd.weight", ids, device)?;
+        let rope = Rope::span(state.position(), ids.len(), self.cfg.rope_dim, self.cfg.rope_theta, device)?;
+        self.read_embeds(blocks, output, device, state, x, rope, partial)
+    }
+
+    /// 임베딩 `x` `[n, hidden]` 와 그 RoPE 표로 읽습니다 (이미지 토큰을 넣은 프롬프트).
+    #[allow(clippy::too_many_arguments)]
+    fn read_embeds(&self, blocks: &Loaded, output: &Loaded, device: &Device, state: &ZoroState, mut x: Tensor, rope: Rope, partial: bool) -> Result<(Tensor, PendingRead)> {
+        let n = x.dim(0)?;
         let gdn = gdn_config(&self.cfg);
         let ctx = Ctx {
-            rope: Rope::span(state.len, n, self.cfg.rope_dim, self.cfg.rope_theta, device)?,
+            rope,
             masks: Masks::Stepping(StepMask::new(AttnMode::Causal, n, self.cfg.n_heads / self.cfg.n_kv_heads, device)?),
             gdn_native: gdn_on_device(device, &gdn),
             gdn,
@@ -581,6 +719,65 @@ impl ZoroModel {
             bail!("블록 디퓨전 설정이 없어서 마스크 초안을 쓸 수 없습니다");
         }
         let mut res = self.residency.lock().unwrap_or_else(|p| p.into_inner());
+        self.write_locked(&mut res, prompt, None, opts)
+    }
+
+    /// 이미지 한 장을 읽고 이어서 씁니다 (다국어 문서 · 고난도 조각 판독). 상주 관리자를 잡은 채로
+    /// ① 비전 타워만 올려 이미지 토큰을 만들고 CPU 로 옮김 → ② 비전 타워를 내리고 텍스트 블록 · 출력 투영을 올림 → ③ 프롬프트의
+    /// `<|image_pad|>` 자리(`slot`)에 이미지 토큰을 넣어 0 번 블록부터 읽고 씁니다. 비전과 텍스트 블록이 함께 올라와 있는 때가 없습니다.
+    /// `prompt` 는 `slot` 자리에 이미지 패드 토큰을 이미지 토큰 수만큼 둔 것이어야 합니다 ([`ZoroModel::vision_config`] 의 병합으로 셉니다).
+    pub fn generate_with_image(&self, prompt: &[u32], image: &vision::VisionImage, slot: ImageSlot, opts: &GenerateOptions) -> Result<(GeneratedIds, f64)> {
+        let mut out = self.generate_with_images(&[(prompt, image, slot)], opts)?;
+        out.pop().ok_or_else(|| anyhow!("결과가 없습니다"))
+    }
+
+    /// 이미지 여러 장: 비전 단계를 한 번 거쳐 모두 인코딩한 뒤(비전 타워만 상주) 비전을 내리고, 텍스트 블록을 한 번 올려 차례로 씁니다.
+    /// 장마다 비전과 블록을 오가며 올렸다 내리지 않습니다 (gocr 의 `OcrEngine` 과 같은 모양). 결과는 (글, 그 장의 비전 시간) 입니다.
+    pub fn generate_with_images(&self, items: &[(&[u32], &vision::VisionImage, ImageSlot)], opts: &GenerateOptions) -> Result<Vec<(GeneratedIds, f64)>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cfg = self.vision_config()?;
+        for (_, image, slot) in items {
+            if image.n_tokens(cfg.merge) != slot.tokens() || (image.grid_h / cfg.merge, image.grid_w / cfg.merge) != (slot.rows, slot.cols) {
+                bail!("이미지 토큰 격자 {} × {} 가 프롬프트 자리 {} × {} 와 다릅니다", image.grid_h / cfg.merge, image.grid_w / cfg.merge, slot.rows, slot.cols);
+            }
+        }
+        let mut res = self.residency.lock().unwrap_or_else(|p| p.into_inner());
+        let mut encoded = Vec::with_capacity(items.len());
+        {
+            let handles = res.enter(&self.spec, &Phase::new("zoro:비전", [Group::Vision]))?;
+            let device = res.device().clone();
+            for (_, image, _) in items {
+                let t = Instant::now();
+                encoded.push((vision::encode(&cfg, &handles[0], image, &device)?.to_device(&Device::Cpu)?, t.elapsed().as_secs_f64() * 1e3));
+            }
+            // 핸들을 여기서 놓아야 글쓰기 단계에서 비전을 내릴 수 있습니다.
+        }
+        items
+            .iter()
+            .zip(encoded)
+            .map(|((prompt, _, slot), (tokens, vision_ms))| Ok((self.write_locked(&mut res, prompt, Some((&tokens, *slot)), opts)?, vision_ms)))
+            .collect()
+    }
+
+    /// 비전 단계만: 이미지 토큰 `[병합 토큰, hidden]` (CPU). 진단 · 수치 대조용입니다 (`examples/zoro_vision.rs`).
+    pub fn encode_image(&self, image: &vision::VisionImage) -> Result<Tensor> {
+        let cfg = self.vision_config()?;
+        let mut res = self.residency.lock().unwrap_or_else(|p| p.into_inner());
+        let handles = res.enter(&self.spec, &Phase::new("zoro:비전", [Group::Vision]))?;
+        let device = res.device().clone();
+        Ok(vision::encode(&cfg, &handles[0], image, &device)?.to_device(&Device::Cpu)?)
+    }
+
+    /// 비전 타워 구조 (mmproj). 비전 파일을 붙이지 않았으면 오류입니다.
+    pub fn vision_config(&self) -> Result<vision::VisionConfig> {
+        let file = self.spec.mmproj.as_ref().ok_or_else(|| anyhow!("Zoro-1 비전 타워 파일(mmproj-zoro-*.gguf)이 없습니다"))?;
+        vision::VisionConfig::from_file(file)
+    }
+
+    /// 글쓰기 본체. `image` 가 있으면 그 자리에 이미지 토큰(CPU `[토큰, hidden]`)을 넣고 3축 위치로 읽습니다.
+    fn write_locked(&self, res: &mut Residency, prompt: &[u32], image: Option<(&Tensor, ImageSlot)>, opts: &GenerateOptions) -> Result<GeneratedIds> {
         let device = res.device().clone();
         let loaded = res.enter(&self.spec, &self.generation_phase())?;
         let (blocks, output, table) = (&loaded[0], &loaded[1], &loaded[2]);
@@ -588,8 +785,24 @@ impl ZoroModel {
 
         let t = Instant::now();
         let mut state = self.new_state_with(codec);
-        let h = self.advance(blocks, output, &device, &mut state, prompt)?;
-        let first = next_tokens(table, &h.narrow(0, h.dim(0)? - 1, 1)?)?[0];
+        let h = match image {
+            None => self.advance(blocks, output, &device, &mut state, prompt)?,
+            Some((tokens, slot)) => {
+                if slot.at + slot.tokens() > prompt.len() || tokens.dim(0)? != slot.tokens() || tokens.dim(1)? != self.cfg.hidden {
+                    bail!("이미지 토큰 {:?} 가 프롬프트 자리 {slot:?} 에 맞지 않습니다", tokens.dims());
+                }
+                let gather = |ids: &[u32]| -> Result<Option<Tensor>> { if ids.is_empty() { Ok(None) } else { Ok(Some(self.spec.file.gather_rows("token_embd.weight", ids, &device)?)) } };
+                let parts: Vec<Tensor> = [gather(&prompt[..slot.at])?, Some(tokens.to_device(&device)?), gather(&prompt[slot.at + slot.tokens()..])?].into_iter().flatten().collect();
+                let x = Tensor::cat(&parts, 0)?;
+                let (pos, delta) = slot.positions(prompt.len());
+                let rope = mrope(&pos, self.cfg.rope_dim, self.cfg.rope_theta, self.cfg.rope_sections, &device)?;
+                let (h, read) = self.read_embeds(blocks, output, &device, &state, x, rope, false)?;
+                self.commit(blocks, &device, &mut state, read, prompt.len())?;
+                state.delta = delta;
+                h
+            }
+        };
+        let first = self.next_tokens(table, &h.narrow(0, h.dim(0)? - 1, 1)?)?[0];
         let prefill_ms = t.elapsed().as_secs_f64() * 1e3;
 
         let t = Instant::now();
@@ -714,14 +927,6 @@ fn speculation_for(device: &Device, has_masks: bool) -> Speculation {
     }
 }
 
-/// 은닉 상태의 행마다 다음 토큰과 그 확률을 고릅니다. 출력 투영은 임베딩 표입니다 (`tie_word_embeddings`).
-fn next_tokens(table: &Loaded, h: &Tensor) -> Result<Vec<(u32, f32)>> {
-    let y = table.linear("token_embd.weight", &h.contiguous()?)?;
-    let vocab = y.dim(1)?;
-    let y = y.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
-    Ok(y.chunks(vocab).map(top1).collect())
-}
-
 /// 글쓰기 한 번의 가중치와 상태를 [`BlockModel`] 로 묶습니다.
 struct Writer<'a> {
     model: &'a ZoroModel,
@@ -742,7 +947,7 @@ impl StreamModel for Writer<'_> {
         }
         let (h, read) = self.model.read(self.blocks, self.output, self.device, &self.state, &ids, ids.len() > 1)?;
         self.pending = Some(read);
-        next_tokens(self.table, &h)
+        self.model.next_tokens(self.table, &h)
     }
 
     fn commit(&mut self, keep: usize) -> Result<()> {
@@ -1359,6 +1564,114 @@ mod tests {
         let a = v(prepare("blk.0.ssm_a", t(vec![0.0, (2.0f32).ln()])).unwrap());
         assert!((a[0] + 1.0).abs() < 1e-6 && (a[1] + 2.0).abs() < 1e-6, "−exp(A_log): {a:?}");
         assert_eq!(v(prepare("blk.0.ssm_dt.bias", t(vec![3.0])).unwrap()), vec![3.0]);
+    }
+
+    #[test]
+    fn the_interleaved_mrope_axes_follow_transformers() {
+        // transformers `apply_interleaved_mrope`, mrope_section [11, 11, 10], 주파수 32 개
+        let s = [11, 11, 10];
+        let h: Vec<usize> = (0..32).filter(|&i| mrope_axis(i, s) == 1).collect();
+        let w: Vec<usize> = (0..32).filter(|&i| mrope_axis(i, s) == 2).collect();
+        let t: Vec<usize> = (0..32).filter(|&i| mrope_axis(i, s) == 0).collect();
+        assert_eq!(h, (1..33).step_by(3).collect::<Vec<_>>());
+        assert_eq!(w, (2..30).step_by(3).collect::<Vec<_>>());
+        assert_eq!((t.len(), h.len(), w.len()), (11, 11, 10));
+        assert_eq!(t.last(), Some(&30));
+        // 몫이 없으면 모두 시간 축 (글만 읽는 1차원 RoPE)
+        assert!((0..4).all(|i| mrope_axis(i, [4, 0, 0]) == 0));
+    }
+
+    #[test]
+    fn image_positions_continue_after_the_grid_maximum() {
+        // transformers `get_rope_index`: 이미지 토큰 (시작, 시작 + 행, 시작 + 열), 다음 글은 시작 + max(행, 열) 부터
+        let slot = ImageSlot { at: 3, rows: 2, cols: 4 };
+        let (pos, delta) = slot.positions(3 + 8 + 2);
+        assert_eq!(&pos[..3], &[[0; 3], [1; 3], [2; 3]]);
+        assert_eq!(pos[3], [3, 3, 3]);
+        assert_eq!(pos[3 + 5], [3, 4, 4], "둘째 행 둘째 열");
+        assert_eq!(&pos[11..], &[[7; 3], [8; 3]], "3 + max(2, 4) = 7 부터");
+        assert_eq!(13 + delta, 9, "다음 토큰 위치 = 마지막 위치 + 1");
+    }
+
+    #[test]
+    fn text_only_mrope_equals_the_plain_rope() -> Result<()> {
+        let pos: Vec<Pos3> = (5..12).map(|p| [p; 3]).collect();
+        let a = mrope(&pos, 64, 1e7, [11, 11, 10], &Device::Cpu)?;
+        let b = Rope::span(5, 7, 64, 1e7, &Device::Cpu)?;
+        let x = Tensor::from_vec(crate::ai::verify::det_normal(2 * 7 * 256, 3), (2, 7, 256), &Device::Cpu)?;
+        let d = (a.apply(&x)? - b.apply(&x)?)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(d < 1e-6, "{d}");
+        Ok(())
+    }
+
+    /// 작은 zoro + 작은 비전 mmproj. 회전 차원 8 의 주파수 넷을 (시간 2, 높이 1, 너비 1) 로 나눠 세 축을 모두 지납니다.
+    fn vision_model(dir: &TempDir, res: SharedResidency) -> ZoroModel {
+        let (_mini, mut m) = model(dir, false, StreamMode::Resident, res);
+        m.cfg.rope_sections = [2, 1, 1];
+        m.with_mmproj(crate::ai::zoro::vision::tiny_mmproj(dir, 64))
+    }
+
+    fn tiny_image() -> crate::ai::zoro::vision::VisionImage {
+        let mut img = image::RgbImage::new(8, 8);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgb([(x * 30) as u8, (y * 20) as u8, 77]);
+        }
+        let cfg = crate::ai::zoro::vision::VisionConfig { depth: 1, hidden: 32, ffn: 64, heads: 2, patch: 2, merge: 2, temporal: 2, out: 64, grid_side: 4 };
+        crate::ai::zoro::vision::prepare(&img, &cfg, 64).unwrap()
+    }
+
+    #[test]
+    fn an_image_prompt_runs_vision_first_and_releases_it_before_the_blocks() -> Result<()> {
+        let dir = TempDir::new("zm-img");
+        let res = cpu_residency();
+        let m = vision_model(&dir, res.clone());
+        let image = tiny_image();
+        assert_eq!((image.grid_h, image.grid_w), (4, 4));
+        let slot = ImageSlot { at: 2, rows: 2, cols: 2 };
+        let ids = [5u32, 17, 7, 7, 7, 7, 42, 120];
+        let opts = GenerateOptions::new(4, vec![]);
+        let (a, _) = m.generate_with_image(&ids, &image, slot, &opts)?;
+        assert!(!a.tokens.is_empty());
+        let log: Vec<(Action, Group)> = res.lock().unwrap().history().iter().map(|t| (t.action, t.group)).collect();
+        let vision_up = log.iter().position(|e| *e == (Action::Load, Group::Vision)).expect("비전을 올림");
+        let vision_down = log.iter().position(|e| *e == (Action::Release, Group::Vision)).expect("비전을 내림");
+        let blocks_up = log.iter().position(|e| matches!(e, (Action::Load, Group::Blocks { .. }))).expect("블록을 올림");
+        assert!(vision_up < vision_down && vision_down < blocks_up, "비전 → 비전 내림 → 텍스트 블록: {log:?}");
+        assert!(!res.lock().unwrap().resident_groups().contains(&Group::Vision));
+        // 프롬프트 자리와 이미지 격자가 다르면 거부
+        assert!(m.generate_with_image(&ids, &image, ImageSlot { at: 2, rows: 1, cols: 4 }, &opts).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn decoding_after_an_image_continues_the_grid_positions() -> Result<()> {
+        let dir = TempDir::new("zm-img-pos");
+        let res = cpu_residency();
+        let m = vision_model(&dir, res.clone());
+        let w = weights(&m, &res);
+        let cpu = Device::Cpu;
+        let img = Tensor::from_vec(crate::ai::verify::det_normal(4 * 64, 9), (4, 64), &cpu)?;
+        let slot = ImageSlot { at: 2, rows: 2, cols: 2 };
+        let ids = [5u32, 17, 7, 7, 7, 7, 42, 120];
+        let embeds = |ids: &[u32]| m.spec.file.gather_rows("token_embd.weight", ids, &cpu).unwrap();
+        let x = Tensor::cat(&[embeds(&ids[..2]), img.clone(), embeds(&ids[6..])], 0)?;
+        let (pos, delta) = slot.positions(ids.len());
+        // 한 번에 읽고 상태에 넣은 뒤, 다음 토큰 하나를 이어 읽음
+        let mut state = m.new_state();
+        let (_, read) = m.read_embeds(&w[0], &w[1], &cpu, &state, x.clone(), mrope(&pos, m.cfg.rope_dim, m.cfg.rope_theta, m.cfg.rope_sections, &cpu)?, false)?;
+        m.commit(&w[0], &cpu, &mut state, read, ids.len())?;
+        state.delta = delta;
+        let step = m.advance(&w[0], &w[1], &cpu, &mut state, &[99])?;
+        // 프롬프트와 다음 토큰을 처음부터 한 번에 (다음 토큰 위치를 직접)
+        let mut all_pos = pos.clone();
+        let next = (ids.len() as i64 + delta) as u32;
+        all_pos.push([next; 3]);
+        let x2 = Tensor::cat(&[x, embeds(&[99])], 0)?;
+        let (whole, _) = m.read_embeds(&w[0], &w[1], &cpu, &m.new_state(), x2, mrope(&all_pos, m.cfg.rope_dim, m.cfg.rope_theta, m.cfg.rope_sections, &cpu)?, false)?;
+        let last = whole.narrow(0, ids.len(), 1)?;
+        let err = rel(&step.flatten_all()?.to_vec1::<f32>()?, &last.flatten_all()?.to_vec1::<f32>()?);
+        assert!(err < 1e-4, "{err}");
+        Ok(())
     }
 
     #[test]

@@ -43,11 +43,16 @@ pub struct DeltaParams {
     pub align: bool,
     /// 유채색 잉크(붉은 · 푸른 펜)는 마스터 잉크와 겹쳐도 새 획으로 셉니다 (개선안 1-2)
     pub chroma: bool,
+    /// 어느 마스터인지 고르는 방식 ([`MatchMethod`]). 기본은 `Centered`: 같은 마스터를 고르면서 2위와의 차이가 평균 방식의 약 1.8 배
+    /// (P3 0.094 → 0.172, P3F 0.111 → 0.199, `docs/verification.md` 15절)라 `min_margin` 에 덜 걸립니다.
+    pub method: MatchMethod,
+    /// 표제란 · 서명란 자리(`plan::protected`)의 조각은 바뀌지 않았어도 늘 통째로 읽습니다 (스캔 한 장을 마스터와 견줄 때만, A0 타일은 아님).
+    pub protect: bool,
 }
 
 impl Default for DeltaParams {
     fn default() -> Self {
-        Self { min_margin: 0.03, radius: 3, block: 16, ink_threshold: 0.03, edge: 32, max_changed: 0.25, clip: true, align: true, chroma: true }
+        Self { min_margin: 0.03, radius: 3, block: 16, ink_threshold: 0.03, edge: 32, max_changed: 0.25, clip: true, align: true, chroma: true, method: MatchMethod::Centered, protect: true }
     }
 }
 
@@ -251,15 +256,31 @@ impl MasterSet {
         }
     }
 
-    /// 격자가 같은 마스터 가운데 가장 닮은 것
+    /// 격자가 같은 마스터 가운데 가장 닮은 것 (같은 자리 패치 코사인의 평균)
     pub fn best_match(&self, scan: &PatchGrid) -> Option<Matched> {
+        self.best_match_by(scan, MatchMethod::Mean)
+    }
+
+    /// 격자가 같은 마스터 가운데 가장 닮은 것을 `method` 로
+    pub fn best_match_by(&self, scan: &PatchGrid, method: MatchMethod) -> Option<Matched> {
+        let center = match method {
+            MatchMethod::Mean => None,
+            MatchMethod::Centered | MatchMethod::Chamfer => Some(self.mean_patch(scan.dim)?),
+        };
         let mut scored: Vec<(usize, f32)> = self
             .pages
             .iter()
             .enumerate()
             .filter_map(|(i, m)| {
-                let c = m.patches.cosines(scan)?;
-                Some((i, c.iter().sum::<f32>() / c.len().max(1) as f32))
+                let s = match (&center, method) {
+                    (None, _) => {
+                        let c = m.patches.cosines(scan)?;
+                        c.iter().sum::<f32>() / c.len().max(1) as f32
+                    }
+                    (Some(mu), MatchMethod::Chamfer) => block_similarity(&m.patches, scan, mu, 1)?,
+                    (Some(mu), _) => block_similarity(&m.patches, scan, mu, 0)?,
+                };
+                Some((i, s))
             })
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -267,6 +288,70 @@ impl MasterSet {
         let margin = scored.get(1).map(|s| similarity - s.1).unwrap_or(1.0);
         Some(Matched { index, similarity, margin })
     }
+
+    /// 마스터들의 모든 패치 평균 (도면이면 어디나 있는 성분: 흰 바탕 · 선 · 글자 결)
+    fn mean_patch(&self, dim: usize) -> Option<Vec<f32>> {
+        let mut mu = vec![0f64; dim];
+        let mut n = 0usize;
+        for m in &self.pages {
+            if m.patches.dim != dim {
+                continue;
+            }
+            for i in 0..m.patches.len() {
+                for (a, b) in mu.iter_mut().zip(m.patches.patch(i)) {
+                    *a += b as f64;
+                }
+                n += 1;
+            }
+        }
+        (n > 0).then(|| mu.into_iter().map(|v| (v / n as f64) as f32).collect())
+    }
+}
+
+/// 마스터를 고르는 방식 (gravity-ocr 의 블록 단위 아카이브 매칭을 SigLIP2 패치에 옮김)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchMethod {
+    /// 같은 자리 패치 코사인의 평균 (원래 방식)
+    Mean,
+    /// 마스터 평균 패치를 뺀 뒤의 같은 자리 코사인 평균 (gravity-ocr: 가운데로 옮긴 벡터)
+    Centered,
+    /// 가운데로 옮긴 뒤, 스캔 패치마다 마스터의 ±1 이웃 패치 중 가장 닮은 것의 평균 (블록 단위 최근접: chamfer)
+    Chamfer,
+}
+
+/// 가운데로 옮긴 패치 코사인을 스캔 패치마다 `reach` 이웃 안의 최댓값으로 모아 평균합니다. 격자가 다르면 None.
+fn block_similarity(master: &MasterPatches, scan: &PatchGrid, mu: &[f32], reach: usize) -> Option<f32> {
+    if scan.rows != master.rows || scan.cols != master.cols || scan.dim != master.dim {
+        return None;
+    }
+    let centered = |v: Vec<f32>| -> Vec<f32> {
+        let mut c: Vec<f32> = v.iter().zip(mu).map(|(a, b)| a - b).collect();
+        let n = c.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if n > 1e-8 {
+            c.iter_mut().for_each(|x| *x /= n);
+        }
+        c
+    };
+    let m: Vec<Vec<f32>> = (0..master.len()).map(|i| centered(master.patch(i))).collect();
+    let (rows, cols) = (master.rows, master.cols);
+    let mut sum = 0f32;
+    for r in 0..rows {
+        for c in 0..cols {
+            let s = centered(scan.patch(r * cols + c).to_vec());
+            let mut best = f32::MIN;
+            for rr in r.saturating_sub(reach)..(r + reach + 1).min(rows) {
+                for cc in c.saturating_sub(reach)..(c + reach + 1).min(cols) {
+                    let dot: f32 = s.iter().zip(&m[rr * cols + cc]).map(|(a, b)| a * b).sum();
+                    best = best.max(dot);
+                }
+            }
+            sum += best;
+        }
+    }
+    Some(sum / (rows * cols).max(1) as f32)
+}
+
+impl MasterSet {
 
     /// 패치 특징만 파일로 (`ZZD1`)
     pub fn patches_to_bytes(&self) -> Vec<u8> {
@@ -458,6 +543,11 @@ const CLIP_PAD: u32 = 6;
 /// 좁힌 구간이 조각 너비의 60 % 를 넘으면 그대로 두고, 좁힌 조각에 글자 모양 덩어리가 둘 미만이면 읽지 않습니다.
 /// 제목 · 서명은 건드리지 않습니다. 돌려주는 값: (좁힌 조각 수, 좁힌 뒤 글자가 없어 뺀 상자)
 pub fn clip_to_changes(plan: &mut PagePlan, ink: &InkPage, diff: &BlockDiff, threshold: f32) -> (usize, Vec<Bbox>) {
+    clip_to_changes_keeping(plan, ink, diff, threshold, &|_| false)
+}
+
+/// [`clip_to_changes`] 와 같되 `whole` 이 참인 조각(표제란 · 서명란 자리)은 좁히지 않습니다.
+pub fn clip_to_changes_keeping(plan: &mut PagePlan, ink: &InkPage, diff: &BlockDiff, threshold: f32, whole: &dyn Fn(Bbox) -> bool) -> (usize, Vec<Bbox>) {
     let unit = ink.text_unit();
     let (merge, margin, snap, gap) = ((unit * CLIP_MERGE_UNITS) as u32, (unit * CLIP_MARGIN_UNITS) as u32, (unit * CLIP_SNAP_UNITS) as u32, ((unit * CLIP_GAP_UNITS) as u32).max(3));
     let b = diff.block;
@@ -466,7 +556,7 @@ pub fn clip_to_changes(plan: &mut PagePlan, ink: &InkPage, diff: &BlockDiff, thr
     let mut out = Vec::with_capacity(plan.crops.len());
     for c in std::mem::take(&mut plan.crops) {
         let (x0, y0, x1, y1) = c.bbox;
-        if matches!(c.kind, CropKind::Title | CropKind::Sign) || x1 <= x0 + 1 || y1 <= y0 + 1 || diff.cols == 0 || diff.rows == 0 {
+        if matches!(c.kind, CropKind::Title | CropKind::Sign) || whole(c.bbox) || x1 <= x0 + 1 || y1 <= y0 + 1 || diff.cols == 0 || diff.rows == 0 {
             out.push(c);
             continue;
         }
@@ -607,6 +697,50 @@ mod tests {
         assert_eq!(set.pages[best.index].id(), "원본");
         assert!(best.similarity > 0.9 && best.margin > 0.5, "{best:?}");
         assert!(set.pages[0].patches.cosines(&grid(2, 4, 64, 1)).is_none(), "격자가 다르면 견주지 않습니다");
+    }
+
+    /// 모든 패치에 같은 "도면 결" 성분이 크게 섞인 격자: 평균 코사인은 모든 마스터가 비슷하게 높지만, 가운데로 옮기면 차이가 벌어집니다.
+    fn with_shared(g: &PatchGrid, shared: &[f32], weight: f32) -> PatchGrid {
+        let mut out = g.clone();
+        for i in 0..g.len() {
+            let mut v: Vec<f32> = g.patch(i).iter().zip(shared).map(|(a, b)| a + weight * b).collect();
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= n);
+            out.patches[i * g.dim..(i + 1) * g.dim].copy_from_slice(&v);
+        }
+        out
+    }
+
+    #[test]
+    fn centering_and_block_matching_widen_the_margin_between_masters() {
+        let shared = grid(1, 1, 64, 99).patches;
+        let a = with_shared(&grid(3, 4, 64, 7), &shared, 3.0);
+        let b = with_shared(&grid(3, 4, 64, 11), &shared, 3.0);
+        // 스캔: 원본 마스터에서 패치 둘이 바뀜
+        let mut scan = a.clone();
+        let other = with_shared(&grid(3, 4, 64, 23), &shared, 3.0);
+        for i in [2usize, 9] {
+            scan.patches[i * 64..(i + 1) * 64].copy_from_slice(other.patch(i));
+        }
+        let ink = || page(400, 300, &[], 250);
+        let set = MasterSet { pages: vec![Master::new("다른 도면", &b, ink(), 3), Master::new("원본", &a, ink(), 3)] };
+        let mean = set.best_match_by(&scan, MatchMethod::Mean).unwrap();
+        let centered = set.best_match_by(&scan, MatchMethod::Centered).unwrap();
+        let chamfer = set.best_match_by(&scan, MatchMethod::Chamfer).unwrap();
+        for m in [&mean, &centered, &chamfer] {
+            assert_eq!(set.pages[m.index].id(), "원본", "{m:?}");
+        }
+        assert!(centered.margin > mean.margin * 2.0, "가운데로 옮기면 공통 성분이 빠짐: {mean:?} {centered:?}");
+        assert!(chamfer.similarity >= centered.similarity, "이웃 최댓값은 같은 자리보다 작지 않음");
+        // 한 칸 밀린 스캔도 이웃 매칭은 원본을 고릅니다.
+        let mut shifted = a.clone();
+        for r in 0..3 {
+            for c in (1..4).rev() {
+                let src = a.patch(r * 4 + c - 1).to_vec();
+                shifted.patches[(r * 4 + c) * 64..(r * 4 + c + 1) * 64].copy_from_slice(&src);
+            }
+        }
+        assert_eq!(set.pages[set.best_match_by(&shifted, MatchMethod::Chamfer).unwrap().index].id(), "원본");
     }
 
     #[test]

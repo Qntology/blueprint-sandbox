@@ -242,6 +242,21 @@ pub fn model_dtype(device: &Device) -> DType {
     }
 }
 
+/// 일반(양자화하지 않은) 가중치를 올릴 dtype 을 정하는 환경 변수: `f32` 면 BF16 · F16 으로 저장된 가중치도 F32 로 넓혀 올립니다.
+pub const DENSE_ENV: &str = "BLUEPRINT_DENSE";
+
+/// BF16 · F16 으로 저장된 일반 가중치를 올릴 dtype. 기본은 [`model_dtype`] 이고, `BLUEPRINT_DENSE=f32` 면 F32 입니다.
+/// RX 6600 (gfx1032) 에서는 BF16 행렬곱에 하드웨어가 없어 F32 가 더 빠르고 원본 값 그대로 계산합니다 (gocr 비전 125 → 87 s,
+/// `docs/verification.md` 15절). VRAM 은 두 배라 기본은 그대로 둡니다.
+pub fn dense_dtype(device: &Device) -> DType {
+    static F32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *F32.get_or_init(|| std::env::var(DENSE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("f32"))) {
+        DType::F32
+    } else {
+        model_dtype(device)
+    }
+}
+
 /// 정상 종료 경로를 타게 하는 환경 변수 (`0`). 멈춤을 재현할 때만 씁니다.
 pub const FAST_EXIT_ENV: &str = "BLUEPRINT_ROCM_FAST_EXIT";
 

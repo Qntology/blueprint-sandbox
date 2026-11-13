@@ -102,7 +102,14 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
     let out_path = PathBuf::from(args.iter().find(|a| a.ends_with(".json")).cloned().unwrap_or_else(|| "out/delta_probe.json".into()));
-    let params = DeltaParams { clip: !flag("--no-clip"), chroma: !flag("--no-chroma"), align: !flag("--no-align"), ..DeltaParams::default() };
+    // `--no-protect`: 표제란 · 서명란 자리도 바뀐 곳만 읽음 (보호 전과 같음), `--match mean|centered|chamfer`: 마스터 고르기 방식 (기본 centered)
+    let method = match args.iter().position(|a| a == "--match").and_then(|i| args.get(i + 1)).map(String::as_str) {
+        Some("mean") => blueprint_core::ai::siglip2::delta::MatchMethod::Mean,
+        Some("centered") => blueprint_core::ai::siglip2::delta::MatchMethod::Centered,
+        Some("chamfer") => blueprint_core::ai::siglip2::delta::MatchMethod::Chamfer,
+        _ => DeltaParams::default().method,
+    };
+    let params = DeltaParams { clip: !flag("--no-clip"), chroma: !flag("--no-chroma"), align: !flag("--no-align"), protect: !flag("--no-protect"), method, ..DeltaParams::default() };
     let aidc = args.windows(2).any(|w| w[0] == "--domain" && w[1] == "aidc");
     let only = args.windows(2).find(|w| w[0] == "--only").map(|w| w[1].clone());
     let shift: Option<(i64, i64)> = args.windows(2).find(|w| w[0] == "--shift").and_then(|w| {
@@ -178,6 +185,10 @@ fn main() -> Result<()> {
                 if same { "같음" } else { "다름" },
                 if title_ok { "마스터와 같음" } else { "마스터와 다름 → 전부 다시 읽어야 함" }
             );
+            for (method, id, sim, margin) in &d.methods {
+                println!("  마스터 고르기 {method}: {id} · 유사도 {sim:.3} · 2위와 차이 {margin:.3}");
+            }
+            println!("  표제란 · 서명란 보호로 통째로 읽은 조각 {}", d.protected);
             if !same {
                 println!("  전부: {}\n  델타: {}", values(&x_full), values(&x_delta));
             }
@@ -225,7 +236,7 @@ fn main() -> Result<()> {
             scans.push(json!({
                 "scan": name,
                 "full": { "ms": full_ms, "crops": full.crops.len(), "blank": full.plan.blank.len(), "values": values(&x_full), "texts": texts(&full) },
-                "delta": { "ms": delta_ms, "crops": delta.crops.len(), "skipped": d.skipped.len(), "clipped": d.clipped, "trimmed": d.trimmed, "master": d.master, "similarity": d.similarity, "margin": d.margin, "changed": d.changed, "blocks": d.blocks, "fallback": d.fallback, "values": values(&x_delta), "texts": texts(&delta) },
+                "delta": { "ms": delta_ms, "crops": delta.crops.len(), "skipped": d.skipped.len(), "clipped": d.clipped, "trimmed": d.trimmed, "master": d.master, "similarity": d.similarity, "margin": d.margin, "methods": d.methods, "protected": d.protected, "changed": d.changed, "blocks": d.blocks, "fallback": d.fallback, "values": values(&x_delta), "texts": texts(&delta) },
                 "same_values": same,
                 "title_matches_master": title_ok,
                 "analysis": analysis,

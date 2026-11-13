@@ -277,6 +277,26 @@ pub fn status() -> Vec<ModelStatus> {
         .collect()
 }
 
+/// 이 모델 폴더에 만들어 둔 피라미드 양자화 배분 이름 (`active.json` 의 `pyramid.plan`, 파일이 있을 때만).
+/// 피라미드 파일은 내려받지 않고, 앱이 처음 쓸 때 원본 BF16 (또는 원본 그대로인 BF16 mmproj)에서 한 번 양자화해 만듭니다
+/// (`blueprint-core` 의 `ai::pyramid::ensure`, `examples/pyramid.rs`). 레시피 번호가 없는 옛 파일(q8 에서 다시 양자화)은 세지 않습니다.
+pub fn pyramid_plan(name: &str) -> Option<String> {
+    let dir = model_dir(name);
+    let record: serde_json::Value = serde_json::from_str(&fs::read_to_string(dir.join("active.json")).ok()?).ok()?;
+    let p = &record["pyramid"];
+    p["recipe"].as_u64()?;
+    let file = p["file"].as_str()?;
+    let vision_ok = p["mmproj"].as_str().is_none_or(|m| dir.join(m).exists());
+    (dir.join(file).exists() && vision_ok).then(|| p["plan"].as_str().unwrap_or("?").to_string())
+}
+
+/// 모델 폴더에 원본 BF16 (`bf16/`, Hugging Face 의 safetensors 그대로)이 있는가. 피라미드 양자화의 재료입니다
+/// (gocr: trillionlabs/GravityOCR-KO, zoro: trillionlabs/Zoro-1). 비전만 바꾸는 배분은 없어도 만들 수 있습니다.
+pub fn has_original(name: &str) -> bool {
+    let dir = model_dir(name).join("bf16");
+    dir.join("model.safetensors").exists() || dir.join("model.safetensors.index.json").exists()
+}
+
 /// 가져오기 결과
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportReport {

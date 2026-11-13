@@ -262,6 +262,10 @@ struct ModelRow {
     bytes_on_disk: u64,
     installed: bool,
     importable: bool,
+    /// 원본 BF16 에서 한 번 양자화해 만들어 둔 피라미드 배분 (있으면 ROCm · CUDA · Metal 에서 이 파일을 씀)
+    pyramid: Option<String>,
+    /// 모델 폴더에 원본 BF16 (`bf16/`) 이 있는가 (피라미드 양자화의 재료)
+    original: bool,
     job: Job,
 }
 
@@ -292,6 +296,8 @@ fn check_model_status(window: Window, jobs: State<'_, Jobs>) -> Result<ModelRepo
             bytes_on_disk: s.bytes_on_disk,
             installed: s.installed,
             importable: s.importable,
+            pyramid: blueprint_models::pyramid_plan(s.entry.name),
+            original: blueprint_models::has_original(s.entry.name),
             job: jobs.get(s.entry.name).cloned().unwrap_or_default(),
         })
         .collect();
@@ -1679,7 +1685,8 @@ fn load_models(app: AppHandle) {
                 engine.writer = Some(Arc::new(rt.writer));
             }
             *lock(&desk.reader) = Some(rt.reader.clone());
-            *lock(&desk.status) = format!("Zoro-1 · {} (SharedResidency)", rt.backend);
+            // gocr 의 양자화 (`q8` 또는 원본 BF16 에서 처음 열 때 만든 `pyramid:<배분>`)도 함께 보입니다.
+            *lock(&desk.status) = format!("Zoro-1 · {} (SharedResidency) · gocr {}", rt.backend, rt.reader.gocr().quant());
             *lock(&desk.device) = Some(rt.device);
             // 마스터 도면 색인 (SigLIP2 비전 1 회, 1 ~ 2 초). 실패하면 Red-line 을 전부 읽습니다.
             match index_masters(&desk, &rt.reader) {

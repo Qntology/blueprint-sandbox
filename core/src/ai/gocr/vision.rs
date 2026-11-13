@@ -33,7 +33,8 @@ fn prepare(name: &str, t: Tensor) -> candle_core::Result<Tensor> {
         let dtype = t.dtype();
         let summed = t.to_dtype(DType::F32)?.reshape((d, 3, ct / 3, h, w))?.sum(2)?;
         summed.reshape((d, 3 * h * w))?.to_dtype(dtype)
-    } else if name == "model.visual.downsample.weight" {
+    } else if name == "model.visual.downsample.weight" && t.rank() == 4 {
+        // 피라미드 파일(`ai::pyramid`)은 이미 [출력, 입력 × 2 × 2] 로 펴서 양자화해 둡니다.
         let (o, c, h, w) = t.dims4()?;
         t.reshape((o, c * h * w))
     } else {
@@ -42,9 +43,9 @@ fn prepare(name: &str, t: Tensor) -> candle_core::Result<Tensor> {
 }
 
 /// 가중치가 BF16 이어도(ROCm) 활성값은 F32 로 다룹니다. 행렬곱만 가중치의 dtype 으로 합니다.
+/// 피라미드 파일의 양자화 가중치(Q8_0 · K 형식)는 양자화 곱입니다 ([`Loaded::linear`]).
 fn linear(w: &Loaded, name: &str, x: &Tensor) -> Result<Tensor> {
-    let weight = w.dense(&format!("{P}.{name}.weight"))?;
-    Ok(x.to_dtype(weight.dtype())?.matmul(&weight.t()?)?.to_dtype(DType::F32)?)
+    w.linear(&format!("{P}.{name}.weight"), &x.to_dtype(DType::F32)?)
 }
 
 fn linear_bias(w: &Loaded, name: &str, x: &Tensor) -> Result<Tensor> {

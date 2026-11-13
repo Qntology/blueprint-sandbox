@@ -38,26 +38,53 @@ impl ActiveModel {
     }
 }
 
-/// `model_dir/active.json` 이 가리키는 GGUF 를 열고 구조 값을 읽습니다.
+/// `model_dir/active.json` 이 가리키는 GGUF 를 열고 구조 값을 읽습니다 (q8 파일).
 pub fn load_active(model_dir: &Path) -> Result<ActiveModel> {
+    load_record(model_dir, false)
+}
+
+/// [`load_active`] 와 같되, `device` 가 K 형식을 장치에서 곱하고 피라미드 파일(`ai::pyramid`)이 있으면 그 파일을 고릅니다
+/// (`BLUEPRINT_PYRAMID=0` 이면 늘 q8, `1` 이면 장치와 상관없이 있으면). 고른 양자화는 `quant` 에 `pyramid:<배분>` 으로 적힙니다.
+pub fn load_active_on(model_dir: &Path, device: &candle_core::Device) -> Result<ActiveModel> {
+    load_record(model_dir, super::pyramid::wanted(device))
+}
+
+fn load_record(model_dir: &Path, pyramid: bool) -> Result<ActiveModel> {
     let record_path = model_dir.join("active.json");
     let record: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&record_path)
             .with_context(|| format!("선택 기록을 읽을 수 없습니다: {}. 앱을 실행하면 모델을 내려받습니다", record_path.display()))?,
     )?;
-    let file = record["file"]
+    let mut file = record["file"]
         .as_str()
-        .ok_or_else(|| anyhow!("active.json 에 file 이 없습니다"))?;
-    let quant = record["active"]
+        .ok_or_else(|| anyhow!("active.json 에 file 이 없습니다"))?
+        .to_string();
+    let mut quant = record["active"]
         .as_str()
-        .ok_or_else(|| anyhow!("active.json 에 active 가 없습니다"))?;
+        .ok_or_else(|| anyhow!("active.json 에 active 가 없습니다"))?
+        .to_string();
     let model = record["model"]
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| model_dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
+    let mut mmproj_file = record["mmproj"].as_str().map(str::to_string);
+    let p = &record["pyramid"];
+    // 지금 레시피(원본 BF16 에서 한 번 양자화)로 만든 파일만 엽니다. 옛 레시피 파일은 앱이 다시 만들 때까지 q8 를 씁니다.
+    let fresh = p["recipe"].as_u64() == Some(super::pyramid::RECIPE as u64);
+    if let Some(pf) = p["file"].as_str().filter(|f| pyramid && fresh && model_dir.join(f).exists()) {
+        // 비전 파일은 피라미드 쪽이 있으면 그것, 없으면(비전을 그대로 둔 배분) 원래 것
+        let vision = p["mmproj"].as_str().map(str::to_string).filter(|m| model_dir.join(m).exists());
+        if p["mmproj"].is_null() || vision.is_some() {
+            file = pf.to_string();
+            mmproj_file = vision.or(mmproj_file);
+            quant = format!("pyramid:{}", p["plan"].as_str().unwrap_or("?"));
+        }
+    }
+    let quant = quant.as_str();
+    let file = file.as_str();
 
     let path = model_dir.join(file);
-    let mmproj = record["mmproj"].as_str().map(|f| model_dir.join(f)).filter(|p| p.exists());
+    let mmproj = mmproj_file.map(|f| model_dir.join(f)).filter(|p| p.exists());
     let mut reader = BufReader::new(
         File::open(&path).with_context(|| format!("GGUF 를 열 수 없습니다: {}", path.display()))?,
     );
