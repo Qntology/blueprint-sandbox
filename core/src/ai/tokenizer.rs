@@ -8,6 +8,8 @@ use tokenizers::Tokenizer;
 
 pub struct ModelTokenizer {
     inner: Tokenizer,
+    /// 추가 · 특수 토큰 번호 (`<|im_start|>`, `[gMASK]` …)
+    added: std::collections::HashSet<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,11 +24,22 @@ impl ModelTokenizer {
         let inner = Tokenizer::from_file(path)
             .map_err(|e| anyhow!("{e}"))
             .with_context(|| format!("토크나이저를 읽을 수 없습니다: {}", path.display()))?;
-        Ok(Self { inner })
+        Ok(Self::from_tokenizer(inner))
     }
 
     pub fn from_tokenizer(inner: Tokenizer) -> Self {
-        Self { inner }
+        let added = inner.get_added_tokens_decoder().keys().copied().collect();
+        Self { inner, added }
+    }
+
+    /// 어휘 크기 (추가 토큰 포함)
+    pub fn vocab_size(&self) -> usize {
+        self.inner.get_vocab_size(true)
+    }
+
+    /// 추가 · 특수 토큰인가 (출력 투영을 잘라 둘 때 늘 남기는 행, `ai::pyramid`)
+    pub fn is_added(&self, id: u32) -> bool {
+        self.added.contains(&id)
     }
 
     /// 시작·끝 토큰을 붙이지 않고 인코딩합니다 (채팅 형식은 프롬프트 문자열에 이미 들어 있습니다).

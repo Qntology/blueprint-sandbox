@@ -27,6 +27,9 @@ pub struct ZoroConfig {
     /// 회전을 적용하는 앞쪽 차원 수 (head_dim × partial_rotary_factor)
     pub rope_dim: usize,
     pub rope_theta: f64,
+    /// 인터리브 M-RoPE 의 (시간, 높이, 너비) 주파수 몫 (`rope.dimension_sections`, 합은 rope_dim / 2). 이미지 토큰의 위치에만 쓰이고,
+    /// 글만 읽을 때는 세 축의 위치가 같아 1차원 RoPE 와 같습니다. 없으면 모두 시간 축입니다.
+    pub rope_sections: [usize; 3],
     pub gdn_k_heads: usize,
     pub gdn_v_heads: usize,
     pub gdn_k_dim: usize,
@@ -49,6 +52,13 @@ impl ZoroConfig {
         if gdn_v_heads == 0 || !inner.is_multiple_of(gdn_v_heads) {
             bail!("ssm.inner_size {inner} 는 ssm.time_step_rank {gdn_v_heads} 로 나누어져야 합니다");
         }
+        let rope_dim = n("rope.dimension_count")?;
+        let rope_sections = match file.meta_u32_array("zoro.rope.dimension_sections") {
+            // llama.cpp 식으로 넷째 몫(0)을 붙인 파일도 받습니다.
+            Ok(s) if s.len() >= 3 && s[3..].iter().all(|&v| v == 0) && s.iter().map(|&v| v as usize).sum::<usize>() * 2 == rope_dim => [s[0] as usize, s[1] as usize, s[2] as usize],
+            Ok(s) => bail!("rope.dimension_sections {s:?} 의 합의 두 배가 회전 차원 {rope_dim} 이어야 합니다"),
+            Err(_) => [rope_dim / 2, 0, 0],
+        };
         let cfg = Self {
             n_layers,
             hidden: n("embedding_length")?,
@@ -58,8 +68,9 @@ impl ZoroConfig {
             n_kv_heads: n("attention.head_count_kv")?,
             head_dim: n("attention.key_length")?,
             rms_eps: file.meta_f64("zoro.attention.layer_norm_rms_epsilon")? as f32,
-            rope_dim: n("rope.dimension_count")?,
+            rope_dim,
             rope_theta: file.meta_f64("zoro.rope.freq_base")?,
+            rope_sections,
             gdn_k_heads: n("ssm.group_count")?,
             gdn_v_heads,
             gdn_k_dim: n("ssm.state_size")?,

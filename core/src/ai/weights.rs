@@ -109,6 +109,8 @@ pub struct WeightFile {
     map: Mmap,
     /// 이미 미리 읽은 범위
     warmed: Mutex<HashSet<(usize, usize)>>,
+    /// 옛 이름(`zeze.*`)을 읽으려고 덧붙인 키. 파일을 다시 쓸 때는 빼고 씁니다.
+    aliases: HashSet<String>,
 }
 
 impl std::fmt::Debug for WeightFile {
@@ -121,11 +123,17 @@ impl std::fmt::Debug for WeightFile {
 }
 
 /// 프로젝트의 이전 이름(`zeze`)으로 변환한 파일도 같은 키로 읽습니다. 저장소의 gocr · zoro GGUF 가 이 이름을 씁니다.
-fn alias_old_names(metadata: &mut HashMap<String, Value>) {
+/// 덧붙인 키를 돌려줍니다.
+fn alias_old_names(metadata: &mut HashMap<String, Value>) -> HashSet<String> {
     let old: Vec<(String, Value)> = metadata.iter().filter_map(|(k, v)| k.strip_prefix("zeze.").map(|rest| (format!("zorogravity.{rest}"), v.clone()))).collect();
+    let mut added = HashSet::new();
     for (key, value) in old {
-        metadata.entry(key).or_insert(value);
+        if !metadata.contains_key(&key) {
+            metadata.insert(key.clone(), value);
+            added.insert(key);
+        }
     }
+    added
 }
 
 impl WeightFile {
@@ -134,10 +142,27 @@ impl WeightFile {
         let file = File::open(path).with_context(|| format!("GGUF 를 열 수 없습니다: {}", path.display()))?;
         let mut content = Content::read(&mut BufReader::new(&file))
             .with_context(|| format!("GGUF 머리를 읽을 수 없습니다: {}", path.display()))?;
-        alias_old_names(&mut content.metadata);
+        let aliases = alias_old_names(&mut content.metadata);
         // 모델 파일은 실행 중에 바꾸지 않는다고 봅니다. candle 의 safetensors 읽기도 같습니다.
         let map = unsafe { Mmap::map(&file) }.with_context(|| format!("GGUF 를 매핑할 수 없습니다: {}", path.display()))?;
-        Ok(Self { path: path.to_path_buf(), content, map, warmed: Mutex::new(HashSet::new()) })
+        Ok(Self { path: path.to_path_buf(), content, map, warmed: Mutex::new(HashSet::new()), aliases })
+    }
+
+    /// 파일에 적힌 메타데이터 그대로 (옛 이름을 읽으려고 덧붙인 키는 뺌, 키 순서로). 파일을 다시 쓸 때 씁니다 (`ai::pyramid`).
+    pub fn metadata_entries(&self) -> Vec<(String, Value)> {
+        let mut out: Vec<(String, Value)> = self.content.metadata.iter().filter(|(k, _)| !self.aliases.contains(*k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// 텐서 이름 전부 (정렬됨)
+    pub fn names(&self) -> Vec<String> {
+        self.names_with_prefix("")
+    }
+
+    /// 텐서 하나의 저장된 바이트 (매핑을 그대로 빌려 줌)
+    pub fn raw(&self, name: &str) -> Result<&[u8]> {
+        Ok(self.stored(name)?.1)
     }
 
     pub fn path(&self) -> &Path {
@@ -176,6 +201,23 @@ impl WeightFile {
     pub fn meta_usize(&self, key: &str) -> Result<usize> {
         let v = self.meta_int(key)?;
         usize::try_from(v).map_err(|_| anyhow!("GGUF 메타데이터 {key}={v} 는 음수이거나 너무 큽니다"))
+    }
+
+    /// 정수 배열 메타데이터 (예: 잘라 둔 출력 투영의 행 번호 `<구조>.head.ids`)
+    pub fn meta_u32_array(&self, key: &str) -> Result<Vec<u32>> {
+        match self.content.metadata.get(key) {
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| match v {
+                    Value::U32(x) => Ok(*x),
+                    Value::I32(x) if *x >= 0 => Ok(*x as u32),
+                    Value::U64(x) if *x <= u32::MAX as u64 => Ok(*x as u32),
+                    other => bail!("GGUF 메타데이터 {key} 의 값이 u32 가 아닙니다: {other:?}"),
+                })
+                .collect(),
+            Some(other) => bail!("GGUF 메타데이터 {key} 가 배열이 아닙니다: {other:?}"),
+            None => bail!("GGUF 메타데이터 {key} 가 없습니다"),
+        }
     }
 
     pub fn meta_f64(&self, key: &str) -> Result<f64> {

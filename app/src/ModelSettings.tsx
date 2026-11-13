@@ -20,6 +20,10 @@ interface ModelRow {
   bytes_on_disk: number;
   installed: boolean;
   importable: boolean;
+  /** 원본 BF16 에서 한 번 양자화해 만들어 둔 피라미드 배분 이름 (없으면 null, q8 그대로) */
+  pyramid: string | null;
+  /** 모델 폴더에 원본 BF16 (bf16/) 이 있는가 */
+  original: boolean;
   job: Job;
 }
 
@@ -46,7 +50,13 @@ const source = (m: ModelRow) => tr(...(SOURCE[m.name] ?? ["zoro-gravity", "zoro-
 
 function note(m: ModelRow): string {
   if (m.job.running) return m.job.message;
-  if (m.installed) return tr(`${size(m.bytes_on_disk)} 사용 중 (${source(m)} 와 같은 모델)`, `${size(m.bytes_on_disk)} in use (same model as ${source(m)})`);
+  const bf16 = m.original ? tr(" · BF16 원본 있음", " · BF16 original present") : "";
+  if (m.installed && m.pyramid)
+    return tr(
+      `${size(m.bytes_on_disk)} 사용 중 (${source(m)} 와 같은 모델 · 피라미드 양자화 ${m.pyramid}, 원본 BF16 에서 한 번 양자화${bf16})`,
+      `${size(m.bytes_on_disk)} in use (same model as ${source(m)} · pyramid quantization ${m.pyramid}, quantized once from the BF16 original${bf16})`,
+    );
+  if (m.installed) return tr(`${size(m.bytes_on_disk)} 사용 중 (${source(m)} 와 같은 모델${bf16})`, `${size(m.bytes_on_disk)} in use (same model as ${source(m)}${bf16})`);
   if (m.importable)
     return tr(
       `${source(m)} 에 있습니다. 가져오면 큰 가중치는 하드 링크로 걸려 디스크를 더 쓰지 않습니다.`,

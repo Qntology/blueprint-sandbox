@@ -17,6 +17,8 @@ required-features = ["download"]
 [dependencies]
 anyhow = "1"
 dirs = "6"
+# active.json 의 피라미드 양자화 항목을 읽습니다.
+serde_json = "1"
 ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
 
 [features]

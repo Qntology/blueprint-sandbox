@@ -5,7 +5,7 @@
 콘솔 머리의 스위치 하나로 **100MW 하이퍼스케일 AI 데이터센터**(DLC 수냉 GPU 클러스터: CDU 냉각수 유량 → GPU 정션 온도)로 바꿔 같은 엔진 · 같은 모델로 관제합니다 ([docs/aidc-control-plan.md](docs/aidc-control-plan.md), 합성 데이터 [docs/synthetic-aidc-data.md](docs/synthetic-aidc-data.md)). 콘솔은 풀스크린 오버레이 관제판입니다: 고른 3-Way 도면이 화면 전체에 깔리고, 그 위에 근본 원인 · 경보 · 선택 설비의 CCTV 말풍선(60초 파형 · 도면 조각)이 지시선으로 붙고, 병목 · 인터록 · 결재 HUD 와 파이프라인 · 타임머신 · 자연어 질의 허브가 반투명 유리 판으로 떠 있습니다 ([docs/overlay-console-plan.md](docs/overlay-console-plan.md), 앞 단계 [docs/cctv-console-plan.md](docs/cctv-console-plan.md)).
 
 - **바탕**: [zoro-gravity](https://github.com/Qntology/zoro-gravity) 의 구조를 그대로 따릅니다. 5-Gate 파이프라인 · 자동화 정책(보조 모드 기본, 불리한 판정 자동 확정 금지) · 감사 로그 · 사실 대조(`factcheck`) · Tauri 두 창 앱.
-- **AI 엔진 · 모델**: zoro-gravity 의 `core/src/ai` 와 **같은 모델**(SigLIP2 크롭 · gocr 문서 인식 · Zoro-1 판단 · 글쓰기)을 씁니다. 모델은 zoro-gravity 의 앱 데이터 폴더에서 **가져옵니다**(큰 가중치는 하드 링크). [docs/engine.md](docs/engine.md)
+- **AI 엔진 · 모델**: zoro-gravity 의 `core/src/ai` 와 **같은 모델**(SigLIP2 크롭 · gocr 문서 인식 · Zoro-1 판단 · 글쓰기 · 다국어 문서 · VLM)을 씁니다. 모델은 zoro-gravity 의 앱 데이터 폴더에서 **가져옵니다**(큰 가중치는 하드 링크). 피라미드 양자화는 원본 BF16 에서 한 번만 하고, 앱이 처음 열 때 만듭니다. [docs/engine.md](docs/engine.md)
 - **데이터**: 발전소 DCS · CMMS 연계가 없어서 합성 시드 원장(KKS 설비 35 · 센서 23 · 간선 41 · 도면 5 + A0 종합 1 · MOC · AOP · 선행 절차 인터록 · 도면 기호 범례 10종)과 합성 시계열 시나리오 8개로 진행합니다. [docs/synthetic-plant-data.md](docs/synthetic-plant-data.md)
   AI 데이터센터도 같은 스키마의 합성 원장(DCIM 자산 32 · 센서 28 · 간선 36 · MEP · SLD 도면 5 + A0 · MOP · EOP · 인터록 · 물리엔진 계통)과 시나리오 8개(D1 ~ D7 · D3F)입니다. [docs/synthetic-aidc-data.md](docs/synthetic-aidc-data.md)
 - **AI 단독 제어 금지**: 이 시스템은 실제 설비를 조작하지 않습니다. Part 8-5 의 자율 대응(Tier 1 우회 개방) 명령은 내장 물리엔진(시뮬레이터)에만 들어갑니다. 확정은 진단과 조치 지시서를 기록하는 일이고, 계통 이상 · 고위험 조치(감발 · 정지)는 교대감독 파트장 공동 결재가 있어야 확정됩니다.
@@ -80,6 +80,7 @@ cargo run -p blueprint-core --release --example sds_eval
 ### 모델
 
 모델은 zoro-gravity 와 같습니다. 앱을 켜면 없는 모델을 `%LOCALAPPDATA%\zorogravity\models` 에서 가져오고(큰 가중치는 하드 링크, 작은 파일은 복사), 거기에도 없으면 Hugging Face 에서 내려받습니다.
+판단 · 글쓰기 · 다국어 문서 · VLM 은 모두 Zoro-1 하나가 맡습니다 (Qwen3.5 2B 는 쓰지 않습니다).
 검색용 두 모델은 선택입니다 (없으면 검색이 규칙 · 글자 경로만 씁니다). 임베딩은 logis-center 가 받아 둔 것을 가져오고, Stanza 는 공개 저장소가 없어 [stanza-onnx-export](https://github.com/Qntology/stanza-onnx-export) 로 en · ko 를 변환한 폴더에서 가져옵니다.
 
 ```bat
@@ -88,13 +89,24 @@ cargo run -p blueprint-models -- import
 cargo run -p blueprint-models -- import stanza ..\stanza-onnx-export\onnx_final
 ```
 
-| 모델 | 내려받는 곳 | 크기 |
-| --- | --- | --- |
-| `zoro` | [Qntology/zoro-1-gguf](https://huggingface.co/Qntology/zoro-1-gguf) | 5.2 GB |
-| `gocr` | [Qntology/GravityOCR-KO-gguf](https://huggingface.co/Qntology/GravityOCR-KO-gguf) | 1.6 GB |
-| `siglip2` | [Qntology/siglip2-so400m-patch16-naflex-gguf](https://huggingface.co/Qntology/siglip2-so400m-patch16-naflex-gguf) | 1.7 GB |
-| `embed` (검색, 선택) | [ibm-granite/granite-embedding-97m-multilingual-r2](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2) (logis-center 에서 가져옴) | 0.22 GB |
-| `stanza` (검색, 선택) | 없음 — stanza-onnx-export 변환본 `onnx_final/{en,ko}` | 0.33 GB |
+| 모델 | 내려받는 곳 | 크기 | 원본 (BF16) |
+| --- | --- | --- | --- |
+| `zoro` | [Qntology/zoro-1-gguf](https://huggingface.co/Qntology/zoro-1-gguf) | 5.2 GB | [trillionlabs/Zoro-1](https://huggingface.co/trillionlabs/Zoro-1) |
+| `gocr` | [Qntology/GravityOCR-KO-gguf](https://huggingface.co/Qntology/GravityOCR-KO-gguf) | 1.6 GB | [trillionlabs/GravityOCR-KO](https://huggingface.co/trillionlabs/GravityOCR-KO) |
+| `siglip2` | [Qntology/siglip2-so400m-patch16-naflex-gguf](https://huggingface.co/Qntology/siglip2-so400m-patch16-naflex-gguf) | 1.7 GB | [google/siglip2-so400m-patch16-naflex](https://huggingface.co/google/siglip2-so400m-patch16-naflex) |
+| `embed` (검색, 선택) | [ibm-granite/granite-embedding-97m-multilingual-r2](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2) (logis-center 에서 가져옴) | 0.22 GB | 같음 |
+| `stanza` (검색, 선택) | 없음 — stanza-onnx-export 변환본 `onnx_final/{en,ko}` | 0.33 GB | - |
+
+**양자화**: 내려받는 q8 파일은 원본 BF16 을 한 번 양자화한 것이고(`pyramid -- audit` 로 확인), mmproj 는 원본 그대로입니다.
+피라미드 양자화(텐서마다 정밀도를 달리한 파일)는 내려받지 않고 **앱이 처음 열 때 원본에서 한 번 양자화해 만듭니다** (기본 배분: gocr `vision-q8+head` = 비전 Q8_0 + 출력 투영 잘라 두기, 처음 열 때 CPU 로 약 9 초 · zoro 는 q8 그대로, 실측 [docs/verification.md](docs/verification.md) 15절).
+원본 safetensors 를 모델 폴더의 `bf16/` 에 두면 그 값을 재료로 쓰고, 없으면 원본 그대로인 BF16 mmproj 만 재료로 씁니다 (q8 의 Q8_0 을 다시 양자화하지 않음). 자세한 것은 [docs/engine.md](docs/engine.md) 5절.
+
+- `BLUEPRINT_GOCR_PLAN` · `BLUEPRINT_ZORO_PLAN` 으로 기본 배분을 바꿀 수 있습니다 (예: `vision+head` 는 비전 피라미드).
+- `BLUEPRINT_PYRAMID=0` 이면 피라미드 파일을 쓰지 않고 q8 로 엽니다 (`1` 이면 모델 폴더에 있는 피라미드 파일을 그대로 쓰고 새로 만들지 않음).
+- `BLUEPRINT_DENSE=f32` 면 BF16 으로 저장된 일반 가중치(mmproj)를 F32 로 넓혀 올립니다. RX 6600 (gfx1032) 에서는 더 빠르고 원본 그대로지만 VRAM 이 두 배입니다.
+- `BLUEPRINT_FUSED_ATTN=1` 이면 디코딩 패스의 묶음 질의 주의 커널(ROCm)을 켭니다. RX 6600 실측에서 행렬곱 경로보다 느려 기본은 꺼짐입니다.
+- `BLUEPRINT_VLM=all|<확신 기준>` 이면 gocr 가 읽은 조각을 Zoro-1 비전으로 다시 읽습니다 (기본 꺼짐). 아랍어처럼 gocr 가 읽지 못하는 문자의 문서에 씁니다
+  (12개 언어 실측에서 `0.4` 는 아랍어 조각만 다시 읽음, Zoro-1 은 조각당 약 6 배 느리고 다른 언어에서 낱말을 그럴듯하게 바꾸기도 함, 15절).
 
 ## 콘솔 화면 (기획 Part 8-1 · 8-1B · 8-2, 개선안 CCTV형 통합 관제판 → 2차 개선안 풀스크린 오버레이)
 

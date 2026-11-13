@@ -127,6 +127,7 @@ impl MiniZoro {
             rms_eps: 1e-6,
             rope_dim: 8,
             rope_theta: 10000.0,
+            rope_sections: [4, 0, 0],
             gdn_k_heads: 2,
             gdn_v_heads: 4,
             gdn_k_dim: 16,

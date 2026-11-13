@@ -12,6 +12,7 @@ pub mod model;
 pub mod ops;
 #[cfg(test)]
 pub(crate) mod reference;
+pub mod vision;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -20,7 +21,8 @@ use anyhow::{bail, Context, Result};
 use serde_json::json;
 
 use self::model::{rows_to_host, GenerateOptions, StreamMode, ZoroModel};
-use super::gguf_model::load_active;
+use super::gguf_model::{load_active, load_active_on};
+use super::residency::Requant;
 use super::jev_head::{JevHead, HIDDEN};
 use super::pointer::{Backbone, PointerHidden, PointerModel, PointerPrompt};
 use super::residency::SharedResidency;
@@ -45,6 +47,26 @@ pub fn parse_speculation(text: &str) -> Result<Speculation> {
     let mut next = || parts.next().and_then(|v| v.ok());
     let parsed = (|| Some(Speculation { masks: next()?, lookup: next()?, width: next()? }))();
     parsed.with_context(|| format!("{SPECULATION_ENV}={text:?}: `마스크:탐색:폭` 형식의 정수여야 합니다"))
+}
+
+/// 판단 · 글쓰기 프롬프트를 남길 폴더 (`pointer.jsonl` · `writer.jsonl`). 양자화 배분을 같은 입력으로 다시 잴 때 씁니다
+/// (`examples/quant_screen.rs zoro`). 합성 데이터 측정 전용이라 앱은 켜지 않습니다.
+pub const DUMP_ENV: &str = "BLUEPRINT_ZORO_DUMP";
+
+fn dump(kind: &str, row: serde_json::Value) {
+    let Some(dir) = std::env::var_os(DUMP_ENV).filter(|v| !v.is_empty()) else { return };
+    let path = std::path::PathBuf::from(dir).join(format!("{kind}.jsonl"));
+    let line = format!("{row}\n");
+    let write = || -> std::io::Result<()> {
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        use std::io::Write;
+        std::fs::OpenOptions::new().create(true).append(true).open(&path)?.write_all(line.as_bytes())
+    };
+    if let Err(e) = write() {
+        eprintln!("[BLUEPRINT-ZORO] {} 에 남기지 못했습니다: {e}", path.display());
+    }
 }
 
 /// 모델이 쓴 글
@@ -73,13 +95,19 @@ pub struct ZoroBackbone {
 
 impl ZoroBackbone {
     /// `model_dir/active.json` 이 가리키는 GGUF 와 `model_dir/tokenizer.json` 을 엽니다. 가중치는 여기서 올리지 않고,
-    /// 첫 판단에서 필요한 묶음만 올라옵니다.
+    /// 첫 판단에서 필요한 묶음만 올라옵니다. 장치가 K 형식을 장치에서 곱하고 피라미드 파일이 있으면 그 파일입니다 (`ai::pyramid`).
     pub fn open(model_dir: &Path, residency: SharedResidency) -> Result<Self> {
         Self::open_with(model_dir, residency, StreamMode::from_env()?)
     }
 
     pub fn open_with(model_dir: &Path, residency: SharedResidency, mode: StreamMode) -> Result<Self> {
-        let active = load_active(model_dir)?;
+        Self::open_variant(model_dir, residency, mode, false)
+    }
+
+    /// `q8_only` 면 피라미드 파일이 있어도 q8 파일을 엽니다 (측정의 기준).
+    pub fn open_variant(model_dir: &Path, residency: SharedResidency, mode: StreamMode, q8_only: bool) -> Result<Self> {
+        let device = residency.lock().unwrap_or_else(|p| p.into_inner()).device().clone();
+        let active = if q8_only { load_active(model_dir)? } else { load_active_on(model_dir, &device)? };
         if active.architecture != "zoro" {
             bail!("zoro 모델 폴더가 아닙니다: {} ({})", model_dir.display(), active.architecture);
         }
@@ -104,6 +132,33 @@ impl ZoroBackbone {
         &self.model
     }
 
+    /// 올릴 때 이 배분으로 다시 양자화합니다 (정밀도 배분 측정용).
+    pub fn with_requant(mut self, label: impl Into<String>, requant: Requant) -> Self {
+        self.model = self.model.with_requant(label, requant);
+        self
+    }
+
+    /// 다시 양자화할 때 이 중요도 행렬을 씁니다.
+    pub fn with_imatrix(mut self, imatrix: Arc<super::pyramid::Imatrix>) -> Self {
+        self.model = self.model.with_imatrix(imatrix);
+        self
+    }
+
+    /// 올릴 때 양자화하는 텐서의 재료를 이 원본 BF16 에서 읽습니다.
+    pub fn with_original(mut self, original: Arc<super::original::Original>) -> Self {
+        self.model = self.model.with_original(original);
+        self
+    }
+
+    /// 이 백본이 연 양자화 (`q8` 또는 `pyramid:<배분>`, 측정 중이면 다시 양자화하는 배분 이름)
+    pub fn quant(&self) -> String {
+        let spec = self.model.spec();
+        if !spec.variant().is_empty() {
+            return format!("requant:{}", spec.variant());
+        }
+        spec.file.meta_str(super::pyramid::META_PLAN).map_or_else(|_| "q8".to_string(), |p| format!("pyramid:{p}"))
+    }
+
     pub fn tokenizer(&self) -> &ModelTokenizer {
         &self.tokenizer
     }
@@ -120,6 +175,7 @@ impl ZoroBackbone {
         let stop = STOP_TOKENS.iter().filter_map(|t| self.tokenizer.token_to_id(t)).collect();
         let out = self.model.generate(&ids, &GenerateOptions::new(max_tokens, stop).with_speculation(speculation))?;
         let text = self.tokenizer.decode(&out.tokens)?;
+        dump("writer", json!({ "system": system, "user": user, "max_tokens": max_tokens, "prompt_ids": ids, "tokens": out.tokens, "text": text, "finished": out.finished, "quant": self.quant() }));
         if trace::enabled() {
             let shown = if trace::with_text() { text.as_str() } else { "" };
             // 지시문은 고정된 글이라 사건 내용이 없습니다. 입력은 남기지 않습니다.
@@ -140,6 +196,73 @@ impl ZoroBackbone {
     }
 }
 
+/// 이미지 판독 지시문 (다국어 문서 · 도면 조각을 그대로 옮겨 적기)
+pub const TRANSCRIBE: &str = "Transcribe all text in this image exactly as it appears, in its original language, keeping line breaks. Output only the text.";
+
+/// 이미지 한 장을 읽은 결과
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageReading {
+    pub text: String,
+    pub tokens: usize,
+    pub finished: bool,
+    pub min_confidence: f32,
+    /// 언어 모델에 넣은 이미지 토큰 수 (2 × 2 병합 뒤)
+    pub image_tokens: usize,
+    pub vision_ms: f64,
+    pub prefill_ms: f64,
+    pub decode_ms: f64,
+}
+
+impl ZoroBackbone {
+    /// 이미지 한 장을 읽고 `instruction` 대로 씁니다 (Zoro-1 비전: 다국어 문서 · 도면 판독, gocr 저신뢰 조각 대체 판독).
+    /// 비전 단계(mmproj) → 비전을 내림 → 텍스트 블록 순서이고 (`ZoroModel::generate_with_image`), 판단 프롬프트와 달리 지시문 언어는 자유입니다.
+    /// `max_pixels` 는 이미지 토큰 수를 묶는 화소 상한입니다 (`zoro::vision::MAX_PIXELS`).
+    pub fn read_image(&self, image: &image::RgbImage, instruction: &str, max_tokens: usize, max_pixels: usize) -> Result<ImageReading> {
+        self.read_images(std::slice::from_ref(image), instruction, max_tokens, max_pixels)?.pop().context("결과가 없습니다")
+    }
+
+    /// 이미지 여러 장을 같은 지시문으로 읽습니다. 비전 단계 한 번(모두 인코딩) → 비전을 내림 → 텍스트 블록 한 번 올려 차례로 씁니다.
+    pub fn read_images(&self, images: &[image::RgbImage], instruction: &str, max_tokens: usize, max_pixels: usize) -> Result<Vec<ImageReading>> {
+        let cfg = self.model.vision_config()?;
+        let pad = self.tokenizer.token_to_id("<|image_pad|>").context("토크나이저에 <|image_pad|> 가 없습니다")?;
+        let head = self.tokenizer.encode("<|im_start|>user\n<|vision_start|>")?.ids;
+        let tail = self.tokenizer.encode(&format!("<|vision_end|>{instruction}<|im_end|>\n{ANSWER_START}"))?.ids;
+        let mut prepared = Vec::with_capacity(images.len());
+        for image in images {
+            let p = vision::prepare(image, &cfg, max_pixels)?;
+            let slot = model::ImageSlot { at: head.len(), rows: p.grid_h / cfg.merge, cols: p.grid_w / cfg.merge };
+            let mut ids = head.clone();
+            ids.extend(std::iter::repeat_n(pad, slot.tokens()));
+            ids.extend_from_slice(&tail);
+            prepared.push((ids, p, slot));
+        }
+        let stop = STOP_TOKENS.iter().filter_map(|t| self.tokenizer.token_to_id(t)).collect();
+        let opts = GenerateOptions::new(max_tokens, stop).with_speculation(self.speculation);
+        let items: Vec<(&[u32], &vision::VisionImage, model::ImageSlot)> = prepared.iter().map(|(ids, p, s)| (ids.as_slice(), p, *s)).collect();
+        let outs = self.model.generate_with_images(&items, &opts)?;
+        outs.into_iter()
+            .zip(&prepared)
+            .map(|((out, vision_ms), (_, _, slot))| {
+                let text = self.tokenizer.decode(&out.tokens)?;
+                if trace::enabled() {
+                    let shown = if trace::with_text() { text.as_str() } else { "" };
+                    trace::record("zoro", "이미지 판독", vision_ms + out.prefill_ms + out.decode_ms, json!({ "image_tokens": slot.tokens(), "tokens": out.tokens.len(), "vision_ms": vision_ms, "text": shown }));
+                }
+                Ok(ImageReading {
+                    text,
+                    tokens: out.tokens.len(),
+                    finished: out.finished,
+                    min_confidence: out.confidences.iter().copied().fold(1.0, f32::min),
+                    image_tokens: slot.tokens(),
+                    vision_ms,
+                    prefill_ms: out.prefill_ms,
+                    decode_ms: out.decode_ms,
+                })
+            })
+            .collect()
+    }
+}
+
 impl Backbone for ZoroBackbone {
     fn encode(&self, prompt: &PointerPrompt) -> Result<PointerHidden> {
         let enc = self.tokenizer.encode(&prompt.text)?;
@@ -154,6 +277,7 @@ impl Backbone for ZoroBackbone {
         }
         let hidden = self.model.hidden_states(&enc.ids)?;
         let picked = rows_to_host(&hidden, &rows)?;
+        dump("pointer", json!({ "text": prompt.text, "query_byte": prompt.query_byte, "option_bytes": prompt.option_bytes, "quant": self.quant() }));
         if picked.iter().any(|r| r.len() != HIDDEN) {
             bail!("은닉 차원이 {HIDDEN} 이 아닙니다: {}", picked[0].len());
         }

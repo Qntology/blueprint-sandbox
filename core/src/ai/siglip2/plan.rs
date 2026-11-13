@@ -29,12 +29,34 @@ pub struct PlanParams {
     pub use_arena: bool,
     /// 패치 경쟁을 쓸 때 문단을 버리는 기준: 잉크 칸 중 안내문의 확정 영토 비율
     pub drop_share: f32,
+    /// 표제란 · 서명란 자리([`protected`])의 문단은 안내문으로 보이더라도 버리지 않습니다.
+    pub protect: bool,
 }
 
 impl Default for PlanParams {
     fn default() -> Self {
-        Self { drop_margin: 0.15, sign_gate: 0.2, text_px: 30.0, max_tile_patches: 1200, use_arena: true, drop_share: 0.5 }
+        Self { drop_margin: 0.15, sign_gate: 0.2, text_px: 30.0, max_tile_patches: 1200, use_arena: true, drop_share: 0.5, protect: true }
     }
+}
+
+/// 표제란 · 서명란 자리 (gravity-ocr `pipeline.protected_region` 을 옮김). 도면 · 점검표의 두 배치를 모두 덮습니다.
+/// - 위 띠: 아래 끝이 페이지 높이의 `TOP_BAND` 위 (도면번호 · 개정이 든 표제란 띠, 이 저장소의 도면은 0.02 ~ 0.095)
+/// - 오른쪽 아래: 왼쪽 끝이 너비의 0.60, 위 끝이 높이의 0.75 너머 (서명 · 날인 · 작성자 칸)
+/// - 넓이의 `PROTECT_SHARE` 이상이 두 자리 안에 든 조각 (공백으로 자른 덩어리가 표제란 줄과 옆 글을 함께 묶은 경우)
+pub const TOP_BAND: f32 = 0.12;
+pub const CORNER: (f32, f32) = (0.60, 0.75);
+pub const PROTECT_SHARE: f32 = 0.2;
+
+/// 페이지 `w × h` 의 표제란 · 서명란 자리에 든 조각인가
+pub fn protected((x0, y0, x1, y1): Bbox, w: u32, h: u32) -> bool {
+    let (w, h) = (w as f32, h as f32);
+    let (fx0, fy0, fx1, fy1) = (x0 as f32, y0 as f32, x1 as f32, y1 as f32);
+    if (fx0 >= CORNER.0 * w && fy0 >= CORNER.1 * h) || fy1 <= TOP_BAND * h {
+        return true;
+    }
+    let area = ((fx1 - fx0) * (fy1 - fy0)).max(1.0);
+    let share = |rx0: f32, ry0: f32, rx1: f32, ry1: f32| ((fx1.min(rx1) - fx0.max(rx0)).max(0.0) * (fy1.min(ry1) - fy0.max(ry0)).max(0.0)) / area;
+    share(CORNER.0 * w, CORNER.1 * h, w, h) >= PROTECT_SHARE || share(0.0, 0.0, w, TOP_BAND * h) >= PROTECT_SHARE
 }
 
 /// 제목은 페이지 위쪽 이 비율 안에서 찾습니다.
@@ -305,7 +327,7 @@ pub fn plan_page(ink: &InkPage, s: &Scores, p: &PlanParams) -> PagePlan {
                     v.guide - v.form.max(v.table).max(v.title) >= p.drop_margin
                 }
             };
-            if guidance {
+            if guidance && !(p.protect && protected(bbox, ink.width, ink.height)) {
                 dropped.push(bbox);
                 continue;
             }
@@ -446,6 +468,20 @@ mod tests {
 
     fn crop(kind: CropKind, bbox: Bbox) -> CropPlan {
         CropPlan { kind, bbox, upscale: 1.0, guide_margin: None }
+    }
+
+    #[test]
+    fn the_title_band_and_the_signature_corner_are_protected() {
+        let (w, h) = (2000, 1400);
+        // 이 저장소 도면의 표제란 띠 (0.02 ~ 0.095 H) 와 서명란 (x 0.72 ~, y 0.86 ~)
+        assert!(protected((60, 28, 1940, 133), w, h));
+        assert!(protected((1440, 1204, 1940, 1365), w, h));
+        // 아래 안내문 띠 (x 0.035 ~ 0.66, y 0.895 ~ 0.975): 오른쪽 아래 자리와 겹침이 20 % 밑이라 보호하지 않음 (점검표 안내문은 계속 버림)
+        assert!(!protected((70, 1253, 1320, 1365), w, h));
+        // 본문 가운데 설비 상자
+        assert!(!protected((280, 400, 610, 560), w, h));
+        // 표제란 줄과 옆 글이 한 덩어리로 묶인 조각: 넓이의 20 % 이상이 위 띠
+        assert!(protected((60, 100, 1940, 260), w, h));
     }
 
     #[test]

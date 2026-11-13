@@ -340,6 +340,10 @@ impl LayerCache {
     pub fn attend(&self, q: &Tensor, kt: &Tensor, v: &Tensor, mask: &StepMask, scale: f64) -> Result<Tensor> {
         let past = self.segments();
         let Some(codec) = &self.codec else {
+            // 디코딩 패스(새 토큰 몇 개)는 커널 하나로 (ROCm, 자가 검증 통과 시). 아니면 행렬곱 경로.
+            if let Some(out) = super::fused_attention::attend(q, kt, v, &past, mask.mode == AttnMode::Causal, scale)? {
+                return Ok(out);
+            }
             return attend(q, kt, v, &past, mask, scale);
         };
         if past.is_empty() {

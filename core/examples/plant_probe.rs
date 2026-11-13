@@ -3,6 +3,8 @@
 //!   cargo run -p blueprint-core --release --example plant_probe -- [현장 스캔 폴더] [결과 JSON]
 //!
 //! `BLUEPRINT_DOMAIN=aidc` 면 AI 데이터센터 원장 · 마스터(MEP · SLD) · 시나리오 D1 ~ D7 로 같은 측정을 합니다 (추가 개선안).
+//! `BLUEPRINT_LANG=en` 이면 영어 화면처럼 절차서 원인 요약을 영어로 씁니다. `--no-reads` 면 도면 · 스캔을 읽지 않고 시나리오만 돕니다
+//! (현장 보고는 시나리오 정답 값).
 //!
 //! 1. 사전 인덱싱(Phase A): 마스터 P&ID 다섯 장을 읽어 KKS 를 찾고 원장 좌표와 맞춥니다 (찾은 비율 · 상자 겹침).
 //! 2. 현장 스캔: `python scripts/gen_pid_drawings.py` 가 만든 점검표 · Red-line 을 읽어 정답과 맞춥니다.
@@ -56,20 +58,27 @@ fn outcome_json(o: &Outcome) -> Value {
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    // `--no-reads`: 마스터 도면 · 현장 스캔을 읽지 않고 시나리오만 돕니다 (현장 보고는 시나리오 정답 값). 영어 초안처럼 판단 · 글쓰기만 볼 때 씁니다.
+    let no_reads = all.iter().any(|a| a == "--no-reads");
+    let args: Vec<String> = all.into_iter().filter(|a| !a.starts_with("--")).collect();
     let field_dir = PathBuf::from(args.first().cloned().unwrap_or_else(|| "out/field".into()));
     let out_path = PathBuf::from(args.get(1).cloned().unwrap_or_else(|| "out/plant_probe.json".into()));
     let mode = std::env::var("BLUEPRINT_DOMAIN").ok().and_then(|k| DomainMode::from_key(&k)).unwrap_or_default();
+    // 화면 언어 (앱의 설정과 같음). 영어면 Zoro-1 이 절차서 원인 요약을 영어로 씁니다.
+    if let Some(lang) = std::env::var("BLUEPRINT_LANG").ok().and_then(|l| blueprint_core::i18n::Lang::parse(&l)) {
+        blueprint_core::i18n::set(lang);
+    }
     let db = Lattice::embedded_for(mode)?;
     let set = ScenarioSet::embedded_for(mode)?;
-    println!("[도메인] {} · 설비 {} · 센서 {} · 시나리오 {}", mode.label(), db.node_count(), db.sensors().len(), set.scenarios.len());
+    println!("[도메인] {} · 설비 {} · 센서 {} · 시나리오 {} · 언어 {}", mode.label(), db.node_count(), db.sensors().len(), set.scenarios.len(), blueprint_core::i18n::current().code());
     let t = Instant::now();
     let rt = runtime::open()?;
     println!("[엔진] {} · 모델 열기 {:.1}s", rt.backend, t.elapsed().as_secs_f64());
 
     // 1. 사전 인덱싱 (마스터 도면)
     let mut drawings = Vec::new();
-    for d in db.drawings() {
+    for d in db.drawings().iter().filter(|_| !no_reads) {
         let path = PathBuf::from(format!("core/fixtures/drawings/{}.png", d.id));
         let (x, timings, ms) = read(&rt, &db, &path)?;
         let expected = db.on_drawing(&d.id);
@@ -97,6 +106,10 @@ fn main() -> Result<()> {
     let mut read_reports: Vec<(String, FieldReport)> = Vec::new();
     for s in &set.scenarios {
         for scan in &s.scans {
+            if no_reads {
+                read_reports.push((s.id.clone(), s.field_reports(|w| db.person(w).map(|p| p.name.clone())).remove(0)));
+                continue;
+            }
             let path = field_dir.join(&scan.image);
             if !path.exists() {
                 println!("[스캔] {} 없음 (python scripts/gen_pid_drawings.py 로 만드세요)", path.display());

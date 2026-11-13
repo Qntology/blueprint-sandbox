@@ -24,8 +24,9 @@ use candle_core::{Device, Tensor};
 
 use self::config::GocrConfig;
 use self::image::PreparedImage;
-use self::text::{top3, AttnMode, Decoder, KvCache, PendingKv, Pos};
-use super::gguf_model::load_active;
+use self::text::{AttnMode, Decoder, KvCache, PendingKv, Pos};
+use super::gguf_model::{load_active, load_active_on};
+use super::head::HeadMap;
 use super::kv_turbo::{self, KvShape};
 use super::ocr::{LanguageDecoder, LanguageWeights, OcrEngine, PhaseCtx, VisionEncoder};
 use super::residency::{headroom_bytes, Loaded, SharedResidency};
@@ -159,6 +160,8 @@ pub struct GocrLanguage {
     max_tokens: usize,
     diffusion: Option<BlockDiffusion>,
     strategy: Strategy,
+    /// 잘라 둔 출력 투영의 행 번호 (피라미드 파일, `ai::pyramid`)
+    head: Option<HeadMap>,
 }
 
 /// 프리필 입력: 임베딩과 위치
@@ -199,6 +202,41 @@ impl GocrLanguage {
         Ok(Prefill { embeds, pos, next_pos: after + tail.len() as u32 })
     }
 
+    /// teacher forcing 진단: 프롬프트 뒤에 `targets` 를 한 번에 읽어, 자리마다 (그 토큰의 음의 로그 확률, 모델의 1위 토큰).
+    /// 같은 조각을 기준 모델(q8)이 읽은 토큰열로 다른 양자화 배분을 견줄 때 씁니다 (`examples/quant_screen.rs`).
+    pub fn score(&self, dec: &Decoder<'_>, f: &VisionFeatures, targets: &[u32], device: &Device) -> Result<Vec<(f32, u32)>> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let p = self.prefill(f, device)?;
+        let fed = &targets[..targets.len() - 1];
+        let mut pos = p.pos.clone();
+        pos.extend((0..fed.len() as u32).map(|i| [p.next_pos + i; 3]));
+        let x = if fed.is_empty() { p.embeds.clone() } else { Tensor::cat(&[p.embeds.clone(), self.embed(fed, device)?], 0)? };
+        let (h, _) = dec.forward(&KvCache::new(self.cfg.n_layers), &x, &pos, AttnMode::Causal)?;
+        let start = p.pos.len() - 1;
+        dec.score(&h.narrow(0, start, targets.len())?, targets)
+    }
+
+    /// 디코더 (언어 단계의 가중치로)
+    pub fn decoder<'a>(&'a self, weights: &'a LanguageWeights) -> Decoder<'a> {
+        Decoder { cfg: &self.cfg, blocks: &weights.blocks, output: &weights.output, head: self.head.as_ref() }
+    }
+
+    pub fn tokenizer(&self) -> &ModelTokenizer {
+        &self.tokenizer
+    }
+
+    /// 첫 끝 토큰 (teacher forcing 에서 글이 끝나는 자리를 함께 잴 때)
+    pub fn eos_first(&self) -> u32 {
+        self.cfg.eos[0]
+    }
+
+    /// 출력 투영을 잘라 둔 파일인가
+    pub fn head(&self) -> Option<&HeadMap> {
+        self.head.as_ref()
+    }
+
     /// 프리필을 계산하고 디코딩을 시작합니다. `free` 는 가중치를 올린 뒤의 장치 여유 메모리입니다.
     fn read(&self, dec: &Decoder<'_>, f: &VisionFeatures, device: &Device, free: Option<u64>) -> Result<OcrOutput> {
         let t = Instant::now();
@@ -208,10 +246,11 @@ impl GocrLanguage {
         let mut cache = KvCache::with_codec(c.n_layers, kv_turbo::plan(&shape, device, free, headroom_bytes())?);
         let (h, kv) = dec.forward(&cache, &p.embeds, &p.pos, AttnMode::Causal)?;
         cache.commit(&kv, p.pos.len())?;
-        let first = Pick::from_top3(top3(&dec.last_logits(&h)?));
+        let first = dec.last_pick(&h)?;
         let prefill_ms = t.elapsed().as_secs_f64() * 1e3;
         let t = Instant::now();
-        let mut session = Session { lang: self, dec, cache, next_pos: p.next_pos, device, pending: None };
+        let full_draft = picks_cut(self.head.as_ref(), &[first]);
+        let mut session = Session { lang: self, dec, cache, next_pos: p.next_pos, device, pending: None, full_draft };
         let opts = DecodeOptions {
             eos: &self.cfg.eos,
             max_tokens: self.max_tokens,
@@ -338,6 +377,11 @@ fn char_confidences(chars: usize, tokens: &[u32], confs: &[f32], decode: impl Fn
     Ok(out)
 }
 
+/// 검증 · 프리필이 고른 토큰 가운데 잘린 행의 것이 있는가 ([`Session::full_draft`])
+fn picks_cut(head: Option<&HeadMap>, picks: &[Pick]) -> bool {
+    head.is_some_and(|m| picks.iter().any(|p| m.is_cut(p.token)))
+}
+
 /// 디코더 · 캐시를 [`BlockModel`] 로 묶습니다.
 struct Session<'a> {
     lang: &'a GocrLanguage,
@@ -346,6 +390,10 @@ struct Session<'a> {
     next_pos: u32,
     device: &'a Device,
     pending: Option<PendingKv>,
+    /// 블록 초안도 잘린 행을 볼지. 남긴 행은 한국어 · 영어 도메인 글 위주라, 검증이 잘린 행의 토큰을 한 번 고르면
+    /// (가나 · 아랍 문자 · 체코어 발음 기호 등) 그 조각의 남은 초안은 전체 어휘로 고릅니다. 글은 검증이 정하므로 같고 속도만 달라집니다
+    /// (`docs/verification.md` 15절: 잘린 행을 보지 않는 초안은 12개 언어 조각에서 43 → 53 s).
+    full_draft: bool,
 }
 
 impl Session<'_> {
@@ -356,8 +404,9 @@ impl Session<'_> {
     fn run(&self, ids: &[u32], mode: AttnMode) -> Result<(Vec<Pick>, PendingKv)> {
         let x = self.lang.embed(ids, self.device)?;
         let (h, kv) = self.dec.forward(&self.cache, &x, &self.positions(ids.len()), mode)?;
-        // 로짓은 이미 CPU 행이라 상위 셋을 뽑는 비용은 1위만 뽑을 때와 같은 한 번 훑기입니다
-        let top = self.dec.logits(&h)?.iter().map(|l| Pick::from_top3(top3(l))).collect();
+        // 로짓은 이미 CPU 행이라 상위 셋을 뽑는 비용은 1위만 뽑을 때와 같은 한 번 훑기입니다.
+        // 블록 초안은 검증이 뒤따르므로 잘린 행을 보지 않습니다 (gravity-ocr 와 같음, `full_draft` 가 아니면). 검증은 늘 봅니다.
+        let top = self.dec.picks(&h, mode == AttnMode::Causal || self.full_draft)?;
         Ok((top, kv))
     }
 }
@@ -373,6 +422,7 @@ impl BlockModel for Session<'_> {
     fn verify(&mut self, candidates: &[u32]) -> Result<Vec<Pick>> {
         let (top, kv) = self.run(candidates, AttnMode::Causal)?;
         self.pending = Some(kv);
+        self.full_draft |= picks_cut(self.lang.head.as_ref(), &top);
         Ok(top)
     }
 
@@ -389,29 +439,70 @@ impl LanguageDecoder for GocrLanguage {
     type Output = OcrOutput;
 
     fn decode(&self, ctx: &PhaseCtx<'_>, weights: &LanguageWeights, features: VisionFeatures) -> Result<OcrOutput> {
-        let dec = Decoder { cfg: &self.cfg, blocks: &weights.blocks, output: &weights.output };
-        self.read(&dec, &features, ctx.residency.device(), ctx.residency.free_bytes())
+        self.read(&self.decoder(weights), &features, ctx.residency.device(), ctx.residency.free_bytes())
     }
 }
 
 pub type GocrEngine = OcrEngine<GocrVision, GocrLanguage>;
 
+impl GocrEngine {
+    /// teacher forcing 진단: 입력마다 [`GocrLanguage::score`]. 비전 → 언어 단계 전환은 인식과 같습니다.
+    pub fn score(&self, inputs: &[GocrInput], targets: &[Vec<u32>]) -> Result<Vec<Vec<(f32, u32)>>> {
+        self.run(inputs, |i, lang, ctx, weights, f| lang.score(&lang.decoder(weights), &f, &targets[i], ctx.residency.device()))
+    }
+
+    /// 이 엔진이 연 양자화 (`q8` 또는 `pyramid:<배분>`). 비전만 바꾼 배분은 언어 파일이 q8 그대로라 mmproj 에서 읽습니다.
+    pub fn quant(&self) -> String {
+        let spec = self.spec();
+        let plan = spec.file.meta_str(super::pyramid::META_PLAN).ok().or_else(|| spec.mmproj.as_ref().and_then(|m| m.meta_str(super::pyramid::META_PLAN).ok()));
+        let base = plan.map_or_else(|| "q8".to_string(), |p| format!("pyramid:{p}"));
+        match spec.variant() {
+            "" => base,
+            v => format!("{base}+{v}"),
+        }
+    }
+}
+
+/// 어떤 파일을 열지
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    /// 장치와 `BLUEPRINT_PYRAMID` 에 따라 (`gguf_model::load_active_on`)
+    Auto,
+    /// 늘 q8 파일 (기준)
+    Q8,
+}
+
 /// `model_dir` 의 선택된 GGUF · 토크나이저로 gocr 엔진을 만듭니다. 가중치는 인식할 때 단계별로 올라옵니다.
+/// 장치가 K 형식을 장치에서 곱하고 피라미드 파일이 있으면 그 파일을 엽니다 (`ai::pyramid`).
 pub fn open(model_dir: &Path, residency: SharedResidency, max_tokens: usize, strategy: Strategy) -> Result<GocrEngine> {
-    let active = load_active(model_dir)?;
+    open_variant(model_dir, residency, max_tokens, strategy, Variant::Auto)
+}
+
+pub fn open_variant(model_dir: &Path, residency: SharedResidency, max_tokens: usize, strategy: Strategy, variant: Variant) -> Result<GocrEngine> {
+    let device = residency.lock().unwrap_or_else(|p| p.into_inner()).device().clone();
+    let active = match variant {
+        Variant::Auto => load_active_on(model_dir, &device)?,
+        Variant::Q8 => load_active(model_dir)?,
+    };
     if active.architecture != "gocr" {
         bail!("gocr 모델 폴더가 아닙니다: {} ({})", model_dir.display(), active.architecture);
     }
-    let file = Arc::new(WeightFile::open(&active.path)?);
+    open_paths(model_dir, &active.path, active.mmproj.as_deref(), residency, max_tokens, strategy)
+}
+
+/// 정해 둔 파일로 엽니다 (측정: BF16 기준 파일 등). 토크나이저 · 블록 디퓨전 설정은 `model_dir` 의 것입니다.
+pub fn open_paths(model_dir: &Path, path: &Path, mmproj: Option<&Path>, residency: SharedResidency, max_tokens: usize, strategy: Strategy) -> Result<GocrEngine> {
+    let file = Arc::new(WeightFile::open(path)?);
     let cfg = Arc::new(GocrConfig::from_file(&file)?);
     let tokenizer = ModelTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
     let batching = std::env::var("BLUEPRINT_VISION_BATCH").map_or(true, |v| v != "0");
     let vision = GocrVision { cfg: Arc::clone(&cfg), batching };
     let diffusion = BlockDiffusion::resolve(&file, model_dir)?.map(|d| d.validate(cfg.vocab)).transpose()?;
-    let language = GocrLanguage { cfg, file: Arc::clone(&file), tokenizer, max_tokens, diffusion, strategy };
+    let head = HeadMap::from_file(&file, "gocr", cfg.vocab)?;
+    let language = GocrLanguage { cfg, file: Arc::clone(&file), tokenizer, max_tokens, diffusion, strategy, head };
     let engine = OcrEngine::from_file(file, residency, vision, language)?.with_prepare(vision::PREPARE);
-    let engine = match active.open_mmproj()? {
-        Some(mmproj) => engine.with_mmproj(mmproj),
+    let engine = match mmproj {
+        Some(p) => engine.with_mmproj(Arc::new(WeightFile::open(p)?)),
         None => engine,
     };
     engine.announce();
@@ -473,5 +564,13 @@ mod tests {
         assert!(alt_supports(text, &p, 2, '김', 0.95));
         // 토큰 바이트가 글과 다르면 자리를 믿지 않음
         assert!(alt_pieces("2 입!", &[0, 1, 2], &[0.99, 0.55, 0.98], &alts, tb).is_empty());
+    }
+
+    #[test]
+    fn a_cut_token_chosen_by_the_verify_pass_turns_on_full_vocabulary_drafts() {
+        let map = HeadMap { kept_name: "output.weight", kept: vec![0, 1, 5], rest_name: crate::ai::residency::OUTPUT_REST, rest: vec![2, 3, 4] };
+        assert!(!picks_cut(Some(&map), &[Pick::new(0, 0.9), Pick::new(5, 0.8)]), "남긴 행만이면 초안은 남긴 행으로");
+        assert!(picks_cut(Some(&map), &[Pick::new(0, 0.9), Pick::new(3, 0.8)]));
+        assert!(!picks_cut(None, &[Pick::new(3, 0.8)]), "자르지 않은 파일은 초안도 늘 전체 어휘");
     }
 }

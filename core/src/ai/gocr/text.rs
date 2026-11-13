@@ -15,11 +15,64 @@ use candle_nn::ops::silu;
 use super::config::GocrConfig;
 pub use crate::ai::attention::{top1, top3, AttnMode};
 use crate::ai::attention::{rms_norm, LayerCache, StepMask};
+use crate::ai::head::{self, HeadMap};
 use crate::ai::kv_turbo::KvCodec;
 use crate::ai::residency::Loaded;
+use crate::ai::speculative::Pick;
 
 /// 토큰의 (시간, 높이, 너비) 위치
 pub type Pos = [u32; 3];
+
+/// `BLUEPRINT_GOCR_PROFILE=1` 이면 디코딩 순전파의 단계별 시간을 모읍니다 (장치 작업을 단계마다 기다리므로 느려짐, 측정 전용).
+/// 칸: [q·k·v 투영, 주의(캐시 읽기), 출력 투영, MLP, 정규화 · 잔차, 출력 투영(어휘)]
+pub mod profile {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    pub const NAMES: [&str; 6] = ["qkv", "attend", "o_proj", "mlp", "norm", "head"];
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static TIMES: Mutex<([f64; 6], [u64; 6])> = Mutex::new(([0.0; 6], [0; 6]));
+
+    pub fn on() -> bool {
+        *ON.get_or_init(|| std::env::var("BLUEPRINT_GOCR_PROFILE").is_ok_and(|v| v == "1"))
+    }
+
+    /// 장치 작업이 끝날 때까지 기다린 뒤의 시각
+    pub fn mark(t: &candle_core::Tensor) -> Instant {
+        if on() {
+            let _ = t.flatten_all().and_then(|f| f.narrow(0, 0, 1)).and_then(|f| f.to_device(&candle_core::Device::Cpu));
+        }
+        Instant::now()
+    }
+
+    pub fn add(slot: usize, since: Instant) {
+        if on() {
+            let mut g = TIMES.lock().unwrap_or_else(|p| p.into_inner());
+            g.0[slot] += since.elapsed().as_secs_f64() * 1e3;
+            g.1[slot] += 1;
+        }
+    }
+
+    /// `t` 의 장치 작업이 끝날 때까지 기다린 뒤 `since` 부터의 시간을 `slot` 에 더하고 지금 시각을 돌려줍니다.
+    /// 기다린 다음에 더해야 장치 시간이 그 칸에 들어갑니다 (먼저 더하면 띄우는 시간만 세고 장치 시간은 어느 칸에도 안 들어감).
+    pub fn lap(slot: usize, since: Instant, t: &candle_core::Tensor) -> Instant {
+        if on() {
+            let now = mark(t);
+            add(slot, since);
+            now
+        } else {
+            Instant::now()
+        }
+    }
+
+    /// 모은 시간 (ms) 을 꺼내고 비웁니다.
+    pub fn take() -> [f64; 6] {
+        let mut g = TIMES.lock().unwrap_or_else(|p| p.into_inner());
+        let out = g.0;
+        *g = ([0.0; 6], [0; 6]);
+        out
+    }
+}
 
 pub struct KvCache {
     layers: Vec<LayerCache>,
@@ -108,6 +161,8 @@ pub struct Decoder<'a> {
     pub cfg: &'a GocrConfig,
     pub blocks: &'a Loaded,
     pub output: &'a Loaded,
+    /// 잘라 둔 출력 투영의 행 번호 (`ai::pyramid`). 없으면 `output.weight` 가 전체 어휘입니다.
+    pub head: Option<&'a HeadMap>,
 }
 
 impl Decoder<'_> {
@@ -131,18 +186,25 @@ impl Decoder<'_> {
         let w = self.blocks;
         let p = |s: &str| format!("blk.{i}.{s}");
         let eps = self.cfg.rms_eps;
+        let t = profile::mark(x);
         let h = rms_norm(x, w.dense(&p("attn_norm.weight"))?, eps)?;
+        profile::lap(4, t, &h);
         let (a, kv) = self.attention(lc, i, &h, cos, sin, mask)?;
+        let t = profile::mark(&a);
         let a = rms_norm(&a, w.dense(&p("post_attn_norm.weight"))?, eps)?;
         let x = (x + a)?;
         let h = rms_norm(&x, w.dense(&p("ffn_norm.weight"))?, eps)?;
+        let t = profile::lap(4, t, &h);
         let gu = w.linear(&p("ffn_gate_up.weight"), &h)?;
         let ffn = self.cfg.ffn;
         let gate = gu.narrow(1, 0, ffn)?;
         let up = gu.narrow(1, ffn, ffn)?;
         let m = w.linear(&p("ffn_down.weight"), &(silu(&gate)? * up)?)?;
+        let t = profile::lap(3, t, &m);
         let m = rms_norm(&m, w.dense(&p("post_ffn_norm.weight"))?, eps)?;
-        Ok(((x + m)?, kv))
+        let out = (x + m)?;
+        profile::lap(4, t, &out);
+        Ok((out, kv))
     }
 
     fn attention(&self, lc: &LayerCache, i: usize, h: &Tensor, cos: &Tensor, sin: &Tensor, mask: &StepMask) -> Result<(Tensor, (Tensor, Tensor))> {
@@ -151,27 +213,49 @@ impl Decoder<'_> {
         let p = |s: &str| format!("blk.{i}.{s}");
         let n = h.dim(0)?;
         let (nh, nkv, d) = (c.n_heads, c.n_kv_heads, c.head_dim);
+        let t = profile::mark(h);
         let q = w.linear(&p("attn_q.weight"), h)?.reshape((n, nh, d))?.transpose(0, 1)?.contiguous()?;
         let k = w.linear(&p("attn_k.weight"), h)?.reshape((n, nkv, d))?.transpose(0, 1)?.contiguous()?;
         let v = w.linear(&p("attn_v.weight"), h)?.reshape((n, nkv, d))?.transpose(0, 1)?.contiguous()?;
         let q = rotate_pairs(&q, cos, sin)?;
         let k = rotate_pairs(&k, cos, sin)?;
         let kt = k.transpose(1, 2)?.contiguous()?;
+        let t = profile::lap(0, t, &kt);
         let o = lc.attend(&q, &kt, &v, mask, 1.0 / (d as f64).sqrt())?;
+        let t = profile::lap(1, t, &o);
         let o = o.transpose(0, 1)?.contiguous()?.reshape((n, nh * d))?;
-        Ok((w.linear(&p("attn_output.weight"), &o)?, (kt, v)))
+        let out = w.linear(&p("attn_output.weight"), &o)?;
+        profile::lap(2, t, &out);
+        Ok((out, (kt, v)))
     }
 
-    /// 은닉 상태 `[n, hidden]` → 어휘 로짓 `[n, vocab]` (CPU)
+    fn normed(&self, h: &Tensor) -> Result<Tensor> {
+        rms_norm(h, self.output.dense("output_norm.weight")?, self.cfg.rms_eps)
+    }
+
+    /// 은닉 상태 `[n, hidden]` → `output.weight` 의 로짓 `[n, 행]` (CPU). 자르지 않은 파일이면 전체 어휘입니다.
     pub fn logits(&self, h: &Tensor) -> Result<Vec<Vec<f32>>> {
-        let n = rms_norm(h, self.output.dense("output_norm.weight")?, self.cfg.rms_eps)?;
-        let l = self.output.linear("output.weight", &n)?;
-        Ok(l.to_device(&Device::Cpu)?.to_vec2::<f32>()?)
+        Ok(head::logits(self.output, "output.weight", self.head, &self.normed(h)?, false)?.rows)
     }
 
-    pub fn last_logits(&self, h: &Tensor) -> Result<Vec<f32>> {
+    /// 행마다 상위 셋. `with_rest` 면 잘린 행도 봅니다 (검증 · 프리필). 블록 디퓨전 초안은 검증이 뒤따르므로 건너뜁니다.
+    pub fn picks(&self, h: &Tensor, with_rest: bool) -> Result<Vec<Pick>> {
+        let t = profile::mark(h);
+        let l = head::logits(self.output, "output.weight", self.head, &self.normed(h)?, with_rest)?;
+        let out = l.rows.iter().zip(l.rest).map(|(row, rest)| Pick::from_top3(head::top3(row, rest, self.head))).collect();
+        profile::add(5, t);
+        Ok(out)
+    }
+
+    /// 마지막 행의 상위 셋 (잘린 행 포함)
+    pub fn last_pick(&self, h: &Tensor) -> Result<Pick> {
         let n = h.dim(0)?;
-        self.logits(&h.narrow(0, n - 1, 1)?)?.into_iter().next().ok_or_else(|| anyhow!("빈 로짓"))
+        self.picks(&h.narrow(0, n - 1, 1)?, true)?.into_iter().next().ok_or_else(|| anyhow!("빈 로짓"))
+    }
+
+    /// teacher forcing: 행 i 의 다음 토큰이 `targets[i]` 일 때의 (음의 로그 확률, 1위 토큰). 전체 어휘 소프트맥스입니다.
+    pub fn score(&self, h: &Tensor, targets: &[u32]) -> Result<Vec<(f32, u32)>> {
+        head::score(self.output, "output.weight", self.head, &self.normed(h)?, targets)
     }
 }
 
@@ -320,7 +404,7 @@ mod tests {
 
     impl Mini {
         fn dec(&self) -> Decoder<'_> {
-            Decoder { cfg: &self.cfg, blocks: &self.blocks, output: &self.output }
+            Decoder { cfg: &self.cfg, blocks: &self.blocks, output: &self.output, head: None }
         }
 
         fn embed(&self, n: usize, seed: u64) -> Tensor {
@@ -377,7 +461,7 @@ mod tests {
                 cache.commit(&kv, 1)?;
                 h = Some(y);
             }
-            let logits = dec.last_logits(&h.expect("마지막 은닉 상태"))?;
+            let logits = dec.logits(&h.expect("마지막 은닉 상태"))?.pop().expect("마지막 행");
             Ok(Tensor::from_vec(logits, m.cfg.vocab, &Device::Cpu)?)
         };
         let device = accel::test_gpu();
