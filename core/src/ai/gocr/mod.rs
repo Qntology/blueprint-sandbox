@@ -29,7 +29,7 @@ use super::gguf_model::{load_active, load_active_on};
 use super::head::HeadMap;
 use super::kv_turbo::{self, KvShape};
 use super::ocr::{LanguageDecoder, LanguageWeights, OcrEngine, PhaseCtx, VisionEncoder};
-use super::residency::{headroom_bytes, Loaded, SharedResidency};
+use super::residency::{headroom_bytes, Group, Loaded, SharedResidency};
 use super::speculative::{decode, BlockDiffusion, BlockModel, DecodeOptions, Pick};
 use super::tokenizer::ModelTokenizer;
 use super::weights::WeightFile;
@@ -40,6 +40,7 @@ pub const TEXT_PROMPT: &str = "Text Recognition:";
 const MAX_BATCH_PATCHES: usize = 4096;
 
 /// 인식할 이미지 하나
+#[derive(Clone)]
 pub struct GocrInput {
     pub image: PreparedImage,
     pub prompt: String,
@@ -160,8 +161,13 @@ pub struct GocrLanguage {
     max_tokens: usize,
     diffusion: Option<BlockDiffusion>,
     strategy: Strategy,
-    /// 잘라 둔 출력 투영의 행 번호 (피라미드 파일, `ai::pyramid`)
-    head: Option<HeadMap>,
+    /// 잘라 낸 출력 투영의 행 번호 (`ai::trim`: 피라미드 파일의 남긴 행, 또는 실행 중 행 보기). 문서 언어를 알면 바꿉니다 ([`GocrEngine::retrim`]).
+    head: std::sync::RwLock<Option<Arc<HeadMap>>>,
+    /// 남길 행을 고르는 데 쓰는 것 (규칙 · 파일의 기준 행)
+    trim: super::trim::HeadSource,
+    /// 문서 하나(출력 투영 다시 자르기 → 조각 판독)를 통째로 묶는 잠금. 두 문서를 동시에 읽으면 한 문서가 자른 행으로 다른 문서를
+    /// 읽고, 상주 관리자가 올린 출력 묶음과 행 번호표가 어긋날 수 있었습니다 (`GocrEngine::recognize_document` · `retrim`).
+    run: std::sync::Mutex<()>,
 }
 
 /// 프리필 입력: 임베딩과 위치
@@ -220,7 +226,7 @@ impl GocrLanguage {
 
     /// 디코더 (언어 단계의 가중치로)
     pub fn decoder<'a>(&'a self, weights: &'a LanguageWeights) -> Decoder<'a> {
-        Decoder { cfg: &self.cfg, blocks: &weights.blocks, output: &weights.output, head: self.head.as_ref() }
+        Decoder { cfg: &self.cfg, blocks: &weights.blocks, output: &weights.output, head: self.head() }
     }
 
     pub fn tokenizer(&self) -> &ModelTokenizer {
@@ -232,9 +238,18 @@ impl GocrLanguage {
         self.cfg.eos[0]
     }
 
-    /// 출력 투영을 잘라 둔 파일인가
-    pub fn head(&self) -> Option<&HeadMap> {
-        self.head.as_ref()
+    /// 지금의 잘라 낸 출력 투영 (없으면 전체 어휘)
+    pub fn head(&self) -> Option<Arc<HeadMap>> {
+        self.head.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// 문서 언어로 남길 행을 다시 고릅니다 (`ai::trim`). 바뀌면 `true` — 출력 묶음을 다시 올려야 합니다.
+    fn retrim(&self, langs: super::trim::Langs) -> Result<bool> {
+        let next = self.trim.head_for(&self.file, &self.tokenizer, self.cfg.vocab, langs)?;
+        let mut cur = self.head.write().unwrap_or_else(|p| p.into_inner());
+        let changed = cur.as_ref().map(|h| &h.kept) != next.as_ref().map(|h| &h.kept);
+        *cur = next.map(Arc::new);
+        Ok(changed)
     }
 
     /// 프리필을 계산하고 디코딩을 시작합니다. `free` 는 가중치를 올린 뒤의 장치 여유 메모리입니다.
@@ -249,8 +264,7 @@ impl GocrLanguage {
         let first = dec.last_pick(&h)?;
         let prefill_ms = t.elapsed().as_secs_f64() * 1e3;
         let t = Instant::now();
-        let full_draft = picks_cut(self.head.as_ref(), &[first]);
-        let mut session = Session { lang: self, dec, cache, next_pos: p.next_pos, device, pending: None, full_draft };
+        let mut session = Session { lang: self, dec, cache, next_pos: p.next_pos, device, pending: None };
         let opts = DecodeOptions {
             eos: &self.cfg.eos,
             max_tokens: self.max_tokens,
@@ -377,11 +391,6 @@ fn char_confidences(chars: usize, tokens: &[u32], confs: &[f32], decode: impl Fn
     Ok(out)
 }
 
-/// 검증 · 프리필이 고른 토큰 가운데 잘린 행의 것이 있는가 ([`Session::full_draft`])
-fn picks_cut(head: Option<&HeadMap>, picks: &[Pick]) -> bool {
-    head.is_some_and(|m| picks.iter().any(|p| m.is_cut(p.token)))
-}
-
 /// 디코더 · 캐시를 [`BlockModel`] 로 묶습니다.
 struct Session<'a> {
     lang: &'a GocrLanguage,
@@ -390,10 +399,6 @@ struct Session<'a> {
     next_pos: u32,
     device: &'a Device,
     pending: Option<PendingKv>,
-    /// 블록 초안도 잘린 행을 볼지. 남긴 행은 한국어 · 영어 도메인 글 위주라, 검증이 잘린 행의 토큰을 한 번 고르면
-    /// (가나 · 아랍 문자 · 체코어 발음 기호 등) 그 조각의 남은 초안은 전체 어휘로 고릅니다. 글은 검증이 정하므로 같고 속도만 달라집니다
-    /// (`docs/verification.md` 15절: 잘린 행을 보지 않는 초안은 12개 언어 조각에서 43 → 53 s).
-    full_draft: bool,
 }
 
 impl Session<'_> {
@@ -404,9 +409,9 @@ impl Session<'_> {
     fn run(&self, ids: &[u32], mode: AttnMode) -> Result<(Vec<Pick>, PendingKv)> {
         let x = self.lang.embed(ids, self.device)?;
         let (h, kv) = self.dec.forward(&self.cache, &x, &self.positions(ids.len()), mode)?;
-        // 로짓은 이미 CPU 행이라 상위 셋을 뽑는 비용은 1위만 뽑을 때와 같은 한 번 훑기입니다.
-        // 블록 초안은 검증이 뒤따르므로 잘린 행을 보지 않습니다 (gravity-ocr 와 같음, `full_draft` 가 아니면). 검증은 늘 봅니다.
-        let top = self.dec.picks(&h, mode == AttnMode::Causal || self.full_draft)?;
+        // 로짓은 이미 CPU 행이라 상위 셋을 뽑는 비용은 1위만 뽑을 때와 같은 한 번 훑기입니다. 초안 · 검증 모두 남긴 행만 봅니다.
+        let _ = mode;
+        let top = self.dec.picks(&h)?;
         Ok((top, kv))
     }
 }
@@ -422,7 +427,6 @@ impl BlockModel for Session<'_> {
     fn verify(&mut self, candidates: &[u32]) -> Result<Vec<Pick>> {
         let (top, kv) = self.run(candidates, AttnMode::Causal)?;
         self.pending = Some(kv);
-        self.full_draft |= picks_cut(self.lang.head.as_ref(), &top);
         Ok(top)
     }
 
@@ -449,6 +453,54 @@ impl GocrEngine {
     /// teacher forcing 진단: 입력마다 [`GocrLanguage::score`]. 비전 → 언어 단계 전환은 인식과 같습니다.
     pub fn score(&self, inputs: &[GocrInput], targets: &[Vec<u32>]) -> Result<Vec<Vec<(f32, u32)>>> {
         self.run(inputs, |i, lang, ctx, weights, f| lang.score(&lang.decoder(weights), &f, &targets[i], ctx.residency.device()))
+    }
+
+    /// 🌟 [DOC LANG] 문서 언어로 출력 투영을 다시 자릅니다 (`ai::trim`). 바뀌면 올라와 있는 출력 묶음을 내려, 다음 언어 단계가
+    /// 새 행을 올리게 합니다. 언어를 미리 모르는 이미지 문서는 첫 판독 글로 [`super::trim::Langs::decisive`] 를 구해 부릅니다.
+    pub fn retrim(&self, langs: super::trim::Langs) -> Result<bool> {
+        let _run = self.decoder().run.lock().unwrap_or_else(|p| p.into_inner());
+        self.retrim_held(langs)
+    }
+
+    /// [`Self::retrim`] 의 본체 (생성 잠금을 쥔 쪽에서 부릅니다)
+    fn retrim_held(&self, langs: super::trim::Langs) -> Result<bool> {
+        let changed = self.decoder().retrim(langs)?;
+        if changed {
+            let mut res = self.residency().lock().unwrap_or_else(|p| p.into_inner());
+            res.release(Group::Output)?;
+        }
+        Ok(changed)
+    }
+
+    /// 🌟 [DOC LANG] 한 문서의 조각들을 읽습니다. 이미지 문서는 언어를 미리 모르므로 `BLUEPRINT_TRIM_LANGS=auto` 면 첫 조각을 12 개 언어의
+    /// 행으로 읽고, 그 글에 라틴 밖 글자가 있으면 그 언어(현지 언어 + 영어)로 다시 잘라 나머지를 읽습니다. `auto` 가 아니면 [`Self::recognize`] 그대로입니다.
+    pub fn recognize_document(&self, inputs: &[GocrInput]) -> Result<Vec<OcrOutput>> {
+        let _run = self.decoder().run.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.trim_auto() {
+            return self.recognize(inputs);
+        }
+        // 새 문서는 12 개 언어의 행으로 시작합니다 (앞 문서의 언어로 잘린 행을 이어 쓰지 않음, 조각이 하나여도)
+        self.retrim_held(super::trim::Langs::all())?;
+        if inputs.len() < 2 {
+            return self.recognize(inputs);
+        }
+        let mut out = self.recognize(&inputs[..1])?;
+        // 첫 조각에 라틴 밖 글자가 있을 때만 그 언어로 자릅니다. 라틴 문자뿐이면 나머지도 12 개 언어의 행으로 읽습니다 (`Langs::decisive`).
+        if let Some(langs) = super::trim::Langs::decisive(&out[0].text) {
+            self.retrim_held(langs)?;
+        }
+        out.extend(self.recognize(&inputs[1..])?);
+        Ok(out)
+    }
+
+    /// `BLUEPRINT_TRIM_LANGS=auto` 인가 (문서 글을 읽은 뒤 언어로 다시 자름)
+    pub fn trim_auto(&self) -> bool {
+        self.decoder().trim.auto
+    }
+
+    /// 지금 남긴 행 수 (자르지 않았으면 전체 어휘)
+    pub fn head_rows(&self) -> usize {
+        self.decoder().head().map_or(self.decoder().cfg.vocab, |h| h.kept.len())
     }
 
     /// 이 엔진이 연 양자화 (`q8` 또는 `pyramid:<배분>`). 비전만 바꾼 배분은 언어 파일이 q8 그대로라 mmproj 에서 읽습니다.
@@ -498,8 +550,10 @@ pub fn open_paths(model_dir: &Path, path: &Path, mmproj: Option<&Path>, residenc
     let batching = std::env::var("BLUEPRINT_VISION_BATCH").map_or(true, |v| v != "0");
     let vision = GocrVision { cfg: Arc::clone(&cfg), batching };
     let diffusion = BlockDiffusion::resolve(&file, model_dir)?.map(|d| d.validate(cfg.vocab)).transpose()?;
-    let head = HeadMap::from_file(&file, "gocr", cfg.vocab)?;
-    let language = GocrLanguage { cfg, file: Arc::clone(&file), tokenizer, max_tokens, diffusion, strategy, head };
+    // 🌟 [VOCAB TRIM] 파일이 잘라 둔 출력 투영(남긴 행만)이면 그 행이 기준이고, 실행 규칙(`BLUEPRINT_TRIM` · `BLUEPRINT_TRIM_LANGS`)으로 더 줄입니다.
+    let trim = super::trim::HeadSource::from_env("gocr", "output.weight", HeadMap::from_file(&file, "gocr", cfg.vocab)?)?;
+    let head = trim.head_for(&file, &tokenizer, cfg.vocab, trim.langs)?.map(Arc::new);
+    let language = GocrLanguage { cfg, file: Arc::clone(&file), tokenizer, max_tokens, diffusion, strategy, head: std::sync::RwLock::new(head), trim, run: std::sync::Mutex::new(()) };
     let engine = OcrEngine::from_file(file, residency, vision, language)?.with_prepare(vision::PREPARE);
     let engine = match mmproj {
         Some(p) => engine.with_mmproj(Arc::new(WeightFile::open(p)?)),
@@ -566,11 +620,4 @@ mod tests {
         assert!(alt_pieces("2 입!", &[0, 1, 2], &[0.99, 0.55, 0.98], &alts, tb).is_empty());
     }
 
-    #[test]
-    fn a_cut_token_chosen_by_the_verify_pass_turns_on_full_vocabulary_drafts() {
-        let map = HeadMap { kept_name: "output.weight", kept: vec![0, 1, 5], rest_name: crate::ai::residency::OUTPUT_REST, rest: vec![2, 3, 4] };
-        assert!(!picks_cut(Some(&map), &[Pick::new(0, 0.9), Pick::new(5, 0.8)]), "남긴 행만이면 초안은 남긴 행으로");
-        assert!(picks_cut(Some(&map), &[Pick::new(0, 0.9), Pick::new(3, 0.8)]));
-        assert!(!picks_cut(None, &[Pick::new(3, 0.8)]), "자르지 않은 파일은 초안도 늘 전체 어휘");
-    }
 }

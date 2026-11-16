@@ -408,8 +408,10 @@ pub struct ZoroModel {
     diffusion: Option<BlockDiffusion>,
     /// 장치 커널이 없을 때 쓰는 선형 주의 작은 텐서(층당 약 130 KB)의 CPU 사본. 가중치 상주와 별개로 RAM 에 남습니다.
     host: Mutex<HashMap<usize, Arc<GdnWeights>>>,
-    /// 피라미드 파일의 따로 둔 출력 투영 (`head.weight` · `head_rest.weight`, `ai::pyramid`). 없으면 묶인 임베딩 표로 곱합니다.
-    head: Option<HeadMap>,
+    /// 🌟 [VOCAB TRIM] 잘라 낸 출력 투영: 묶인 임베딩 표 `token_embd.weight` 에서 남긴 행만의 행 보기 (`ai::trim`, 새 파일 없음).
+    /// 없으면 묶인 임베딩 표 전체로 곱합니다. 문서 언어를 알면 바꿉니다 ([`ZoroModel::retrim`]).
+    head: std::sync::RwLock<Option<Arc<HeadMap>>>,
+    trim: Option<crate::ai::trim::HeadSource>,
 }
 
 impl ZoroModel {
@@ -423,8 +425,49 @@ impl ZoroModel {
         };
         let plan = plan_phases(&cfg, &file, &device, budget, mode)?;
         let diffusion = BlockDiffusion::from_file(&file)?.map(|d| d.validate(cfg.vocab)).transpose()?;
-        let head = HeadMap::from_file(&file, "zoro", cfg.vocab)?;
-        Ok(Self { cfg, spec, residency, plan, diffusion, host: Mutex::new(HashMap::new()), head })
+        let head = HeadMap::from_file(&file, "zoro", cfg.vocab)?.map(Arc::new);
+        Ok(Self { cfg, spec, residency, plan, diffusion, host: Mutex::new(HashMap::new()), head: std::sync::RwLock::new(head), trim: None })
+    }
+
+    /// 🌟 [VOCAB TRIM] 출력 투영을 잘라 냅니다 (`BLUEPRINT_TRIM` · `BLUEPRINT_TRIM_LANGS`, 기본 `full` · 문서 언어 자동).
+    /// 묶인 임베딩 표에서 남긴 행만 행 보기로 두므로 파일은 그대로이고, 글쓰기 때 그 행만 장치에 올라옵니다.
+    pub fn with_trim(mut self, tokenizer: &crate::ai::tokenizer::ModelTokenizer) -> Result<Self> {
+        let src = crate::ai::trim::HeadSource::from_env("zoro", "token_embd.weight", None)?;
+        let head = src.head_for(&self.spec.file, tokenizer, self.cfg.vocab, src.langs)?.map(Arc::new);
+        *self.head.write().unwrap_or_else(|p| p.into_inner()) = head;
+        self.trim = Some(src);
+        Ok(self)
+    }
+
+    /// 🌟 [DOC LANG] 문서 언어로 출력 투영을 다시 자릅니다. 바뀌면 올라와 있는 출력 투영 묶음을 내립니다.
+    pub fn retrim(&self, tokenizer: &crate::ai::tokenizer::ModelTokenizer, langs: crate::ai::trim::Langs) -> Result<bool> {
+        let Some(src) = &self.trim else { return Ok(false) };
+        let next = src.head_for(&self.spec.file, tokenizer, self.cfg.vocab, langs)?;
+        let changed = {
+            let mut cur = self.head.write().unwrap_or_else(|p| p.into_inner());
+            let changed = cur.as_ref().map(|h| &h.kept) != next.as_ref().map(|h| &h.kept);
+            *cur = next.map(Arc::new);
+            changed
+        };
+        if changed {
+            let mut res = self.residency.lock().unwrap_or_else(|p| p.into_inner());
+            res.release(Group::Head)?;
+        }
+        Ok(changed)
+    }
+
+    /// `BLUEPRINT_TRIM_LANGS=auto` 인가
+    pub fn trim_auto(&self) -> bool {
+        self.trim.as_ref().is_some_and(|t| t.auto)
+    }
+
+    /// 지금 남긴 행 수 (자르지 않았으면 전체 어휘)
+    pub fn head_rows(&self) -> usize {
+        self.current_head().map_or(self.cfg.vocab, |h| h.kept.len())
+    }
+
+    fn current_head(&self) -> Option<Arc<HeadMap>> {
+        self.head.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// 올릴 때 이 배분으로 다시 양자화합니다 (정밀도 배분 측정용, [`ModelSpec::with_requant`]).
@@ -433,9 +476,9 @@ impl ZoroModel {
         self
     }
 
-    /// 출력 투영을 잘라 둔 피라미드 파일인가
-    pub fn head(&self) -> Option<&HeadMap> {
-        self.head.as_ref()
+    /// 지금의 잘라 낸 출력 투영 (없으면 묶인 임베딩 표 전체)
+    pub fn head(&self) -> Option<Arc<HeadMap>> {
+        self.current_head()
     }
 
     /// 다시 양자화할 때 이 중요도 행렬을 씁니다.
@@ -567,17 +610,18 @@ impl ZoroModel {
         self.spec.announce(&self.generation_phase());
     }
 
-    /// 글쓰기에 쓰는 묶음: 텍스트 블록 전부 · 출력 정규화 · 출력 투영. 출력 투영은 임베딩 표(묶임) 전체이고,
-    /// 피라미드 파일이면 따로 둔 출력 투영(남긴 행 · 잘린 행, `Group::Head`)입니다.
+    /// 글쓰기에 쓰는 묶음: 텍스트 블록 전부 · 출력 정규화 · 출력 투영. 출력 투영은 잘라 냈으면 남긴 행의 행 보기(`Group::Head`),
+    /// 아니면 묶인 임베딩 표 전체(`Group::Embedding`)입니다.
     pub fn generation_phase(&self) -> Phase {
-        let projection = if self.head.is_some() { Group::Head } else { Group::Embedding };
+        let projection = if self.current_head().is_some() { Group::Head } else { Group::Embedding };
         Phase::new("zoro:글쓰기", [Group::blocks(0..self.cfg.n_layers), Group::Output, projection])
     }
 
     /// 정규화한 은닉 상태의 행마다 다음 토큰과 확률. `table` 은 글쓰기 단계의 출력 투영 묶음입니다.
     fn next_tokens(&self, table: &Loaded, h: &Tensor) -> Result<Vec<(u32, f32)>> {
-        let l = head::logits(table, "token_embd.weight", self.head.as_ref(), &h.contiguous()?, true)?;
-        Ok(l.rows.iter().zip(l.rest).map(|(row, rest)| head::top1(row, rest, self.head.as_ref())).collect())
+        let map = self.current_head();
+        let rows = head::logits(table, "token_embd.weight", map.as_deref(), &h.contiguous()?)?;
+        Ok(rows.iter().map(|row| head::top1(row, map.as_deref())).collect())
     }
 
     /// teacher forcing 진단: 프롬프트 뒤에 `targets` 를 한 번에 읽어, 자리마다 (그 토큰의 음의 로그 확률, 모델의 1위 토큰).
@@ -596,7 +640,7 @@ impl ZoroModel {
         let mut state = self.new_state();
         let h = self.advance(blocks, output, &device, &mut state, &ids)?;
         let rows = h.narrow(0, prompt.len() - 1, targets.len())?.contiguous()?;
-        head::score(table, "token_embd.weight", self.head.as_ref(), &rows, targets)
+        head::score(table, "token_embd.weight", self.current_head().as_deref(), &rows, targets)
     }
 
     pub fn new_state(&self) -> ZoroState {

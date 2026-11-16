@@ -8,9 +8,9 @@
 //! - 배분: gravity-ocr-qsa-ngram 이 같은 모델(GravityOCR-KO)의 53개 묶음 × 6개 형식을 teacher forcing ΔNLL 로 재서 정한 것([`GOCR_MEASURED`])과
 //!   비전 16 ~ 22 층 · downsample · merger 보호 규칙, Zoro-1 의 보호 규칙([`ZORO_SPEC`]). 커널이 다르므로 이 엔진에서 다시 재서 고릅니다
 //!   (`examples/quant_screen.rs`, `docs/verification.md` 15절). 정규화 · 편향 · 패치 임베딩(합성곱)은 저장된 그대로 둡니다.
-//! - 출력 투영 잘라 두기([`HeadPlan`]): 쓰는 글자의 행(특수 토큰 · 한글 · 바이트 조각 · 표 태그 · 도면 영어 · 원장 글)을
-//!   `output.weight` 로, 나머지 행을 `output_rest.weight` 로 나누고 남긴 행의 번호를 `<구조>.head.ids` 에 둡니다.
-//!   디코딩은 남긴 행으로 고르고, 잘린 행의 최댓값이 이기면 그 토큰을 씁니다 (잘린 행 검사, gravity-ocr 의 `PRESSURE` → `RESSURE` 결함).
+//! - 출력 투영 잘라 내기([`HeadPlan`], `ai::trim`): 출력 투영을 따로 둔 모델(gocr)은 남길 행(바이트 폴백 · 특수 · ASCII · 지원 언어 문자
+//!   체계 전부 · 도메인 글 · 상위 한자)만 `output.weight` 로 쓰고 그 번호를 `<구조>.head.ids` 에 둡니다. 잘린 행은 버립니다
+//!   (예전 `output_rest.weight` 없음). 묶인 임베딩 모델(zoro)은 파일을 더 만들지 않고 실행할 때 행 보기로 자릅니다.
 //!
 //! 만든 파일은 모델 폴더에 두고 `active.json` 의 `pyramid` 에 적습니다 (배분 · 재료 · [`RECIPE`]). 레시피가 바뀌면 앱이 다시 만듭니다
 //! ([`ensure`], 사용할 때 양자화). 엔진은 K 형식을 장치에서 곱하는 백엔드(ROCm · CUDA · Metal · CPU)에서만 이 파일을 엽니다.
@@ -27,7 +27,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use candle_core::quantized::gguf_file::Value;
 use candle_core::quantized::GgmlDType;
 use candle_core::Device;
-use rayon::prelude::*;
 use serde_json::json;
 
 use super::kquant;
@@ -42,8 +41,10 @@ pub const META_PLAN: &str = "blueprint.pyramid.plan";
 pub const META_SOURCE: &str = "blueprint.pyramid.source";
 pub const META_RECIPE: &str = "blueprint.pyramid.recipe";
 /// 인코더 · 배분 규칙의 번호. 바꾸면 앱이 피라미드 파일을 다시 만듭니다 ([`ensure`]).
-/// 1: q8 파일에서 다시 양자화(폐기), 2: 원본 BF16 에서 quant.py 척도 탐색으로 한 번 양자화
-pub const RECIPE: u32 = 2;
+/// 1: q8 파일에서 다시 양자화(폐기), 2: 원본 BF16 에서 quant.py 척도 탐색으로 한 번 양자화,
+/// 3: 출력 투영 잘라 내기(`ai::trim`, 잘린 행 버림 · 문자 체계 규칙 · 64 배수),
+/// 4: 한자를 쓰는 언어(ja · zh)면 한자 토큰 전부 (상위 4,096 개만이면 일본어 한자가 간체로 바뀜)
+pub const RECIPE: u32 = 4;
 /// 한 번에 읽어 양자화하는 원소 수 (메모리를 묶어 둠)
 const CHUNK_ELEMS: usize = 1 << 22;
 const ALIGN: u64 = 32;
@@ -343,12 +344,10 @@ pub fn write_gguf(path: &Path, metadata: &[(String, Value)], tensors: Vec<OutTen
 /// 텐서 이름 → 형식 (`None` 이면 저장된 그대로)
 pub type Rule = fn(&str) -> Option<GgmlDType>;
 
-/// 출력 투영 잘라 두기: 남길 행 수와 두 부분의 형식
+/// 출력 투영 잘라 내기: 남긴 행의 형식 (남길 행은 `ai::trim` 의 [`TrimRule::Full`] · 12 개 언어)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeadPlan {
-    pub budget: usize,
     pub kept: GgmlDType,
-    pub rest: GgmlDType,
 }
 
 /// 모델 하나의 배분
@@ -481,10 +480,10 @@ fn gocr_text_f32_all(name: &str) -> Option<GgmlDType> {
     gocr_text_f32(name)
 }
 
-/// gocr 출력 투영: 16,384 행 (gravity-ocr 슬라이스 v4 와 같은 크기), 남긴 행 Q5_K · 잘린 행 Q4_K (gravity-ocr 패키지와 같은 구성)
-pub const GOCR_HEAD: HeadPlan = HeadPlan { budget: 16_384, kept: Q5K, rest: Q4K };
-/// gocr 출력 투영을 정밀도 손실 없이 자르기만: 두 부분 모두 Q8_0
-pub const GOCR_HEAD_Q8: HeadPlan = HeadPlan { budget: 16_384, kept: Q8_0, rest: Q8_0 };
+/// gocr 출력 투영: 남긴 행 Q5_K (gravity-ocr 패키지와 같은 형식)
+pub const GOCR_HEAD: HeadPlan = HeadPlan { kept: Q5K };
+/// gocr 출력 투영을 정밀도 손실 없이 잘라 내기만: 남긴 행 Q8_0 (q8 파일의 행 그대로)
+pub const GOCR_HEAD_Q8: HeadPlan = HeadPlan { kept: Q8_0 };
 
 /// gocr 배분: 비전만 피라미드(gravity-ocr 측정 배분 + 16 ~ 22 층 · 관문 보호), 언어는 q8 그대로 (비교용, 정확도 손실로 기본 아님)
 pub const GOCR_VISION: Plan = Plan { name: "vision", text: keep, vision: gocr_vision, head: None };
@@ -550,19 +549,12 @@ fn zoro_spec_text(name: &str) -> Option<GgmlDType> {
     zoro_type(ZORO_SPEC, ZORO_LAYERS, name)
 }
 
-/// Zoro-1 출력 투영 (묶인 임베딩 248,078 행): 남긴 행 32,768 (Q8_0) · 잘린 행 Q4_K. 입력 임베딩은 파일에서 행만 읽으므로 그대로입니다.
-pub const ZORO_HEAD: HeadPlan = HeadPlan { budget: 32_768, kept: Q8_0, rest: Q4K };
-/// Zoro-1 출력 투영을 정밀도 손실 없이 자르기만 (두 부분 모두 q8 파일의 Q8_0 행 그대로)
-pub const ZORO_HEAD_Q8: HeadPlan = HeadPlan { budget: 32_768, kept: Q8_0, rest: Q8_0 };
-
 /// 이름으로 고르는 Zoro-1 배분. 비전(mmproj)은 원본 BF16 그대로 둡니다 (Zoro-1 비전은 다국어 판독 경로에서만 올라옴).
 pub fn zoro_plan(name: &str) -> Option<Plan> {
     let p = |name, text: Rule, head| Plan { name, text, vision: keep, head };
     Some(match name {
         "q8" => p("q8", keep, None),
         "zoro-spec" => p("zoro-spec", zoro_spec_text, None),
-        "zoro-spec+head" => p("zoro-spec+head", zoro_spec_text, Some(ZORO_HEAD)),
-        "q8-head" => p("q8-head", keep, Some(ZORO_HEAD_Q8)),
         _ => return None,
     })
 }
@@ -688,193 +680,6 @@ fn thousands(v: f64) -> String {
     format!("{grouped}.{frac}")
 }
 
-/// 토큰 종류 (slice v4 의 `token_class`)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum TokenClass {
-    Special,
-    /// 혼자서는 UTF-8 이 아닌 바이트 조각 (한글 한 글자를 이루는 조각들)
-    Partial,
-    Hangul,
-    Html,
-    Symbol,
-    Greek,
-    Ascii,
-    Cjk,
-    Other,
-}
-
-fn script(c: char) -> u8 {
-    let o = c as u32;
-    if o < 128 {
-        0
-    } else if (0xAC00..=0xD7A3).contains(&o) || (0x1100..=0x11FF).contains(&o) || (0x3130..=0x318F).contains(&o) || (0xA960..=0xA97F).contains(&o) || (0xD7B0..=0xD7FF).contains(&o) {
-        1
-    } else if (0x4E00..=0x9FFF).contains(&o) || (0x3400..=0x4DBF).contains(&o) || (0xF900..=0xFAFF).contains(&o) {
-        2
-    } else if (0x0370..=0x03FF).contains(&o) {
-        3
-    } else if (0x2000..=0x2BFF).contains(&o) || (0x3200..=0x33FF).contains(&o) || (0x3000..=0x303F).contains(&o) || (0xFF00..=0xFFEF).contains(&o) || (0x00A0..=0x00BF).contains(&o) {
-        4
-    } else {
-        5
-    }
-}
-
-fn is_html(s: &str) -> bool {
-    let t = s.trim();
-    if t == ">" || t == "/>" {
-        return true;
-    }
-    ["table", "thead", "tbody", "tr", "td", "th", "br", "caption"].iter().any(|tag| {
-        ["<", "</"].iter().any(|open| {
-            s.match_indices(&format!("{open}{tag}")).any(|(i, m)| {
-                let after = s[i + m.len()..].chars().next();
-                after.is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
-            })
-        })
-    })
-}
-
-pub fn token_class(piece: &[u8], special: bool) -> TokenClass {
-    if special {
-        return TokenClass::Special;
-    }
-    let Ok(s) = std::str::from_utf8(piece) else { return TokenClass::Partial };
-    if s.is_empty() {
-        return TokenClass::Other;
-    }
-    let kinds: BTreeSet<u8> = s.chars().map(script).collect();
-    let within = |allowed: &[u8]| kinds.iter().all(|k| allowed.contains(k));
-    if kinds.contains(&1) {
-        TokenClass::Hangul
-    } else if within(&[0]) {
-        if is_html(s) { TokenClass::Html } else { TokenClass::Ascii }
-    } else if within(&[0, 4]) {
-        TokenClass::Symbol
-    } else if within(&[0, 4, 3]) {
-        TokenClass::Greek
-    } else if within(&[0, 4, 2]) {
-        TokenClass::Cjk
-    } else {
-        TokenClass::Other
-    }
-}
-
-/// ` ?[A-Z0-9]+` (설비 코드 · 대문자 영어 조각)
-fn caps_piece(b: &[u8]) -> bool {
-    let body = b.strip_prefix(b" ").unwrap_or(b);
-    !body.is_empty() && body.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-}
-
-/// `[0-9 \n.,:;\-/()%+=#&*'"!?]+` 이면서 띄어쓰기 셋이 이어지지 않음 (본문 · 숫자의 구두점)
-fn text_punct(b: &[u8]) -> bool {
-    !b.is_empty() && b.iter().all(|c| c.is_ascii_digit() || b" \n.,:;-/()%+=#&*'\"!?".contains(c)) && !b.windows(3).any(|w| w == b"   ")
-}
-
-/// ` ?[A-Za-z]+` (영어 낱말 조각)
-fn word_piece(b: &[u8]) -> bool {
-    let body = b.strip_prefix(b" ").unwrap_or(b);
-    !body.is_empty() && body.iter().all(|c| c.is_ascii_alphabetic())
-}
-
-/// 잘라 둔 출력 투영의 남긴 행
-#[derive(Debug, Clone, PartialEq)]
-pub struct HeadSlice {
-    /// 남긴 행의 전체 어휘 번호 (오름차순). `ids[행]` 이 그 행의 토큰입니다.
-    pub ids: Vec<u32>,
-    /// 단계마다 더한 수 (must · domain · cjk · words · ascii · rest)
-    pub tiers: Vec<(&'static str, usize)>,
-}
-
-impl HeadSlice {
-    /// 남기지 않은 번호 (오름차순): 잘린 행 `output_rest.weight` 의 순서
-    pub fn rest(&self, vocab: usize) -> Vec<u32> {
-        let mut keep = self.ids.iter().peekable();
-        (0..vocab as u32)
-            .filter(|i| {
-                if keep.peek() == Some(&i) {
-                    keep.next();
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect()
-    }
-}
-
-/// 우선순위로 남길 행을 고릅니다: 반드시 남길 것(특수 · 한글 · 바이트 조각 · 표 태그 · 기호 · 그리스 · 한 바이트 · 대문자 · 숫자 조각 · 구두점) →
-/// 도메인 글이 쓰는 토큰 → 자주 쓰는 한자 `cjk_fill` 개 → 영어 낱말 조각 → 나머지 ASCII → 나머지, 각 단계 안은 번호 순(BPE 병합 순 = 빈도 순).
-pub fn slice_head(vocab: usize, tokenizer: &ModelTokenizer, corpus: &[String], budget: usize, cjk_fill: usize) -> Result<HeadSlice> {
-    if vocab < budget {
-        bail!("어휘 {vocab} 가 남길 행 {budget} 보다 작습니다");
-    }
-    let pieces: Vec<(Vec<u8>, TokenClass)> = (0..vocab as u32)
-        .into_par_iter()
-        .map(|i| {
-            let special = tokenizer.is_added(i);
-            let piece = tokenizer.token_bytes(i).unwrap_or_default();
-            let class = token_class(&piece, special);
-            (piece, class)
-        })
-        .collect();
-    let mut keep: BTreeSet<u32> = BTreeSet::new();
-    let mut tiers = Vec::new();
-    let mut add = |name: &'static str, ids: Vec<u32>, keep: &mut BTreeSet<u32>| {
-        let before = keep.len();
-        for i in ids {
-            if keep.len() >= budget {
-                break;
-            }
-            keep.insert(i);
-        }
-        tiers.push((name, keep.len() - before));
-    };
-    use TokenClass::*;
-    let ids = |f: &dyn Fn(u32, &[u8], TokenClass) -> bool| -> Vec<u32> { (0..vocab as u32).filter(|&i| f(i, &pieces[i as usize].0, pieces[i as usize].1)).collect() };
-    let must = ids(&|_, p, c| {
-        matches!(c, Special | Hangul | Partial | Html | Symbol | Greek) || p.len() == 1 || (c == Ascii && (caps_piece(p) || text_punct(p)))
-    });
-    add("must", must, &mut keep);
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
-    for text in corpus {
-        seen.extend(tokenizer.encode(text)?.ids.into_iter().filter(|&i| (i as usize) < vocab));
-    }
-    add("domain", seen.into_iter().collect(), &mut keep);
-    let cjk: Vec<u32> = ids(&|i, _, c| c == Cjk && !keep.contains(&i)).into_iter().take(cjk_fill).collect();
-    add("cjk", cjk, &mut keep);
-    let words = ids(&|i, p, c| c == Ascii && !keep.contains(&i) && word_piece(p));
-    add("words", words, &mut keep);
-    let ascii = ids(&|i, _, c| c == Ascii && !keep.contains(&i));
-    add("ascii", ascii, &mut keep);
-    let rest = ids(&|i, _, c| !keep.contains(&i) && matches!(c, Cjk | Other));
-    add("rest", rest, &mut keep);
-    if keep.len() < budget {
-        bail!("남길 행 {budget} 개를 다 채우지 못했습니다 ({}개)", keep.len());
-    }
-    Ok(HeadSlice { ids: keep.into_iter().collect(), tiers })
-}
-
-/// 글들의 토큰 가운데 남긴 행에 든 몫과, 잘린 행에 든 토큰 (빈도순 앞 20개)
-pub fn coverage(tokenizer: &ModelTokenizer, slice: &HeadSlice, texts: &[String]) -> Result<(usize, usize, Vec<(String, usize)>)> {
-    let kept: std::collections::HashSet<u32> = slice.ids.iter().copied().collect();
-    let (mut total, mut missing) = (0usize, 0usize);
-    let mut lost: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-    for t in texts {
-        for id in tokenizer.encode(t)?.ids {
-            total += 1;
-            if !kept.contains(&id) {
-                missing += 1;
-                *lost.entry(id).or_default() += 1;
-            }
-        }
-    }
-    let mut lost: Vec<(String, usize)> = lost.into_iter().map(|(id, n)| (String::from_utf8_lossy(&tokenizer.token_bytes(id).unwrap_or_default()).to_string(), n)).collect();
-    lost.sort_by(|a, b| b.1.cmp(&a.1));
-    lost.truncate(20);
-    Ok((total, missing, lost))
-}
-
 // ---------------------------------------------------------------------------------------------
 // 파일 만들기
 // ---------------------------------------------------------------------------------------------
@@ -898,36 +703,24 @@ pub fn head_source(model: &str) -> &'static str {
 }
 
 /// 한 파일의 텐서 목록을 배분대로 만듭니다. 바꾸는 텐서는 원본(`original`, 없으면 원본 그대로 저장된 값)에서 한 번 양자화하고,
-/// 나머지는 저장된 바이트 그대로 옮깁니다. `head` 가 있으면 `head_source` 텐서를 남긴 행 · 잘린 행으로 나눕니다.
+/// 나머지는 저장된 바이트 그대로 옮깁니다. `head` 가 있으면 `head_source` 텐서(`output.weight`)를 남긴 행만으로 씁니다 (잘린 행은 버림).
 /// `imatrix` 가 있으면 K 형식을 그 열 가중으로 양자화합니다.
-fn plan_file(src: &Arc<WeightFile>, original: Option<&Arc<Original>>, rule: Rule, head: Option<(&str, &HeadSlice, HeadPlan, usize)>, imatrix: Option<&Arc<Imatrix>>) -> Result<Vec<OutTensor>> {
+fn plan_file(src: &Arc<WeightFile>, original: Option<&Arc<Original>>, rule: Rule, head: Option<(&str, &[u32], HeadPlan)>, imatrix: Option<&Arc<Imatrix>>) -> Result<Vec<OutTensor>> {
     let mut out = Vec::new();
     let weights_of = |name: &str, cols: usize| -> Option<Vec<f32>> { imatrix.and_then(|m| m.get(name).cloned()).filter(|w| w.len() == cols) };
     for name in src.names() {
         let meta = src.info(&name)?;
         let (rows, cols) = rows_cols(&meta.dims);
-        if let Some((head_source, slice, plan, vocab)) = head {
+        if let Some((head_source, ids, plan)) = head {
             if name == head_source {
-                // 출력 투영을 따로 둔 모델(gocr)은 그 자리에, 묶인 임베딩 모델(zoro)은 따로 둔 출력 투영 묶음(`Group::Head`)으로 씁니다.
-                let (kept_name, rest_name) = if head_source == "output.weight" {
-                    ("output.weight", super::residency::OUTPUT_REST)
+                // 🌟 [VOCAB TRIM] 남긴 행만 같은 이름(`output.weight`)으로 씁니다. 잘린 행은 파일에 남기지 않습니다.
+                let (f, o, n, w, ids, dtype) = (Arc::clone(src), original.cloned(), name.clone(), weights_of(&name, cols), ids.to_vec(), plan.kept);
+                out.push(if dtype == meta.dtype {
+                    // 저장과 같은 형식이면 저장된 행의 바이트를 그대로 옮깁니다 (다시 양자화하지 않아 원본 없이도 만듦).
+                    OutTensor::new(name.clone(), vec![ids.len(), cols], dtype, move || stored_rows_bytes(&f, &n, &ids))
                 } else {
-                    (super::residency::HEAD_KEPT, super::residency::HEAD_REST)
-                };
-                for (part, ids, dtype) in [(kept_name, slice.ids.clone(), plan.kept), (rest_name, slice.rest(vocab), plan.rest)] {
-                    let (f, o, n, w) = (Arc::clone(src), original.cloned(), name.clone(), weights_of(&name, cols));
-                    out.push(if dtype == meta.dtype {
-                        // 저장과 같은 형식이면 저장된 행의 바이트를 그대로 옮깁니다 (다시 양자화하지 않아 원본 없이도 만듦).
-                        OutTensor::new(part, vec![ids.len(), cols], dtype, move || stored_rows_bytes(&f, &n, &ids))
-                    } else {
-                        OutTensor::new(part, vec![ids.len(), cols], dtype, move || quantize_rows_of(&f, &n, o.as_deref(), &ids, dtype, w.as_deref()))
-                    });
-                }
-                if head_source != "output.weight" {
-                    // 묶인 임베딩(zoro): 입력 임베딩은 파일에서 행만 읽으므로 그대로 둡니다.
-                    let (f, n) = (Arc::clone(src), name.clone());
-                    out.push(OutTensor::new(name.clone(), meta.dims.clone(), meta.dtype, move || Ok(f.raw(&n)?.to_vec())));
-                }
+                    OutTensor::new(name.clone(), vec![ids.len(), cols], dtype, move || quantize_rows_of(&f, &n, o.as_deref(), &ids, dtype, w.as_deref()))
+                });
                 continue;
             }
         }
@@ -1015,9 +808,9 @@ fn record_file(record: &serde_json::Value) -> Result<String> {
     Ok(record["file"].as_str().ok_or_else(|| anyhow!("active.json 에 file 이 없습니다"))?.to_string())
 }
 
-/// 출력 투영 잘라 두기가 다시 양자화를 하는가 (남긴 행 · 잘린 행 중 저장과 다른 형식이 있으면). 같은 형식이면 행만 옮깁니다.
+/// 출력 투영 잘라 내기가 다시 양자화를 하는가 (남긴 행이 저장과 다른 형식이면). 같은 형식이면 행만 옮깁니다.
 fn head_requantizes(file: &WeightFile, model: &str, hp: &HeadPlan) -> bool {
-    file.info(head_source(model)).map_or(true, |m| hp.kept != m.dtype || hp.rest != m.dtype)
+    file.info(head_source(model)).map_or(true, |m| hp.kept != m.dtype)
 }
 
 /// 이 배분을 만들려면 원본 BF16 (safetensors) 이 꼭 있어야 하는가: 바꾸는 텐서 중 저장 형식이 양자화된 것이 있으면 그렇습니다.
@@ -1064,13 +857,16 @@ pub fn build(model_dir: &Path, model: &str, plan: &Plan, corpus: &[String], imat
     let head = match plan.head {
         Some(hp) => {
             let source = head_source(model);
+            if source != "output.weight" {
+                bail!("{model} 은 묶인 임베딩이라 출력 투영을 파일로 자르지 않습니다 (실행할 때 행 보기, ai::trim)");
+            }
             let vocab = src.info(source)?.dims[0];
             let tokenizer = ModelTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
-            let slice = slice_head(vocab, &tokenizer, corpus, hp.budget, 1024)?;
-            let (total, missing, _) = coverage(&tokenizer, &slice, corpus)?;
-            log(&format!("[피라미드] 출력 투영 {vocab} 행 → 남김 {} ({:?}), 도메인 글 토큰 {total} 중 잘린 행 {missing}", slice.ids.len(), slice.tiers));
-            extra.push((format!("{arch}.head.ids"), Value::Array(slice.ids.iter().map(|&i| Value::U32(i)).collect())));
-            Some((source, slice, hp, vocab))
+            let kept = super::trim::select(vocab, &tokenizer, corpus, super::trim::TrimRule::Full, super::trim::Langs::all(), None)?;
+            let (total, missing) = super::trim::coverage(&tokenizer, &kept.ids, corpus)?;
+            log(&format!("[피라미드] 출력 투영 {vocab} 행 → 남김 {}, 도메인 글 토큰 {total} 중 잘린 행 {missing}", kept.summary()));
+            extra.push((format!("{arch}.head.ids"), Value::Array(kept.ids.iter().map(|&i| Value::U32(i)).collect())));
+            Some((source, kept.ids, hp))
         }
         None => None,
     };
@@ -1081,7 +877,7 @@ pub fn build(model_dir: &Path, model: &str, plan: &Plan, corpus: &[String], imat
         log(&format!("[피라미드] 언어는 그대로입니다 ({file_name})"));
         file_name.clone()
     } else {
-        let tensors = plan_file(&src, original.as_ref(), plan.text, head.as_ref().map(|(s, sl, hp, v)| (*s, sl, *hp, *v)), imatrix.as_ref())?;
+        let tensors = plan_file(&src, original.as_ref(), plan.text, head.as_ref().map(|(s, ids, hp)| (*s, ids.as_slice(), *hp)), imatrix.as_ref())?;
         let types = by_type(&tensors);
         let path = dest.join(format!("{stem}-pyramid.gguf"));
         log(&format!("[피라미드] {} 쓰는 중 ({} 텐서)", path.display(), tensors.len()));
@@ -1268,7 +1064,7 @@ pub fn ensure(models_dir: &Path, device: &Device, log: &mut dyn FnMut(&str)) -> 
         let imatrix = dir.join("imatrix.bin");
         let imatrix = if imatrix.exists() { Some(Arc::new(load_imatrix(&imatrix)?)) } else { None };
         log(&format!("[피라미드] {model} 파일을 만듭니다 ({plan_name}, 레시피 {RECIPE})"));
-        build(&dir, model, &plan, &corpus(model == "zoro"), imatrix, None, log)?;
+        build(&dir, model, &plan, &corpus(true), imatrix, None, log)?;
     }
     Ok(())
 }
@@ -1380,48 +1176,30 @@ mod tests {
     }
 
     #[test]
-    fn head_rows_split_into_kept_and_rest_in_id_order() -> Result<()> {
+    fn a_trimmed_head_keeps_only_its_rows_and_no_rest_tensor() -> Result<()> {
         let dir = TempDir::new("pyr-head");
         let (src, original, _) = sample(&dir);
-        let slice = HeadSlice { ids: vec![1, 4, 7], tiers: vec![] };
-        assert_eq!(slice.rest(10), vec![0, 2, 3, 5, 6, 8, 9]);
-        let hp = HeadPlan { budget: 3, kept: Q8_0, rest: Q4K };
-        let tensors = plan_file(&src, Some(&original), keep, Some(("output.weight", &slice, hp, 10)), None)?;
+        let ids = [1u32, 4, 7];
+        let hp = HeadPlan { kept: Q4K };
+        let tensors = plan_file(&src, Some(&original), keep, Some(("output.weight", &ids, hp)), None)?;
         let out = dir.0.join("head.gguf");
         write_gguf(&out, &metadata_with(&src, vec![]), tensors)?;
         let f = WeightFile::open(&out)?;
         assert_eq!(f.info("output.weight")?.dims, vec![3, 256]);
-        assert_eq!(f.info(crate::ai::residency::OUTPUT_REST)?.dims, vec![7, 256]);
+        assert!(!f.has("output_rest.weight"), "잘린 행은 파일에 남기지 않습니다");
         let kept = stored_gather(&f, "output.weight", &[0, 1, 2])?;
         let want = original.gather("output.weight", &[1, 4, 7])?;
-        assert!(kquant::rel(&kept, &want) < 0.01, "남긴 행은 원본 행의 Q8_0");
-        // 저장과 같은 형식(Q8_0)인 남긴 행은 다시 양자화하지 않고 저장된 행의 바이트를 그대로 옮깁니다.
-        assert_eq!(f.raw("output.weight")?, stored_rows_bytes(&src, "output.weight", &[1, 4, 7])?.as_slice());
-        // 원본이 없어도 Q8_0 그대로 나누기는 됩니다 (잘린 행도 Q8_0 일 때).
-        let same = HeadPlan { budget: 3, kept: Q8_0, rest: Q8_0 };
-        let tensors = plan_file(&src, None, keep, Some(("output.weight", &slice, same, 10)), None)?;
+        assert!(kquant::rel(&kept, &want) < 0.12, "남긴 행은 원본 행의 Q4_K");
+        // 저장과 같은 형식(Q8_0)이면 다시 양자화하지 않고 저장된 행의 바이트를 그대로 옮깁니다 (원본 없이도).
+        let same = HeadPlan { kept: Q8_0 };
+        let tensors = plan_file(&src, None, keep, Some(("output.weight", &ids, same)), None)?;
         let out = dir.0.join("head_q8.gguf");
         write_gguf(&out, &metadata_with(&src, vec![]), tensors)?;
         let g = WeightFile::open(&out)?;
-        assert_eq!(g.raw(crate::ai::residency::OUTPUT_REST)?, stored_rows_bytes(&src, "output.weight", &slice.rest(10))?.as_slice());
+        assert_eq!(g.raw("output.weight")?, stored_rows_bytes(&src, "output.weight", &ids)?.as_slice());
         assert!(!head_requantizes(&src, "gocr", &same) && head_requantizes(&src, "gocr", &hp));
-        Ok(())
-    }
-
-    #[test]
-    fn token_classes_follow_slice_v4() {
-        assert_eq!(token_class("한".as_bytes(), false), TokenClass::Hangul);
-        assert_eq!(token_class(&[0xEC, 0x9E], false), TokenClass::Partial);
-        assert_eq!(token_class(b"</td>", false), TokenClass::Html);
-        assert_eq!(token_class(b"<tdx", false), TokenClass::Ascii);
-        assert_eq!(token_class(b" PRESS", false), TokenClass::Ascii);
-        assert!(caps_piece(b" PRESS") && caps_piece(b"10LAB") && !caps_piece(b"Press"));
-        assert_eq!(token_class("μm".as_bytes(), false), TokenClass::Greek);
-        assert_eq!(token_class("℃".as_bytes(), false), TokenClass::Symbol);
-        assert_eq!(token_class("給水".as_bytes(), false), TokenClass::Cjk);
-        assert_eq!(token_class("Привет".as_bytes(), false), TokenClass::Other);
-        assert!(text_punct(b", ") && !text_punct(b"   ") && word_piece(b" valve") && !word_piece(b"v2"));
         assert_eq!(thousands(1234.56), "1,234.6");
+        Ok(())
     }
 
     #[test]
@@ -1457,8 +1235,11 @@ mod tests {
             assert_eq!(gocr_plan(name).map(|p| p.name), Some(name));
         }
         assert!(gocr_plan("gocr-measured").is_none(), "q8 파일에서 다시 양자화하던 옛 배분 이름은 없음");
-        for name in ["q8", "zoro-spec", "zoro-spec+head", "q8-head"] {
+        for name in ["q8", "zoro-spec"] {
             assert_eq!(zoro_plan(name).map(|p| p.name), Some(name));
+        }
+        for name in ["zoro-spec+head", "q8-head"] {
+            assert!(zoro_plan(name).is_none(), "zoro 출력 투영은 파일을 만들지 않고 실행할 때 행 보기로 자름 ({name})");
         }
         assert_eq!(gocr_plan(DEFAULT_GOCR_PLAN).map(|p| p.name), Some(DEFAULT_GOCR_PLAN));
         assert_eq!(zoro_plan(DEFAULT_ZORO_PLAN).map(|p| p.name), Some(DEFAULT_ZORO_PLAN));

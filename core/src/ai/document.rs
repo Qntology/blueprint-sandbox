@@ -395,7 +395,7 @@ impl DocumentReader {
                 Ok(GocrInput { image: gocr_prepare(&piece, GOCR_PATCH, GOCR_MERGE)?, prompt: TEXT_PROMPT.to_string() })
             })
             .collect::<Result<_>>()?;
-        self.gocr.recognize(&inputs)
+        self.gocr.recognize_document(&inputs)
     }
 
     /// 페이지마다 심볼 후보를 찾아 그림 사전에 댑니다. 사전이 없으면 빈 결과입니다.
@@ -541,7 +541,7 @@ impl DocumentReader {
             .par_iter()
             .map(|(straight, c)| Ok(GocrInput { image: gocr_prepare(&cut(straight, c.bbox, c.upscale), GOCR_PATCH, GOCR_MERGE)?, prompt: self.prompt_of(c.kind).to_string() }))
             .collect::<Result<_>>()?;
-        let mut outputs = self.gocr.recognize(&inputs)?;
+        let mut outputs = self.gocr.recognize_document(&inputs)?;
         // 다시 읽을 조각은 Zoro-1 비전으로 (비전 단계 한 번 → 텍스트 블록 한 번, 상주 관리자가 gocr 를 먼저 내림)
         let mut by_vlm = vec![false; outputs.len()];
         if let Some((zoro, when)) = &self.vlm {

@@ -5,6 +5,10 @@
 //!
 //! 글자 오류율(CER)은 띄어쓰기 · 줄바꿈을 한 칸으로 줄인 뒤 편집 거리 / 정답 글자 수입니다. 언어별 · 전체 표를 출력합니다.
 //! 두 모델은 상주 관리자를 함께 써서 한 번에 하나만 올라옵니다 (gocr 비전 → gocr 언어 → Zoro-1 비전 → Zoro-1 텍스트 블록).
+//!
+//! 출력 투영 잘라 내기(`ai::trim`)는 `BLUEPRINT_TRIM` (full · off) 과 `BLUEPRINT_TRIM_LANGS` 를 따릅니다.
+//! 문서 언어 자동(`BLUEPRINT_TRIM_LANGS` 없음 · `auto`, 기본)이면 같은 언어의 조각을 한 문서로 보고, 첫 조각을 12 개 언어의 행으로 읽은 글로 문서 언어(현지 언어 + 영어)를
+//! 정한 뒤 나머지 조각을 그 언어의 행으로 읽습니다 (이미지 맥락: 언어를 미리 모름). 첫 조각이 라틴 문자뿐이면 정하지 않고 12 개 언어의 행으로 읽습니다. 조각마다 남긴 행 수와 정한 언어를 남깁니다.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -16,6 +20,7 @@ use blueprint_core::ai::gocr::image::prepare as gocr_prepare;
 use blueprint_core::ai::gocr::{open as open_gocr, GocrInput, Strategy, EARLY_EXIT, TEXT_PROMPT};
 use blueprint_core::ai::model_store::model_dir;
 use blueprint_core::ai::residency::{Budget, Residency};
+use blueprint_core::ai::trim::Langs;
 use blueprint_core::ai::zoro::{vision, ZoroBackbone, TRANSCRIBE};
 use image::RgbImage;
 use serde_json::{json, Value};
@@ -71,26 +76,56 @@ fn main() -> Result<()> {
     let res = Residency::shared(device.clone(), Budget::auto(&device));
     let mut rows: Vec<Value> = list.iter().map(|c| json!({ "image": c["image"], "lang": c["lang"], "truth": c["text"] })).collect();
 
+    // 문서 언어 자동(기본)이면 같은 언어의 조각을 한 문서로 (조각 순서 그대로)
+    let auto = Langs::from_env()?.1;
+    let groups: Vec<Vec<usize>> = if auto {
+        let mut g: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (i, c) in list.iter().enumerate() {
+            g.entry(c["lang"].as_str().unwrap_or("").to_string()).or_default().push(i);
+        }
+        g.into_values().collect()
+    } else {
+        vec![(0..list.len()).collect()]
+    };
+    // 첫 조각이 라틴 문자뿐이면 정하지 않음 → 12 개 언어 그대로 (`all`)
+    let doc_lang = |text: &str| -> String { Langs::decisive(text).unwrap_or_else(Langs::all).label() };
+
     if !no_gocr {
         let gocr = open_gocr(&model_dir("gocr"), res.clone(), 512, Strategy::Speculative { early_exit: Some(EARLY_EXIT) })?;
         let inputs: Vec<GocrInput> = images.iter().map(|im| Ok(GocrInput { image: gocr_prepare(im, 14, 2)?, prompt: TEXT_PROMPT.to_string() })).collect::<Result<_>>()?;
         let t = Instant::now();
-        let outs = gocr.recognize(&inputs)?;
-        println!("[gocr] {} ({}) · {}개 · {:.1}s", accel::backend_name(&device), gocr.quant(), outs.len(), t.elapsed().as_secs_f64());
-        for (r, o) in rows.iter_mut().zip(&outs) {
-            let (e, n) = cer(&o.text, r["truth"].as_str().unwrap());
-            r["gocr"] = json!({ "text": o.text, "edits": e, "chars": n, "min_conf": o.min_confidence, "ms": o.vision_ms + o.prefill_ms + o.decode_ms });
+        let mut total = 0usize;
+        for g in &groups {
+            let picked: Vec<GocrInput> = g.iter().map(|&i| inputs[i].clone()).collect();
+            let outs = gocr.recognize_document(&picked)?;
+            let k = gocr.head_rows();
+            let detected = outs.first().map(|o| doc_lang(&o.text)).unwrap_or_default();
+            for (&i, o) in g.iter().zip(&outs) {
+                let r = &mut rows[i];
+                let (e, n) = cer(&o.text, r["truth"].as_str().unwrap());
+                r["gocr"] = json!({ "text": o.text, "edits": e, "chars": n, "min_conf": o.min_confidence, "ms": o.vision_ms + o.prefill_ms + o.decode_ms, "head_rows": k, "doc_langs": detected });
+            }
+            total += outs.len();
         }
+        println!("[gocr] {} ({}) · {}개 · {:.1}s · 출력 투영 {} 행", accel::backend_name(&device), gocr.quant(), total, t.elapsed().as_secs_f64(), gocr.head_rows());
     }
     if !no_zoro {
         let zoro = ZoroBackbone::open(&model_dir("zoro"), res.clone())?;
         let t = Instant::now();
-        let outs = zoro.read_images(&images, TRANSCRIBE, 256, vision::MAX_PIXELS)?;
-        println!("[zoro] {} ({}) · {}개 · {:.1}s", accel::backend_name(&device), zoro.quant(), outs.len(), t.elapsed().as_secs_f64());
-        for (r, o) in rows.iter_mut().zip(&outs) {
-            let (e, n) = cer(&o.text, r["truth"].as_str().unwrap());
-            r["zoro"] = json!({ "text": o.text, "edits": e, "chars": n, "min_conf": o.min_confidence, "image_tokens": o.image_tokens, "ms": o.vision_ms + o.prefill_ms + o.decode_ms });
+        let mut total = 0usize;
+        for g in &groups {
+            let picked: Vec<RgbImage> = g.iter().map(|&i| images[i].clone()).collect();
+            let outs = zoro.read_images(&picked, TRANSCRIBE, 256, vision::MAX_PIXELS)?;
+            let k = zoro.head_rows();
+            let detected = outs.first().map(|o| doc_lang(&o.text)).unwrap_or_default();
+            for (&i, o) in g.iter().zip(&outs) {
+                let r = &mut rows[i];
+                let (e, n) = cer(&o.text, r["truth"].as_str().unwrap());
+                r["zoro"] = json!({ "text": o.text, "edits": e, "chars": n, "min_conf": o.min_confidence, "image_tokens": o.image_tokens, "ms": o.vision_ms + o.prefill_ms + o.decode_ms, "head_rows": k, "doc_langs": detected });
+            }
+            total += outs.len();
         }
+        println!("[zoro] {} ({}) · {}개 · {:.1}s · 출력 투영 {} 행", accel::backend_name(&device), zoro.quant(), total, t.elapsed().as_secs_f64(), zoro.head_rows());
     }
     // 언어별 표
     let mut by: BTreeMap<String, [(usize, usize, usize); 2]> = BTreeMap::new();

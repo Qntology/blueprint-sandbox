@@ -13,6 +13,7 @@
 //! - `ocr`: 비전 → 언어 단계 전환, `document`: 문서 한 장 읽기
 //! - `pyramid`: 피라미드 양자화 (텐서마다 정밀도를 달리한 GGUF 와 잘라 둔 출력 투영을 원본 BF16 에서 한 번 양자화해 만듦)
 //! - `original` · `kquant`: 원본 safetensors(BF16) 읽기 · GGML 블록 형식 인코더 (gravity-ocr `quant.py` 의 척도 탐색)
+//! - `trim`: 어휘 잘라 내기 (출력 투영에서 남길 행: 바이트 폴백 · 지원 언어 문자 체계 · 도메인 글, 문서 언어로 줄임)
 //! - `embed`: 검색용 문장 임베딩 (granite-embedding-97m-multilingual-r2, CPU)
 
 pub mod accel;
@@ -36,6 +37,7 @@ pub mod siglip2;
 pub mod speculative;
 pub mod tokenizer;
 pub mod trace;
+pub mod trim;
 pub mod verify;
 pub mod weights;
 pub mod zoro;
