@@ -91,6 +91,10 @@ pub struct ZoroBackbone {
     tokenizer: ModelTokenizer,
     /// 글쓰기에 쓰는 추측의 양
     speculation: Speculation,
+    /// 생성 하나(출력 투영 다시 자르기 → 생성)를 통째로 묶는 잠금. 글쓰기(writer)와 문서 판독(reader)이 이 백본 하나를 나눠 쓰는데
+    /// (`SharedBackbone`), 투영은 모델 안의 공유 상태라 둘이 겹치면 한쪽이 자른 행으로 다른 쪽이 생성하고, 상주 관리자가 올린 행과
+    /// 행 번호표가 어긋날 수 있었습니다. GPU 는 어차피 한 번에 생성 하나를 돌립니다.
+    run: std::sync::Mutex<()>,
 }
 
 impl ZoroBackbone {
@@ -115,7 +119,7 @@ impl ZoroBackbone {
         let tokenizer = ModelTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
         // GGUF 에 없으면 모델 폴더의 설정을 씁니다 (예전에 변환한 파일).
         let diffusion = BlockDiffusion::resolve(&file, model_dir)?;
-        let mut model = ZoroModel::new(file, residency, mode)?.with_diffusion(diffusion)?;
+        let mut model = ZoroModel::new(file, residency, mode)?.with_diffusion(diffusion)?.with_trim(&tokenizer)?;
         if let Some(path) = &active.mmproj {
             // 매핑만 합니다. 비전 단계가 없으면 이 파일의 텐서는 읽지 않습니다.
             model = model.with_mmproj(Arc::new(WeightFile::open(path)?));
@@ -125,7 +129,11 @@ impl ZoroBackbone {
             Ok(v) => parse_speculation(&v)?,
             Err(_) => model.default_speculation(),
         };
-        Ok(Self { model, tokenizer, speculation })
+        Ok(Self { model, tokenizer, speculation, run: std::sync::Mutex::new(()) })
+    }
+
+    fn lock_run(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.run.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     pub fn model(&self) -> &ZoroModel {
@@ -163,6 +171,17 @@ impl ZoroBackbone {
         &self.tokenizer
     }
 
+    /// 문서 언어로 출력 투영을 다시 자릅니다 ([`ZoroModel::retrim`]).
+    pub fn retrim(&self, langs: crate::ai::trim::Langs) -> Result<bool> {
+        let _run = self.lock_run();
+        self.model.retrim(&self.tokenizer, langs)
+    }
+
+    /// 지금 남긴 출력 투영 행 수
+    pub fn head_rows(&self) -> usize {
+        self.model.head_rows()
+    }
+
     /// 지시문과 입력으로 글을 씁니다. 가장 확률이 높은 토큰만 고르므로 같은 입력이면 같은 글이 나옵니다.
     pub fn write(&self, system: &str, user: &str, max_tokens: usize) -> Result<Written> {
         self.write_with(system, user, max_tokens, self.speculation)
@@ -170,6 +189,11 @@ impl ZoroBackbone {
 
     /// 추측의 양을 정해서 씁니다. 얼마이든 글은 같고 시간만 달라집니다.
     pub fn write_with(&self, system: &str, user: &str, max_tokens: usize, speculation: Speculation) -> Result<Written> {
+        let _run = self.lock_run();
+        // 🌟 [DOC LANG] 텍스트 맥락: 쓰기 전에 지시문 · 입력 글로 언어를 정하고 그 언어의 행만 남깁니다 (`BLUEPRINT_TRIM_LANGS=auto`).
+        if self.model.trim_auto() {
+            self.model.retrim(&self.tokenizer, crate::ai::trim::Langs::of_document(&format!("{system}\n{user}")))?;
+        }
         let prompt = format!("<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n{ANSWER_START}");
         let ids = self.tokenizer.encode(&prompt)?.ids;
         let stop = STOP_TOKENS.iter().filter_map(|t| self.tokenizer.token_to_id(t)).collect();
@@ -222,7 +246,34 @@ impl ZoroBackbone {
     }
 
     /// 이미지 여러 장을 같은 지시문으로 읽습니다. 비전 단계 한 번(모두 인코딩) → 비전을 내림 → 텍스트 블록 한 번 올려 차례로 씁니다.
+    /// 🌟 [DOC LANG] 이미지 맥락은 언어를 미리 모르므로 `BLUEPRINT_TRIM_LANGS=auto` 면 첫 장을 12 개 언어의 행으로 읽고, 그 글에 라틴 밖
+    /// 글자가 있으면 그 언어로 다시 잘라 나머지를 읽습니다 (한 문서의 조각들, [`crate::ai::trim::Langs::decisive`]).
     pub fn read_images(&self, images: &[image::RgbImage], instruction: &str, max_tokens: usize, max_pixels: usize) -> Result<Vec<ImageReading>> {
+        let _run = self.lock_run();
+        if self.model.trim_auto() {
+            // 새 문서는 12 개 언어의 행으로 시작합니다 (앞 문서의 언어로 잘린 행을 이어 쓰지 않음, 이미지가 한 장이어도)
+            self.model.retrim(&self.tokenizer, crate::ai::trim::Langs::all())?;
+        }
+        if self.model.trim_auto() && images.len() > 1 {
+            let mut out = self.read_images_held(&images[..1], instruction, max_tokens, max_pixels)?;
+            // 첫 장에 라틴 밖 글자가 있을 때만 그 언어로 자릅니다 (`Langs::decisive`, 라틴 문자뿐이면 12 개 언어의 행 그대로)
+            if let Some(langs) = crate::ai::trim::Langs::decisive(&out[0].text) {
+                self.model.retrim(&self.tokenizer, langs)?;
+            }
+            out.extend(self.read_images_held(&images[1..], instruction, max_tokens, max_pixels)?);
+            return Ok(out);
+        }
+        self.read_images_held(images, instruction, max_tokens, max_pixels)
+    }
+
+    /// 지금의 출력 투영으로 읽습니다.
+    pub fn read_images_now(&self, images: &[image::RgbImage], instruction: &str, max_tokens: usize, max_pixels: usize) -> Result<Vec<ImageReading>> {
+        let _run = self.lock_run();
+        self.read_images_held(images, instruction, max_tokens, max_pixels)
+    }
+
+    /// [`Self::read_images_now`] 의 본체 (생성 잠금을 쥔 쪽에서 부릅니다)
+    fn read_images_held(&self, images: &[image::RgbImage], instruction: &str, max_tokens: usize, max_pixels: usize) -> Result<Vec<ImageReading>> {
         let cfg = self.model.vision_config()?;
         let pad = self.tokenizer.token_to_id("<|image_pad|>").context("토크나이저에 <|image_pad|> 가 없습니다")?;
         let head = self.tokenizer.encode("<|im_start|>user\n<|vision_start|>")?.ids;

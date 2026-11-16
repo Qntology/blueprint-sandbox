@@ -44,11 +44,9 @@ pub const HEADROOM_ENV: &str = "BLUEPRINT_VRAM_HEADROOM_MB";
 const DEFAULT_HEADROOM_MB: u64 = 640;
 /// siglip2 토큰 임베딩 표. [`Group::Embedding`] 과 같은 이유로 올리지 않고 필요한 행만 파일에서 읽습니다.
 pub const TEXT_TOKEN_TABLE: &str = "text_model.embeddings.token_embedding.weight";
-/// 잘라 둔 출력 투영에서 남기지 않은 행 (`ai::pyramid`). 디코딩마다 이 행들이 이기는지만 봅니다.
-pub const OUTPUT_REST: &str = "output_rest.weight";
-/// 묶인 임베딩을 쓰는 모델(zoro)의 피라미드 파일이 따로 두는 출력 투영 (남긴 행 · 잘린 행). [`Group::Head`]
-pub const HEAD_KEPT: &str = "head.weight";
-pub const HEAD_REST: &str = "head_rest.weight";
+/// 🌟 [VOCAB TRIM] 잘라 낸 출력 투영의 행 보기 (`ai::trim`, [`WeightFile::set_row_view`]): 묶인 임베딩 표(zoro `token_embd.weight`)
+/// 또는 출력 투영(gocr `output.weight`)에서 남긴 행만. 파일에 따로 저장하지 않습니다.
+pub const HEAD_VIEW: &str = "head.view";
 /// 호스트에 남은 가중치가 있어도 계속 진행하도록 허용하는 환경 변수 (`1`). 수치가 실행마다 달라질 수 있어 진단용으로만 씁니다.
 pub const ALLOW_HOST_ENV: &str = "BLUEPRINT_ALLOW_HOST_WEIGHTS";
 /// 모델이 바뀌어도 남겨 둘 묶음 (`siglip2` = SigLIP2 비전 타워). 없거나 `off` 면 한 번에 한 모델입니다.
@@ -110,12 +108,12 @@ pub enum Group {
     Embedding,
     /// 텍스트 블록 `[start, end)` (`blk.N.*`)
     Blocks { start: u32, end: u32 },
-    /// 출력 정규화와, 있으면 출력 투영 (`output_norm.weight`, `output.weight`). 출력 투영을 잘라 둔 파일(`ai::pyramid`)이면
-    /// 잘린 행(`output_rest.weight`)도 함께입니다.
+    /// 출력 정규화와, 있으면 출력 투영 (`output_norm.weight`, `output.weight`). 출력 투영의 행 보기([`HEAD_VIEW`])가 있으면
+    /// `output.weight` 대신 그 행만입니다.
     Output,
     /// 비전 타워 (`model.visual.*`, `vision_model.*`). 이미지를 읽을 때만 필요합니다.
     Vision,
-    /// 묶인 임베딩 대신 따로 둔 출력 투영 (`head.weight` 남긴 행, `head_rest.weight` 잘린 행, `ai::pyramid`). zoro 피라미드 파일의 글쓰기에만 필요합니다.
+    /// 묶인 임베딩 표에서 남긴 행만의 출력 투영 ([`HEAD_VIEW`], `ai::trim`). 출력 투영을 따로 두지 않은 모델(zoro)의 글쓰기에만 필요합니다.
     Head,
     /// siglip2 텍스트 타워 (`text_model.*`, 토큰 임베딩 표 제외). 앵커 문구를 새로 인코딩할 때만 필요합니다.
     Text,
@@ -130,8 +128,22 @@ impl Group {
     pub fn tensor_names(&self, file: &WeightFile) -> Vec<String> {
         match *self {
             Self::Embedding => ["token_embd.weight"].iter().filter(|n| file.has(n)).map(|n| n.to_string()).collect(),
-            Self::Output => ["output_norm.weight", "output.weight", OUTPUT_REST].iter().filter(|n| file.has(n)).map(|n| n.to_string()).collect(),
-            Self::Head => [HEAD_KEPT, HEAD_REST].iter().filter(|n| file.has(n)).map(|n| n.to_string()).collect(),
+            Self::Output => {
+                let projection = if file.has(HEAD_VIEW) { HEAD_VIEW } else { "output.weight" };
+                let mut names = vec!["output_norm.weight".to_string()];
+                if file.has("output.weight") {
+                    names.push(projection.to_string());
+                }
+                names.retain(|n| file.has(n));
+                names
+            }
+            Self::Head => {
+                if file.has(HEAD_VIEW) && !file.has("output.weight") {
+                    vec![HEAD_VIEW.to_string()]
+                } else {
+                    Vec::new()
+                }
+            }
             Self::Vision => {
                 let mut names = file.names_with_prefix("model.visual.");
                 names.extend(file.names_with_prefix("vision_model."));

@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use candle_core::quantized::ggml_file::qtensor_from_ggml;
@@ -111,6 +111,15 @@ pub struct WeightFile {
     warmed: Mutex<HashSet<(usize, usize)>>,
     /// 옛 이름(`zeze.*`)을 읽으려고 덧붙인 키. 파일을 다시 쓸 때는 빼고 씁니다.
     aliases: HashSet<String>,
+    /// 행 보기: 저장된 2차원 텐서의 몇 행만 다른 이름의 텐서처럼 읽습니다 ([`WeightFile::set_row_view`]).
+    views: RwLock<HashMap<String, RowView>>,
+}
+
+/// 저장된 텐서 `source` 의 `rows` 번 행 (그 순서대로)
+#[derive(Debug, Clone)]
+struct RowView {
+    source: String,
+    rows: Arc<Vec<u32>>,
 }
 
 impl std::fmt::Debug for WeightFile {
@@ -145,7 +154,58 @@ impl WeightFile {
         let aliases = alias_old_names(&mut content.metadata);
         // 모델 파일은 실행 중에 바꾸지 않는다고 봅니다. candle 의 safetensors 읽기도 같습니다.
         let map = unsafe { Mmap::map(&file) }.with_context(|| format!("GGUF 를 매핑할 수 없습니다: {}", path.display()))?;
-        Ok(Self { path: path.to_path_buf(), content, map, warmed: Mutex::new(HashSet::new()), aliases })
+        Ok(Self { path: path.to_path_buf(), content, map, warmed: Mutex::new(HashSet::new()), aliases, views: RwLock::new(HashMap::new()) })
+    }
+
+    /// 🌟 [VOCAB TRIM] 저장된 2차원 텐서 `source` 의 `rows` 번 행만 `name` 이라는 텐서로 보이게 합니다. 파일은 바꾸지 않고, 장치에 올릴 때
+    /// ([`Self::read_qtensor`]) 그 행의 바이트만 모읍니다. 잘라 낸 출력 투영(`ai::trim`)이 묶인 임베딩 표(zoro `token_embd.weight`)나
+    /// 이미 잘라 둔 출력 투영에서 더 줄인 행을 새 파일 없이 쓰는 길입니다. 같은 이름으로 다시 부르면 바꿉니다.
+    pub fn set_row_view(&self, name: &str, source: &str, rows: Vec<u32>) -> Result<()> {
+        if self.content.tensor_infos.contains_key(name) {
+            bail!("{name} 은 파일에 저장된 텐서라 행 보기 이름으로 쓸 수 없습니다");
+        }
+        let info = self.content.tensor_infos.get(source).ok_or_else(|| anyhow!("행 보기의 원본 {source} 이 없습니다 ({})", self.path.display()))?;
+        let dims = info.shape.dims();
+        if dims.len() != 2 || dims[1] % info.ggml_dtype.block_size() != 0 {
+            bail!("행 보기의 원본 {source} 은 블록으로 나뉘는 2차원이어야 합니다 (모양 {dims:?})");
+        }
+        if rows.is_empty() || rows.iter().any(|&r| r as usize >= dims[0]) {
+            bail!("{name}: 행 번호가 비었거나 {source} 의 행 수 {} 를 넘습니다", dims[0]);
+        }
+        self.views.write().unwrap_or_else(|p| p.into_inner()).insert(name.to_string(), RowView { source: source.to_string(), rows: Arc::new(rows) });
+        Ok(())
+    }
+
+    /// 행 보기를 지웁니다.
+    pub fn clear_row_view(&self, name: &str) {
+        self.views.write().unwrap_or_else(|p| p.into_inner()).remove(name);
+    }
+
+    fn view(&self, name: &str) -> Option<RowView> {
+        self.views.read().unwrap_or_else(|p| p.into_inner()).get(name).cloned()
+    }
+
+    /// 행 보기의 원본 행 번호 (그 순서대로)
+    pub fn row_view_rows(&self, name: &str) -> Option<Arc<Vec<u32>>> {
+        self.view(name).map(|v| v.rows)
+    }
+
+    /// 행 보기의 바이트 (원본 행을 이어 붙임, 블록 구조체로 읽을 수 있게 정렬)
+    fn view_bytes(&self, v: &RowView) -> Result<(GgmlDType, Vec<usize>, Vec<u64>, usize)> {
+        let (info, table) = self.stored(&v.source)?;
+        let cols = info.shape.dims()[1];
+        let dtype = info.ggml_dtype;
+        let row_bytes = cols / dtype.block_size() * dtype.type_size();
+        let total = v.rows.len() * row_bytes;
+        let mut words = vec![0u64; total.div_ceil(8)];
+        {
+            let (_, raw, _) = unsafe { words.align_to_mut::<u8>() };
+            for (i, &r) in v.rows.iter().enumerate() {
+                let r = r as usize;
+                raw[i * row_bytes..(i + 1) * row_bytes].copy_from_slice(&table[r * row_bytes..(r + 1) * row_bytes]);
+            }
+        }
+        Ok((dtype, vec![v.rows.len(), cols], words, total))
     }
 
     /// 파일에 적힌 메타데이터 그대로 (옛 이름을 읽으려고 덧붙인 키는 뺌, 키 순서로). 파일을 다시 쓸 때 씁니다 (`ai::pyramid`).
@@ -232,10 +292,16 @@ impl WeightFile {
     // ---- 목차 ----
 
     pub fn has(&self, name: &str) -> bool {
-        self.content.tensor_infos.contains_key(name)
+        self.content.tensor_infos.contains_key(name) || self.view(name).is_some()
     }
 
     pub fn info(&self, name: &str) -> Result<TensorMeta> {
+        if let Some(v) = self.view(name) {
+            let src = self.info(&v.source)?;
+            let cols = src.dims[1];
+            let bytes = (v.rows.len() * (cols / src.dtype.block_size()) * src.dtype.type_size()) as u64;
+            return Ok(TensorMeta { name: name.to_string(), dtype: src.dtype, dims: vec![v.rows.len(), cols], bytes });
+        }
         let t = self
             .content
             .tensor_infos
@@ -324,8 +390,13 @@ impl WeightFile {
         }
     }
 
-    /// 텐서 하나를 `device` 로 읽습니다 (양자화 형식 그대로). 장치로 가는 복사 한 번뿐입니다.
+    /// 텐서 하나를 `device` 로 읽습니다 (양자화 형식 그대로). 장치로 가는 복사 한 번뿐입니다. 행 보기면 그 행의 바이트만 모읍니다.
     pub fn read_qtensor(&self, name: &str, device: &Device) -> Result<QTensor> {
+        if let Some(v) = self.view(name) {
+            let (dtype, dims, words, total) = self.view_bytes(&v)?;
+            let (_, raw, _) = unsafe { words.align_to::<u8>() };
+            return Ok(qtensor_from_ggml(dtype, &raw[..total], dims, device).with_context(|| format!("{name} 행 보기를 읽을 수 없습니다"))?);
+        }
         self.content
             .tensor_from_slice(&self.map, name, device)
             .with_context(|| format!("{name} 텐서를 읽을 수 없습니다"))
@@ -334,6 +405,11 @@ impl WeightFile {
     /// 텐서 하나를 풀어서 `dtype` 의 일반 텐서로 `device` 에 둡니다. 정규화·컨볼루션·비전 가중치 같은 일반 텐서용입니다.
     /// 저장 형식 그대로 쓰면 변환 없이 복사만 하고, BF16 을 F32 로 풀 때는 병렬로 합니다.
     pub fn read_dense(&self, name: &str, device: &Device, dtype: DType) -> Result<Tensor> {
+        if self.view(name).is_some() {
+            let t = self.read_qtensor(name, &Device::Cpu)?.dequantize(&Device::Cpu)?;
+            let t = if t.dtype() == dtype { t } else { t.to_dtype(dtype)? };
+            return Ok(t.to_device(device)?);
+        }
         let (info, raw) = self.stored(name)?;
         let dims = info.shape.dims().to_vec();
         match (info.ggml_dtype, dtype) {
@@ -493,6 +569,28 @@ mod tests {
         let want = whole.index_select(&Tensor::new(&ids[..], &Device::Cpu)?, 0)?;
         let diff = (&got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
         assert_eq!(diff, 0.0, "같은 바이트를 같은 방식으로 풀어야 합니다");
+        Ok(())
+    }
+
+    #[test]
+    fn a_row_view_reads_only_its_rows_without_a_new_file() -> Result<()> {
+        let (_dir, f) = sample()?;
+        let whole = f.read_qtensor("token_embd.weight", &Device::Cpu)?.dequantize(&Device::Cpu)?;
+        let rows = vec![3u32, 9, 21, 39];
+        f.set_row_view("head.view", "token_embd.weight", rows.clone())?;
+        assert!(f.has("head.view") && !f.names().contains(&"head.view".to_string()), "목차에는 있고 파일 텐서 목록에는 없음");
+        let meta = f.info("head.view")?;
+        assert_eq!((meta.dtype, meta.dims.clone()), (GgmlDType::Q8_0, vec![4, 64]));
+        assert_eq!(meta.bytes, f.info("token_embd.weight")?.bytes / 40 * 4, "행 4 / 40 만큼");
+        let got = f.read_qtensor("head.view", &Device::Cpu)?.dequantize(&Device::Cpu)?;
+        let want = whole.index_select(&Tensor::new(rows.as_slice(), &Device::Cpu)?, 0)?;
+        assert_eq!((&got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?, 0.0, "같은 행의 같은 바이트");
+        let dense = f.read_dense("head.view", &Device::Cpu, DType::F32)?;
+        assert_eq!((&dense - &want)?.abs()?.max_all()?.to_scalar::<f32>()?, 0.0);
+        assert!(f.set_row_view("token_embd.weight", "token_embd.weight", vec![0]).is_err(), "저장된 이름은 쓸 수 없음");
+        assert!(f.set_row_view("v", "token_embd.weight", vec![40]).is_err(), "행 범위 밖");
+        f.clear_row_view("head.view");
+        assert!(!f.has("head.view"));
         Ok(())
     }
 

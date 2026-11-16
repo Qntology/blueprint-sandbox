@@ -161,8 +161,8 @@ pub struct Decoder<'a> {
     pub cfg: &'a GocrConfig,
     pub blocks: &'a Loaded,
     pub output: &'a Loaded,
-    /// 잘라 둔 출력 투영의 행 번호 (`ai::pyramid`). 없으면 `output.weight` 가 전체 어휘입니다.
-    pub head: Option<&'a HeadMap>,
+    /// 잘라 낸 출력 투영의 행 번호 (`ai::trim`). 없으면 `output.weight` 가 전체 어휘입니다.
+    pub head: Option<std::sync::Arc<HeadMap>>,
 }
 
 impl Decoder<'_> {
@@ -233,29 +233,29 @@ impl Decoder<'_> {
         rms_norm(h, self.output.dense("output_norm.weight")?, self.cfg.rms_eps)
     }
 
-    /// 은닉 상태 `[n, hidden]` → `output.weight` 의 로짓 `[n, 행]` (CPU). 자르지 않은 파일이면 전체 어휘입니다.
+    /// 은닉 상태 `[n, hidden]` → 출력 투영의 로짓 `[n, 행]` (CPU). 잘라 냈으면 남긴 행만, 아니면 전체 어휘입니다.
     pub fn logits(&self, h: &Tensor) -> Result<Vec<Vec<f32>>> {
-        Ok(head::logits(self.output, "output.weight", self.head, &self.normed(h)?, false)?.rows)
+        head::logits(self.output, "output.weight", self.head.as_deref(), &self.normed(h)?)
     }
 
-    /// 행마다 상위 셋. `with_rest` 면 잘린 행도 봅니다 (검증 · 프리필). 블록 디퓨전 초안은 검증이 뒤따르므로 건너뜁니다.
-    pub fn picks(&self, h: &Tensor, with_rest: bool) -> Result<Vec<Pick>> {
+    /// 행마다 상위 셋 (번호는 전체 어휘). 잘라 냈으면 남긴 행 안에서 고르고 확률도 그 안의 소프트맥스입니다.
+    pub fn picks(&self, h: &Tensor) -> Result<Vec<Pick>> {
         let t = profile::mark(h);
-        let l = head::logits(self.output, "output.weight", self.head, &self.normed(h)?, with_rest)?;
-        let out = l.rows.iter().zip(l.rest).map(|(row, rest)| Pick::from_top3(head::top3(row, rest, self.head))).collect();
+        let rows = self.logits(h)?;
+        let out = rows.iter().map(|row| Pick::from_top3(head::top3(row, self.head.as_deref()))).collect();
         profile::add(5, t);
         Ok(out)
     }
 
-    /// 마지막 행의 상위 셋 (잘린 행 포함)
+    /// 마지막 행의 상위 셋
     pub fn last_pick(&self, h: &Tensor) -> Result<Pick> {
         let n = h.dim(0)?;
-        self.picks(&h.narrow(0, n - 1, 1)?, true)?.into_iter().next().ok_or_else(|| anyhow!("빈 로짓"))
+        self.picks(&h.narrow(0, n - 1, 1)?)?.into_iter().next().ok_or_else(|| anyhow!("빈 로짓"))
     }
 
-    /// teacher forcing: 행 i 의 다음 토큰이 `targets[i]` 일 때의 (음의 로그 확률, 1위 토큰). 전체 어휘 소프트맥스입니다.
+    /// teacher forcing: 행 i 의 다음 토큰이 `targets[i]` 일 때의 (음의 로그 확률, 1위 토큰). 남긴 행의 소프트맥스입니다.
     pub fn score(&self, h: &Tensor, targets: &[u32]) -> Result<Vec<(f32, u32)>> {
-        head::score(self.output, "output.weight", self.head, &self.normed(h)?, targets)
+        head::score(self.output, "output.weight", self.head.as_deref(), &self.normed(h)?, targets)
     }
 }
 
