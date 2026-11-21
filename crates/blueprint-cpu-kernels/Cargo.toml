@@ -1,0 +1,10 @@
+[package]
+name = "blueprint-cpu-kernels"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Portable SIMD (AVX-512/AVX2+FMA/NEON/scalar) PackedW NR=32 GEMM, 64-key streaming attention (incl. head_dim=72), 1-pass RMSNorm/LayerNorm/GELU, dot/cosine, and image patchify"
+
+[dependencies]
+rayon = "1"

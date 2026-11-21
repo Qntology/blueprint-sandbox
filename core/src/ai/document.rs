@@ -174,12 +174,16 @@ fn apply_delta(plan: &mut PagePlan, grid: &PatchGrid, ink: &InkPage, baseline: &
     let mut out = DeltaReading { master: None, similarity: 0.0, margin: 0.0, changed: 0, blocks: 0, skipped: Vec::new(), clipped: 0, clipped_blank: Vec::new(), fallback: None, cosines: Vec::new(), changed_boxes: Vec::new(), trimmed: 0, methods: Vec::new(), protected: 0 };
     let master = match baseline {
         Baseline::Best(set) => {
+            let mut picked = None;
             for method in [MatchMethod::Mean, MatchMethod::Centered, MatchMethod::Chamfer] {
                 if let Some(m) = set.best_match_by(grid, method) {
                     out.methods.push((format!("{method:?}"), set.pages[m.index].id().to_string(), m.similarity, m.margin));
+                    if method == p.method {
+                        picked = Some(m);
+                    }
                 }
             }
-            let Some(m) = set.best_match_by(grid, p.method) else {
+            let Some(m) = picked else {
                 out.fallback = Some("격자가 같은 마스터가 없습니다".into());
                 return out;
             };
@@ -435,7 +439,7 @@ impl DocumentReader {
         let straight = straighten(&refs);
         let grids = self.grids_of(&straight.iter().map(|s| &s.0).collect::<Vec<_>>())?;
         let masters = straight.into_par_iter().zip(grids).zip(pages.par_iter()).map(|(((_, _, ink), grid), (id, _))| Master::new(id.clone(), &grid, ink, p.radius)).collect();
-        Ok(MasterSet { pages: masters })
+        Ok(MasterSet::from_pages(masters))
     }
 
     fn grids_of(&self, images: &[&RgbImage]) -> Result<Vec<PatchGrid>> {
@@ -547,13 +551,14 @@ impl DocumentReader {
         if let Some((zoro, when)) = &self.vlm {
             let picks: Vec<usize> = outputs.iter().enumerate().filter(|(_, o)| when.wants(o)).map(|(i, _)| i).collect();
             if !picks.is_empty() {
+                let tz = Instant::now();
                 let images: Vec<RgbImage> = picks.par_iter().map(|&i| cut(crops[i].0, crops[i].1.bbox, crops[i].1.upscale)).collect();
                 let read = zoro.read_images(&images, TRANSCRIBE, MAX_TOKENS, zoro_vision::MAX_PIXELS)?;
                 for (&i, r) in picks.iter().zip(read) {
                     outputs[i] = vlm_output(r);
                     by_vlm[i] = true;
                 }
-                trace::record("zoro", "조각 다시 읽기", 0.0, json!({ "crops": picks.len() }));
+                trace::record("zoro", "조각 다시 읽기", tz.elapsed().as_secs_f64() * 1e3, json!({ "crops": picks.len() }));
             }
         }
         let mut by_vlm = by_vlm.into_iter();

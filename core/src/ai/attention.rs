@@ -46,11 +46,52 @@ fn fused_rms_trusted(device: &Device) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Pack C Fused Decoder Ops (Residual + RMSNorm, SwiGLU silu_mul)
+// ---------------------------------------------------------------------------------------------
+
+/// Pack C 융합 `residual = x + delta`, `normed = rms_norm(residual, w, eps)` (가능하면 인플레이스).
+pub fn residual_rms_norm_inplace(x: Tensor, delta: &Tensor, w: &Tensor, eps: f32) -> Result<(Tensor, Tensor)> {
+    if !x.device().is_cpu() && verify::decoder_ops_trusted(x.device()) {
+        return Ok(candle_core::decoder_ops::residual_rmsnorm_inplace(x, Some(delta), w, eps, false)?);
+    }
+    let res = (x + delta)?;
+    let normed = rms_norm(&res, w, eps)?;
+    Ok((res, normed))
+}
+
+/// Pack C 융합 `silu(gate) * up` (분할 뷰 zero-copy 지원).
+pub fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    if !gate.device().is_cpu() && verify::decoder_ops_trusted(gate.device()) {
+        return Ok(candle_core::decoder_ops::silu_mul(gate, up)?);
+    }
+    Ok((candle_nn::ops::silu(gate)? * up)?)
+}
+
+// ---------------------------------------------------------------------------------------------
 // LayerNorm
 // ---------------------------------------------------------------------------------------------
 
 /// `(x − 평균) / sqrt(분산 + eps) × w + b` (마지막 차원)
 pub fn layer_norm(x: &Tensor, w: &Tensor, b: &Tensor, eps: f64) -> Result<Tensor> {
+    if x.device().is_cpu() && x.dtype() == candle_core::DType::F32 && w.dtype() == candle_core::DType::F32 && b.dtype() == candle_core::DType::F32 {
+        let dims = x.dims().to_vec();
+        if let Some(&h) = dims.last() {
+            if h > 0 && w.dims() == [h] && b.dims() == [h] {
+                let xc = x.contiguous()?;
+                let wc = w.contiguous()?;
+                let bc = b.contiguous()?;
+                let xs = xc.flatten_all()?.to_vec1::<f32>()?;
+                let ws = wc.to_vec1::<f32>()?;
+                let bs = bc.to_vec1::<f32>()?;
+                let mut out = vec![0f32; xs.len()];
+                blueprint_cpu_kernels::layer_norm(&xs, h, &ws, Some(&bs), eps as f32, &mut out);
+                return Ok(Tensor::from_vec(out, dims, x.device())?);
+            }
+        }
+    }
+    if !x.device().is_cpu() && verify::layer_norm_trusted(x.device()) {
+        return Ok(candle_nn::ops::layer_norm(&x.contiguous()?, w, b, eps as f32)?);
+    }
     let mean = x.mean_keepdim(D::Minus1)?;
     let c = x.broadcast_sub(&mean)?;
     let var = c.sqr()?.mean_keepdim(D::Minus1)?;
@@ -100,6 +141,14 @@ impl Rope {
     pub fn from_tables(cos: Tensor, sin: Tensor) -> Result<Self> {
         let (_, half) = cos.dims2()?;
         Ok(Self { cos, sin, rot: 2 * half })
+    }
+
+    pub fn cos(&self) -> &Tensor {
+        &self.cos
+    }
+
+    pub fn sin(&self) -> &Tensor {
+        &self.sin
     }
 
     /// `x`: `[헤드, 토큰, head_dim]`. 앞 `rot` 차원을 반으로 나눠 `(x1, x2) → (x1 cos − x2 sin, x2 cos + x1 sin)`.
@@ -164,11 +213,77 @@ fn repeat_kv(x: &Tensor, rep: usize) -> Result<Tensor> {
     Ok(x.unsqueeze(1)?.expand((h, rep, t, d))?.reshape((h * rep, t, d))?)
 }
 
+/// 장치에서 주어진 `head_dim` 으로 `candle_nn::flash_attn` (비인과) 을 써도 되는지 검증합니다.
+fn flash_attn_dim_trusted(device: &Device, head_dim: usize) -> bool {
+    if device.is_cpu() {
+        return false;
+    }
+    let op = format!("flash_attn_d{head_dim}");
+    verify::trusted(device, &op, 5e-3, || {
+        let (b, h, n, d) = (1usize, 2usize, 32usize, head_dim);
+        let q = Tensor::from_vec(verify::det_normal(b * h * n * d, 31 + d as u64), (b, h, n, d), &Device::Cpu)?;
+        let k = Tensor::from_vec(verify::det_normal(b * h * n * d, 32 + d as u64), (b, h, n, d), &Device::Cpu)?;
+        let v = Tensor::from_vec(verify::det_normal(b * h * n * d, 33 + d as u64), (b, h, n, d), &Device::Cpu)?;
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale as f64)?;
+        let want = softmax_last_dim(&scores)?.matmul(&v)?;
+        let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scale);
+        let got = candle_nn::flash_attn::flash_attn_bhsd(
+            &q.to_device(device)?,
+            &k.to_device(device)?,
+            &v.to_device(device)?,
+            &cfg,
+        )?;
+        verify::rel_err(&got.to_device(&Device::Cpu)?, &want)
+    })
+}
+
 /// 마스크 없는 전체 주의 `softmax(q kᵀ · scale) v` (이미지 패치끼리). `q`·`k`·`v`: `[H, N, D]`. 질의를 `chunk` 개씩 나눠 계산합니다.
 pub fn full_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, chunk: usize) -> Result<Tensor> {
-    let (_, n, _) = q.dims3()?;
+    let (h, n, d) = q.dims3()?;
+    let (hk, nk, dk) = k.dims3()?;
     if chunk == 0 {
         bail!("질의 구간 크기가 0 입니다");
+    }
+    // Pack D CPU 스트리밍 어텐션 (64-key 패널, N×N 점수 행렬 미할당, SigLIP2 head_dim=72 포함)
+    if q.device().is_cpu()
+        && h == hk
+        && d == dk
+        && q.dtype() == candle_core::DType::F32
+        && k.dtype() == candle_core::DType::F32
+        && v.dtype() == candle_core::DType::F32
+        && d > 0
+        && n > 0
+        && nk > 0
+    {
+        // `stream_attention_f32` 는 [seq, heads, head_dim] (SHD) 레이아웃을 받습니다.
+        let qc = q.transpose(0, 1)?.contiguous()?;
+        let kc = k.transpose(0, 1)?.contiguous()?;
+        let vc = v.transpose(0, 1)?.contiguous()?;
+        let qs = qc.flatten_all()?.to_vec1::<f32>()?;
+        let ks = kc.flatten_all()?.to_vec1::<f32>()?;
+        let vs = vc.flatten_all()?.to_vec1::<f32>()?;
+        let mut out = vec![0f32; n * h * d];
+        let cfg = blueprint_cpu_kernels::CpuStreamAttnCfg {
+            num_heads: h,
+            num_kv_heads: hk,
+            head_dim: d,
+            scale: scale as f32,
+            causal: false,
+            past_offset: 0,
+        };
+        blueprint_cpu_kernels::stream_attention_f32(&qs, &ks, &vs, n, nk, &cfg, &mut out);
+        return Ok(Tensor::from_vec(out, (n, h, d), q.device())?.transpose(0, 1)?.contiguous()?);
+    }
+    // GPU FlashAttention (head_dim 별 자가 검증 통과 시)
+    if !q.device().is_cpu() && h == hk && d == dk && flash_attn_dim_trusted(q.device(), d) {
+        let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scale as f32);
+        let q4 = q.unsqueeze(0)?.contiguous()?;
+        let k4 = k.unsqueeze(0)?.contiguous()?;
+        let v4 = v.unsqueeze(0)?.contiguous()?;
+        if let Ok(out) = candle_nn::flash_attn::flash_attn_bhsd(&q4, &k4, &v4, &cfg) {
+            return Ok(out.squeeze(0)?);
+        }
     }
     let kt = k.transpose(1, 2)?.contiguous()?;
     let mut outs = Vec::with_capacity(n.div_ceil(chunk));

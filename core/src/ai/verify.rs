@@ -99,6 +99,106 @@ pub fn rel_err(a: &Tensor, b: &Tensor) -> Result<f32> {
     Ok(if r.is_finite() { r } else { f32::INFINITY })
 }
 
+/// 장치의 `candle_nn::ops::layer_norm` 커널이 CPU 기준과 일치하는지 검증합니다.
+pub fn layer_norm_trusted(device: &Device) -> bool {
+    trusted(device, "layer_norm", 1e-4, || {
+        let x = Tensor::from_vec(det_normal(4 * 128, 21), (4, 128), &Device::Cpu)?;
+        let w = Tensor::from_vec(det_normal(128, 22), 128, &Device::Cpu)?;
+        let b = Tensor::from_vec(det_normal(128, 23), 128, &Device::Cpu)?;
+        let mean = x.mean_keepdim(candle_core::D::Minus1)?;
+        let c = x.broadcast_sub(&mean)?;
+        let var = c.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let want = c.broadcast_div(&(var + 1e-5)?.sqrt()?)?.broadcast_mul(&w)?.broadcast_add(&b)?;
+        let got = candle_nn::ops::layer_norm(
+            &x.to_device(device)?,
+            &w.to_device(device)?,
+            &b.to_device(device)?,
+            1e-5,
+        )?;
+        rel_err(&got.to_device(&Device::Cpu)?, &want)
+    })
+}
+
+/// 장치의 `candle_nn::flash_attn` (비인과) 커널이 CPU 기준과 일치하는지 검증합니다.
+pub fn flash_attn_trusted(device: &Device) -> bool {
+    trusted(device, "flash_attn", 5e-3, || {
+        let (b, h, n, d) = (1usize, 4usize, 32usize, 64usize);
+        let q = Tensor::from_vec(det_normal(b * h * n * d, 31), (b, h, n, d), &Device::Cpu)?;
+        let k = Tensor::from_vec(det_normal(b * h * n * d, 32), (b, h, n, d), &Device::Cpu)?;
+        let v = Tensor::from_vec(det_normal(b * h * n * d, 33), (b, h, n, d), &Device::Cpu)?;
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale as f64)?;
+        let want = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
+        let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scale);
+        let got = candle_nn::flash_attn::flash_attn_bhsd(
+            &q.to_device(device)?,
+            &k.to_device(device)?,
+            &v.to_device(device)?,
+            &cfg,
+        )?;
+        rel_err(&got.to_device(&Device::Cpu)?, &want)
+    })
+}
+
+/// Pack C 융합 디코더 커널(`residual_rmsnorm` · `silu_mul`)이 장치에서 CPU 기준과 일치하는지 검증합니다.
+pub fn decoder_ops_trusted(device: &Device) -> bool {
+    trusted(device, "decoder_ops", 1e-3, || {
+        let (rows, d) = (4usize, 256usize);
+        let x = Tensor::from_vec(det_normal(rows * d, 51), (rows, d), &Device::Cpu)?;
+        let delta = Tensor::from_vec(det_normal(rows * d, 52), (rows, d), &Device::Cpu)?;
+        let w = Tensor::from_vec(det_normal(d, 53), d, &Device::Cpu)?;
+        let (want_r, want_y) = candle_core::decoder_ops::residual_rmsnorm(&x, Some(&delta), &w, 1e-5, false)?;
+        let (got_r, got_y) = candle_core::decoder_ops::residual_rmsnorm(
+            &x.to_device(device)?,
+            Some(&delta.to_device(device)?),
+            &w.to_device(device)?,
+            1e-5,
+            false,
+        )?;
+        let e1 = rel_err(&got_r.to_device(&Device::Cpu)?, &want_r)?;
+        let e2 = rel_err(&got_y.to_device(&Device::Cpu)?, &want_y)?;
+        let gate = Tensor::from_vec(det_normal(rows * d, 54), (rows, d), &Device::Cpu)?;
+        let up = Tensor::from_vec(det_normal(rows * d, 55), (rows, d), &Device::Cpu)?;
+        let want_s = candle_core::decoder_ops::silu_mul(&gate, &up)?;
+        let got_s = candle_core::decoder_ops::silu_mul(&gate.to_device(device)?, &up.to_device(device)?)?;
+        let e3 = rel_err(&got_s.to_device(&Device::Cpu)?, &want_s)?;
+        Ok(e1.max(e2).max(e3))
+    })
+}
+
+/// Pack A/C `lm_head::logits_argmax_cs` 커널이 장치에서 CPU 기준과 일치하는지 검증합니다.
+pub fn lm_head_argmax_trusted(device: &Device) -> bool {
+    trusted(device, "lm_head_argmax_cs", 1e-3, || {
+        let (m, v, k) = (2usize, 128usize, 64usize);
+        let logits = Tensor::from_vec(det_normal(m * v, 61), (m, v), &Device::Cpu)?;
+        let hidden = Tensor::from_vec(det_normal(m * k, 62), (m, k), &Device::Cpu)?;
+        let rest_w = Tensor::from_vec(det_normal(32 * k, 63), (32, k), &Device::Cpu)?;
+        let cids: Vec<u32> = (0..v as u32).map(|i| i * 2 + 1).collect();
+        let cids_t = Tensor::from_vec(cids, (v,), &Device::Cpu)?;
+        let cs_cpu = candle_core::lm_head::CsGuardParams::from_rest_weight(&rest_w, None, 1e-3)?;
+        let want = candle_core::lm_head::logits_argmax_cs(&logits, Some(&hidden), Some(&cids_t), Some(&cs_cpu))?;
+        let cs_dev = candle_core::lm_head::CsGuardParams {
+            mu_rest: cs_cpu.mu_rest.to_device(device)?,
+            w_rest_bound: cs_cpu.w_rest_bound,
+            b_rest_max: cs_cpu.b_rest_max,
+        };
+        let got = candle_core::lm_head::logits_argmax_cs(
+            &logits.to_device(device)?,
+            Some(&hidden.to_device(device)?),
+            Some(&cids_t.to_device(device)?),
+            Some(&cs_dev),
+        )?;
+        let want_ids = want.ids.to_vec1::<u32>()?;
+        let got_ids = got.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
+        if want_ids != got_ids {
+            return Ok(f32::INFINITY);
+        }
+        let want_v = want.max_vals.as_ref().unwrap();
+        let got_v = got.max_vals.as_ref().unwrap().to_device(&Device::Cpu)?;
+        rel_err(&got_v, want_v)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -19,12 +19,12 @@ use std::time::Instant;
 use anyhow::{anyhow, bail, Result};
 use candle_core::delta_rule::GdnConfig;
 use candle_core::{Device, Tensor};
-use candle_nn::ops::{sigmoid, silu};
+use candle_nn::ops::sigmoid;
 
 use super::config::{LayerKind, ZoroConfig};
 use super::vision;
 use super::ops::{gated_delta_state, gated_delta_state_on_host, gated_delta_step, gated_delta_step_on_host, gdn_config, gdn_on_device, GdnState, GdnWeights};
-use crate::ai::attention::{causal_attention, rms_norm, AttnMode, Causal, LayerCache, Rope, StepMask, ATTN_QUERY_CHUNK};
+use crate::ai::attention::{causal_attention, residual_rms_norm_inplace, rms_norm, silu_mul, AttnMode, Causal, LayerCache, Rope, StepMask, ATTN_QUERY_CHUNK};
 use crate::ai::head::{self, HeadMap};
 use crate::ai::kv_turbo::{self, KvCodec, KvShape};
 use crate::ai::residency::{estimate_group_bytes, headroom_bytes, Budget, Group, Loaded, ModelId, ModelSpec, Phase, Prepare, Requant, Residency, SharedResidency};
@@ -566,7 +566,7 @@ impl ZoroModel {
                     Group::Blocks { start, end } => {
                         for i in start as usize..end as usize {
                             let t0 = std::time::Instant::now();
-                            x = self.layer(&ctx, l, i, &x, None)?.0;
+                            x = self.layer(&ctx, l, i, x, None)?.0;
                             if layer_trace_enabled() {
                                 // 진단: 층 출력의 체크섬. 두 번의 실행을 비교해 처음 달라지는 층을 찾습니다.
                                 let v = x.flatten_all()?.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
@@ -618,10 +618,10 @@ impl ZoroModel {
     }
 
     /// 정규화한 은닉 상태의 행마다 다음 토큰과 확률. `table` 은 글쓰기 단계의 출력 투영 묶음입니다.
+    /// Pack A/C: 장치 내 `logits_argmax_cs` + `lse` 로 `[n, V]` 전체 D2H 전송을 제거합니다.
     fn next_tokens(&self, table: &Loaded, h: &Tensor) -> Result<Vec<(u32, f32)>> {
         let map = self.current_head();
-        let rows = head::logits(table, "token_embd.weight", map.as_deref(), &h.contiguous()?)?;
-        Ok(rows.iter().map(|row| head::top1(row, map.as_deref())).collect())
+        head::top1_on_device(table, "token_embd.weight", map.as_deref(), None, &h.contiguous()?)
     }
 
     /// teacher forcing 진단: 프롬프트 뒤에 `targets` 를 한 번에 읽어, 자리마다 (그 토큰의 음의 로그 확률, 모델의 1위 토큰).
@@ -704,7 +704,7 @@ impl ZoroModel {
         };
         let mut layers = Vec::with_capacity(self.cfg.n_layers);
         for i in 0..self.cfg.n_layers {
-            let (y, pending) = self.layer(&ctx, blocks, i, &x, Some(LayerRead { state: &state.layers[i], partial }))?;
+            let (y, pending) = self.layer(&ctx, blocks, i, x, Some(LayerRead { state: &state.layers[i], partial }))?;
             x = y;
             layers.push(pending.ok_or_else(|| anyhow!("층 {i} 의 상태가 없습니다"))?);
         }
@@ -778,6 +778,18 @@ impl ZoroModel {
     /// 이미지 여러 장: 비전 단계를 한 번 거쳐 모두 인코딩한 뒤(비전 타워만 상주) 비전을 내리고, 텍스트 블록을 한 번 올려 차례로 씁니다.
     /// 장마다 비전과 블록을 오가며 올렸다 내리지 않습니다 (gocr 의 `OcrEngine` 과 같은 모양). 결과는 (글, 그 장의 비전 시간) 입니다.
     pub fn generate_with_images(&self, items: &[(&[u32], &vision::VisionImage, ImageSlot)], opts: &GenerateOptions) -> Result<Vec<(GeneratedIds, f64)>> {
+        self.generate_with_images_retrim(items, opts, None, |_| Ok(None))
+    }
+
+    /// 이미지 여러 장을 **비전 단계 1회**로 인코딩한 뒤 텍스트 블록을 올리고, 첫 결과 뒤 `after_first` 가 문서 언어를 돌려주면
+    /// 32개 텍스트 블록은 장치에 유지한 채 `Group::Head` 만 교체해 나머지를 생성합니다 (이중 비전↔언어 스왑 제거).
+    pub fn generate_with_images_retrim(
+        &self,
+        items: &[(&[u32], &vision::VisionImage, ImageSlot)],
+        opts: &GenerateOptions,
+        tokenizer: Option<&crate::ai::tokenizer::ModelTokenizer>,
+        mut after_first: impl FnMut(&GeneratedIds) -> Result<Option<crate::ai::trim::Langs>>,
+    ) -> Result<Vec<(GeneratedIds, f64)>> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -798,11 +810,29 @@ impl ZoroModel {
             }
             // 핸들을 여기서 놓아야 글쓰기 단계에서 비전을 내릴 수 있습니다.
         }
-        items
-            .iter()
-            .zip(encoded)
-            .map(|((prompt, _, slot), (tokens, vision_ms))| Ok((self.write_locked(&mut res, prompt, Some((&tokens, *slot)), opts)?, vision_ms)))
-            .collect()
+        let mut out = Vec::with_capacity(items.len());
+        for (idx, ((prompt, _, slot), (tokens, vision_ms))) in items.iter().zip(encoded).enumerate() {
+            let gen = self.write_locked(&mut res, prompt, Some((&tokens, *slot)), opts)?;
+            if idx == 0 && items.len() > 1 {
+                if let (Some(tok), Some(langs)) = (tokenizer, after_first(&gen)?) {
+                    // 텍스트 블록은 상주 유지, 출력 투영 묶음(`Group::Head`)만 교체합니다.
+                    if let Some(src) = &self.trim {
+                        let next = src.head_for(&self.spec.file, tok, self.cfg.vocab, langs)?;
+                        let changed = {
+                            let mut cur = self.head.write().unwrap_or_else(|p| p.into_inner());
+                            let changed = cur.as_ref().map(|h| &h.kept) != next.as_ref().map(|h| &h.kept);
+                            *cur = next.map(Arc::new);
+                            changed
+                        };
+                        if changed {
+                            res.release(Group::Head)?;
+                        }
+                    }
+                }
+            }
+            out.push((gen, vision_ms));
+        }
+        Ok(out)
     }
 
     /// 비전 단계만: 이미지 토큰 `[병합 토큰, hidden]` (CPU). 진단 · 수치 대조용입니다 (`examples/zoro_vision.rs`).
@@ -867,10 +897,10 @@ impl ZoroModel {
         })
     }
 
-    fn layer(&self, ctx: &Ctx, w: &Loaded, i: usize, x: &Tensor, read: Option<LayerRead<'_>>) -> Result<(Tensor, Option<PendingLayer>)> {
+    fn layer(&self, ctx: &Ctx, w: &Loaded, i: usize, x: Tensor, read: Option<LayerRead<'_>>) -> Result<(Tensor, Option<PendingLayer>)> {
         let p = |s: &str| format!("blk.{i}.{s}");
         let eps = self.cfg.rms_eps;
-        let h = rms_norm(x, w.dense(&p("attn_norm.weight"))?, eps)?;
+        let h = rms_norm(&x, w.dense(&p("attn_norm.weight"))?, eps)?;
         let (mix, pending) = match (self.cfg.kind(i), read) {
             (LayerKind::LinearAttention, None) => self.linear_attention(ctx, w, i, &h, None)?,
             (LayerKind::FullAttention, None) => self.full_attention(ctx, w, i, &h, None)?,
@@ -880,11 +910,10 @@ impl ZoroModel {
             (LayerKind::FullAttention, Some(LayerRead { state: LayerState::Full(c), .. })) => self.full_attention(ctx, w, i, &h, Some(c))?,
             _ => bail!("층 {i} 의 상태 종류가 층 구조와 다릅니다"),
         };
-        let x = (x + mix)?;
-        let h = rms_norm(&x, w.dense(&p("post_attention_norm.weight"))?, eps)?;
+        let (x, h) = residual_rms_norm_inplace(x, &mix, w.dense(&p("post_attention_norm.weight"))?, eps)?;
         let gate = w.linear(&p("ffn_gate.weight"), &h)?;
         let up = w.linear(&p("ffn_up.weight"), &h)?;
-        let act = (silu(&gate)? * &up)?;
+        let act = silu_mul(&gate, &up)?;
         let down = w.linear(&p("ffn_down.weight"), &act)?;
         Ok(((x + down)?, pending))
     }

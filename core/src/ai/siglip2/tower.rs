@@ -16,7 +16,12 @@ pub(super) struct Stack<'a> {
 
 impl Stack<'_> {
     pub fn tensor(&self, name: &str) -> Result<Tensor> {
-        Ok(self.w.dense(&format!("{}.{name}", self.prefix))?.to_dtype(DType::F32)?)
+        let t = self.w.dense(&format!("{}.{name}", self.prefix))?;
+        if t.dtype() == DType::F32 {
+            Ok(t.clone())
+        } else {
+            Ok(t.to_dtype(DType::F32)?)
+        }
     }
 
     pub fn linear(&self, name: &str, x: &Tensor) -> Result<Tensor> {

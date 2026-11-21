@@ -95,10 +95,13 @@ impl VisionEncoder for GocrVision {
         for (i, input) in inputs.iter().enumerate() {
             groups.entry((input.image.grid_h, input.image.grid_w)).or_default().push(i);
         }
+        // Pack B LPT 스케줄링: 패치 면적(h*w)이 큰 격자 버킷부터 먼저 처리해 꼬리 지연을 줄입니다.
+        let mut ordered: Vec<((usize, usize), Vec<usize>)> = groups.into_iter().collect();
+        ordered.sort_by(|((h1, w1), _), ((h2, w2), _)| (h2 * w2, *h2, *w2).cmp(&(h1 * w1, *h1, *w1)));
         let device = ctx.residency.device();
         let m = self.cfg.v_merge;
         let mut out: Vec<Option<VisionFeatures>> = inputs.iter().map(|_| None).collect();
-        for ((h, w), members) in groups {
+        for ((h, w), members) in ordered {
             for chunk in members.chunks((MAX_BATCH_PATCHES / (h * w)).max(1)) {
                 let t = Instant::now();
                 let images: Vec<&PreparedImage> = chunk.iter().map(|&i| &inputs[i].image).collect();
@@ -484,13 +487,15 @@ impl GocrEngine {
         if inputs.len() < 2 {
             return self.recognize(inputs);
         }
-        let mut out = self.recognize(&inputs[..1])?;
-        // 첫 조각에 라틴 밖 글자가 있을 때만 그 언어로 자릅니다. 라틴 문자뿐이면 나머지도 12 개 언어의 행으로 읽습니다 (`Langs::decisive`).
-        if let Some(langs) = super::trim::Langs::decisive(&out[0].text) {
-            self.retrim_held(langs)?;
-        }
-        out.extend(self.recognize(&inputs[1..])?);
-        Ok(out)
+        // 모든 조각을 비전 단계 1회로 인코딩한 뒤 언어 단계에 진입하고, 첫 조각에서 문서 언어가 확정되면
+        // 텍스트 블록은 상주 유지한 채 출력 묶음(`Group::Output`)만 교체합니다.
+        self.recognize_with_retrim(inputs, |dec, first| {
+            if let Some(langs) = super::trim::Langs::decisive(&first.text) {
+                dec.retrim(langs)
+            } else {
+                Ok(false)
+            }
+        })
     }
 
     /// `BLUEPRINT_TRIM_LANGS=auto` 인가 (문서 글을 읽은 뒤 언어로 다시 자름)

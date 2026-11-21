@@ -8,12 +8,12 @@
 
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
-use candle_nn::ops::silu;
 
 use super::config::GocrConfig;
 use super::image::PreparedImage;
-use crate::ai::attention::{full_attention, layer_norm, rms_norm, Rope, ATTN_QUERY_CHUNK};
+use crate::ai::attention::{full_attention, layer_norm, rms_norm, silu_mul, Rope, ATTN_QUERY_CHUNK};
 use crate::ai::residency::{Loaded, Prepare};
+use crate::ai::vision_prune::{plan_1hop_halo, scatter_groups, PruneMode};
 
 const P: &str = "model.visual";
 
@@ -25,6 +25,8 @@ pub const PREPARE: Prepare = Prepare { touches: reshapes, apply: prepare };
 
 fn reshapes(name: &str) -> bool {
     matches!(name, "model.visual.patch_embed.proj.weight" | "model.visual.downsample.weight")
+        || (name.starts_with("model.visual.")
+            && (name.ends_with(".bias") || name.ends_with("norm.weight") || name.ends_with("norm1.weight") || name.ends_with("norm2.weight")))
 }
 
 fn prepare(name: &str, t: Tensor) -> candle_core::Result<Tensor> {
@@ -37,6 +39,9 @@ fn prepare(name: &str, t: Tensor) -> candle_core::Result<Tensor> {
         // 피라미드 파일(`ai::pyramid`)은 이미 [출력, 입력 × 2 × 2] 로 펴서 양자화해 둡니다.
         let (o, c, h, w) = t.dims4()?;
         t.reshape((o, c * h * w))
+    } else if t.rank() == 1 && t.dtype() != DType::F32 {
+        // 1차원 정규화·편향 가중치는 올릴 때 한 번만 F32 로 변환해 층마다 캐스팅 비용을 제거합니다.
+        t.to_dtype(DType::F32)
     } else {
         Ok(t)
     }
@@ -45,17 +50,30 @@ fn prepare(name: &str, t: Tensor) -> candle_core::Result<Tensor> {
 /// 가중치가 BF16 이어도(ROCm) 활성값은 F32 로 다룹니다. 행렬곱만 가중치의 dtype 으로 합니다.
 /// 피라미드 파일의 양자화 가중치(Q8_0 · K 형식)는 양자화 곱입니다 ([`Loaded::linear`]).
 fn linear(w: &Loaded, name: &str, x: &Tensor) -> Result<Tensor> {
-    w.linear(&format!("{P}.{name}.weight"), &x.to_dtype(DType::F32)?)
+    if x.dtype() == DType::F32 {
+        w.linear(&format!("{P}.{name}.weight"), x)
+    } else {
+        w.linear(&format!("{P}.{name}.weight"), &x.to_dtype(DType::F32)?)
+    }
 }
 
 fn linear_bias(w: &Loaded, name: &str, x: &Tensor) -> Result<Tensor> {
-    let bias = w.dense(&format!("{P}.{name}.bias"))?.to_dtype(DType::F32)?;
-    Ok(linear(w, name, x)?.broadcast_add(&bias)?)
+    let b = w.dense(&format!("{P}.{name}.bias"))?;
+    let y = linear(w, name, x)?;
+    if b.dtype() == DType::F32 {
+        Ok(y.broadcast_add(b)?)
+    } else {
+        Ok(y.broadcast_add(&b.to_dtype(DType::F32)?)?)
+    }
 }
 
 fn norm(w: &Loaded, name: &str, x: &Tensor, eps: f32) -> Result<Tensor> {
-    let weight = w.dense(&format!("{P}.{name}.weight"))?.to_dtype(DType::F32)?;
-    rms_norm(x, &weight, eps)
+    let weight = w.dense(&format!("{P}.{name}.weight"))?;
+    if weight.dtype() == DType::F32 {
+        rms_norm(x, weight, eps)
+    } else {
+        rms_norm(x, &weight.to_dtype(DType::F32)?, eps)
+    }
 }
 
 /// 패치의 2차원 RoPE 표 (cos, sin `[패치, head_dim/2]`). 앞 절반 주파수는 행 위치, 뒤 절반은 열 위치입니다.
@@ -108,13 +126,15 @@ fn block(cfg: &GocrConfig, w: &Loaded, i: usize, x: &Tensor, rope: &Rope, batch:
     let h = norm(w, &format!("{b}.norm2"), &x, cfg.v_rms_eps)?;
     let gate = linear_bias(w, &format!("{b}.mlp.gate_proj"), &h)?;
     let up = linear_bias(w, &format!("{b}.mlp.up_proj"), &h)?;
-    let down = linear_bias(w, &format!("{b}.mlp.down_proj"), &(silu(&gate)? * up)?)?;
+    let down = linear_bias(w, &format!("{b}.mlp.down_proj"), &silu_mul(&gate, &up)?)?;
     Ok((x + down)?)
 }
 
 fn merger_norm(w: &Loaded, x: &Tensor) -> Result<Tensor> {
-    let weight = w.dense(&format!("{P}.merger.post_projection_norm.weight"))?.to_dtype(DType::F32)?;
-    let bias = w.dense(&format!("{P}.merger.post_projection_norm.bias"))?.to_dtype(DType::F32)?;
+    let wr = w.dense(&format!("{P}.merger.post_projection_norm.weight"))?;
+    let br = w.dense(&format!("{P}.merger.post_projection_norm.bias"))?;
+    let weight = if wr.dtype() == DType::F32 { wr.clone() } else { wr.to_dtype(DType::F32)? };
+    let bias = if br.dtype() == DType::F32 { br.clone() } else { br.to_dtype(DType::F32)? };
     layer_norm(x, &weight, &bias, 1e-5)
 }
 
@@ -130,18 +150,40 @@ pub fn encode_batch(cfg: &GocrConfig, w: &Loaded, imgs: &[&PreparedImage], devic
         bail!("묶음 안의 격자가 다릅니다");
     }
     let batch = imgs.len();
-    let n = batch * first.n_patches();
-    let patches: Vec<f32> = imgs.iter().flat_map(|i| i.patches.iter().copied()).collect();
-    let x = Tensor::from_vec(patches, (n, cfg.patch_len()), device)?;
+    let prune = if batch == 1 && PruneMode::from_env() == PruneMode::Halo1HopScatter {
+        plan_1hop_halo(&first.patches, first.grid_h, first.grid_w, cfg.v_merge, cfg.patch_len(), 0.05)
+    } else {
+        None
+    };
+    let (x, rope, n_eff) = if let Some(ref plan) = prune {
+        let plen = cfg.patch_len();
+        let n_kept = plan.kept_patch_indices.len();
+        let mut kept_px = Vec::with_capacity(n_kept * plen);
+        for &pidx in &plan.kept_patch_indices {
+            let off = pidx as usize * plen;
+            kept_px.extend_from_slice(&first.patches[off..off + plen]);
+        }
+        let full_rope = vision_rope(cfg, first.grid_h, first.grid_w, device)?;
+        let idx_t = Tensor::from_slice(&plan.kept_patch_indices, (n_kept,), device)?;
+        let cos = full_rope.cos().index_select(&idx_t, 0)?;
+        let sin = full_rope.sin().index_select(&idx_t, 0)?;
+        let kept_rope = Rope::from_tables(cos, sin)?;
+        (Tensor::from_vec(kept_px, (n_kept, plen), device)?, kept_rope, n_kept)
+    } else {
+        let n = batch * first.n_patches();
+        let patches: Vec<f32> = imgs.iter().flat_map(|i| i.patches.iter().copied()).collect();
+        let x = Tensor::from_vec(patches, (n, cfg.patch_len()), device)?;
+        let rope = vision_rope(cfg, first.grid_h, first.grid_w, device)?;
+        (x, rope, n)
+    };
     let mut x = linear_bias(w, "patch_embed.proj", &x)?;
-    let rope = vision_rope(cfg, first.grid_h, first.grid_w, device)?;
     for i in 0..cfg.v_depth {
         x = block(cfg, w, i, &x, &rope, batch)?;
     }
     let x = norm(w, "post_layernorm", &x, cfg.v_rms_eps)?;
     // 2×2 패치 → 병합 토큰 하나: [M, 4, C] → [M, C, 4] 로 펴서 펼친 다운샘플 가중치와 맞춥니다.
     let mm = cfg.v_merge * cfg.v_merge;
-    let m = n / mm;
+    let m = n_eff / mm;
     let x = x.reshape((m, mm, cfg.v_hidden))?.transpose(1, 2)?.contiguous()?.reshape((m, mm * cfg.v_hidden))?;
     let x = linear_bias(w, "downsample", &x)?;
     // 병합기
@@ -149,7 +191,12 @@ pub fn encode_batch(cfg: &GocrConfig, w: &Loaded, imgs: &[&PreparedImage], devic
     let h = merger_norm(w, &h)?.gelu_erf()?;
     let gate = linear(w, "merger.gate_proj", &h)?;
     let up = linear(w, "merger.up_proj", &h)?;
-    linear(w, "merger.down_proj", &(silu(&gate)? * up)?)
+    let merged = linear(w, "merger.down_proj", &silu_mul(&gate, &up)?)?;
+    if let Some(ref plan) = prune {
+        Ok(scatter_groups(&merged, plan, device)?)
+    } else {
+        Ok(merged)
+    }
 }
 
 #[cfg(test)]

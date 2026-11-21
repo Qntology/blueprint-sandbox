@@ -10,11 +10,10 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use candle_core::{Device, Tensor};
-use candle_nn::ops::silu;
 
 use super::config::GocrConfig;
 pub use crate::ai::attention::{top1, top3, AttnMode};
-use crate::ai::attention::{rms_norm, LayerCache, StepMask};
+use crate::ai::attention::{residual_rms_norm_inplace, rms_norm, silu_mul, LayerCache, StepMask};
 use crate::ai::head::{self, HeadMap};
 use crate::ai::kv_turbo::KvCodec;
 use crate::ai::residency::Loaded;
@@ -175,31 +174,30 @@ impl Decoder<'_> {
         let mut h = x.clone();
         let mut layers = Vec::with_capacity(self.cfg.n_layers);
         for i in 0..self.cfg.n_layers {
-            let (next, kv) = self.layer(&cache.layers[i], i, &h, &cos, &sin, &mask)?;
+            let (next, kv) = self.layer(&cache.layers[i], i, h, &cos, &sin, &mask)?;
             h = next;
             layers.push(kv);
         }
         Ok((h, PendingKv { layers, n }))
     }
 
-    fn layer(&self, lc: &LayerCache, i: usize, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &StepMask) -> Result<(Tensor, (Tensor, Tensor))> {
+    fn layer(&self, lc: &LayerCache, i: usize, x: Tensor, cos: &Tensor, sin: &Tensor, mask: &StepMask) -> Result<(Tensor, (Tensor, Tensor))> {
         let w = self.blocks;
         let p = |s: &str| format!("blk.{i}.{s}");
         let eps = self.cfg.rms_eps;
-        let t = profile::mark(x);
-        let h = rms_norm(x, w.dense(&p("attn_norm.weight"))?, eps)?;
+        let t = profile::mark(&x);
+        let h = rms_norm(&x, w.dense(&p("attn_norm.weight"))?, eps)?;
         profile::lap(4, t, &h);
         let (a, kv) = self.attention(lc, i, &h, cos, sin, mask)?;
         let t = profile::mark(&a);
         let a = rms_norm(&a, w.dense(&p("post_attn_norm.weight"))?, eps)?;
-        let x = (x + a)?;
-        let h = rms_norm(&x, w.dense(&p("ffn_norm.weight"))?, eps)?;
+        let (x, h) = residual_rms_norm_inplace(x, &a, w.dense(&p("ffn_norm.weight"))?, eps)?;
         let t = profile::lap(4, t, &h);
         let gu = w.linear(&p("ffn_gate_up.weight"), &h)?;
         let ffn = self.cfg.ffn;
         let gate = gu.narrow(1, 0, ffn)?;
         let up = gu.narrow(1, ffn, ffn)?;
-        let m = w.linear(&p("ffn_down.weight"), &(silu(&gate)? * up)?)?;
+        let m = w.linear(&p("ffn_down.weight"), &silu_mul(&gate, &up)?)?;
         let t = profile::lap(3, t, &m);
         let m = rms_norm(&m, w.dense(&p("post_ffn_norm.weight"))?, eps)?;
         let out = (x + m)?;

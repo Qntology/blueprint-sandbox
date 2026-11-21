@@ -127,8 +127,8 @@ impl MasterPatches {
                 .map(|i| {
                     let q = &self.codes[i * self.dim..(i + 1) * self.dim];
                     let s = scan.patch(i);
-                    let dot: f32 = s.iter().zip(q).map(|(s, q)| s * *q as f32).sum();
-                    let norm = s.iter().map(|v| v * v).sum::<f32>().sqrt() * self.norms[i];
+                    let dot = blueprint_cpu_kernels::dot_f32_i8_simd(s, q);
+                    let norm = blueprint_cpu_kernels::dot_f32_simd(s, s).sqrt() * self.norms[i];
                     if norm > 0.0 {
                         dot / norm
                     } else {
@@ -231,6 +231,13 @@ impl Master {
 #[derive(Default)]
 pub struct MasterSet {
     pub pages: Vec<Master>,
+    mean_cache: std::sync::Mutex<Option<(usize, usize, Vec<f32>)>>,
+}
+
+impl MasterSet {
+    pub fn from_pages(pages: Vec<Master>) -> Self {
+        Self { pages, mean_cache: std::sync::Mutex::new(None) }
+    }
 }
 
 /// 스캔 한 장이 어느 마스터와 닮았는지
@@ -289,8 +296,14 @@ impl MasterSet {
         Some(Matched { index, similarity, margin })
     }
 
-    /// 마스터들의 모든 패치 평균 (도면이면 어디나 있는 성분: 흰 바탕 · 선 · 글자 결)
+    /// 마스터들의 모든 패치 평균 (도면이면 어디나 있는 성분: 흰 바탕 · 선 · 글자 결). `(pages.len(), dim)` 으로 캐시합니다.
     fn mean_patch(&self, dim: usize) -> Option<Vec<f32>> {
+        let key = (self.pages.len(), dim);
+        if let Some((n_pages, d, ref cached)) = *self.mean_cache.lock().unwrap_or_else(|p| p.into_inner()) {
+            if (n_pages, d) == key {
+                return Some(cached.clone());
+            }
+        }
         let mut mu = vec![0f64; dim];
         let mut n = 0usize;
         for m in &self.pages {
@@ -298,13 +311,17 @@ impl MasterSet {
                 continue;
             }
             for i in 0..m.patches.len() {
-                for (a, b) in mu.iter_mut().zip(m.patches.patch(i)) {
-                    *a += b as f64;
+                let scale = m.patches.scales[i] as f64;
+                let codes = &m.patches.codes[i * dim..(i + 1) * dim];
+                for (a, &q) in mu.iter_mut().zip(codes) {
+                    *a += q as f64 * scale;
                 }
                 n += 1;
             }
         }
-        (n > 0).then(|| mu.into_iter().map(|v| (v / n as f64) as f32).collect())
+        let res = (n > 0).then(|| mu.into_iter().map(|v| (v / n as f64) as f32).collect::<Vec<f32>>())?;
+        *self.mean_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some((key.0, key.1, res.clone()));
+        Some(res)
     }
 }
 
@@ -324,31 +341,51 @@ fn block_similarity(master: &MasterPatches, scan: &PatchGrid, mu: &[f32], reach:
     if scan.rows != master.rows || scan.cols != master.cols || scan.dim != master.dim {
         return None;
     }
-    let centered = |v: Vec<f32>| -> Vec<f32> {
-        let mut c: Vec<f32> = v.iter().zip(mu).map(|(a, b)| a - b).collect();
-        let n = c.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if n > 1e-8 {
-            c.iter_mut().for_each(|x| *x /= n);
+    let (rows, cols, dim) = (master.rows, master.cols, master.dim);
+    let cells = rows * cols;
+    let mut m_flat = vec![0f32; cells * dim];
+    for i in 0..cells {
+        let scale = master.scales[i];
+        let codes = &master.codes[i * dim..(i + 1) * dim];
+        let dst = &mut m_flat[i * dim..(i + 1) * dim];
+        for j in 0..dim {
+            dst[j] = codes[j] as f32 * scale - mu[j];
         }
-        c
-    };
-    let m: Vec<Vec<f32>> = (0..master.len()).map(|i| centered(master.patch(i))).collect();
-    let (rows, cols) = (master.rows, master.cols);
+        let n = blueprint_cpu_kernels::dot_f32_simd(dst, dst).sqrt();
+        if n > 1e-8 {
+            let inv = 1.0 / n;
+            for x in dst.iter_mut() {
+                *x *= inv;
+            }
+        }
+    }
+    let mut s_buf = vec![0f32; dim];
     let mut sum = 0f32;
     for r in 0..rows {
         for c in 0..cols {
-            let s = centered(scan.patch(r * cols + c).to_vec());
+            let sp = scan.patch(r * cols + c);
+            for j in 0..dim {
+                s_buf[j] = sp[j] - mu[j];
+            }
+            let n = blueprint_cpu_kernels::dot_f32_simd(&s_buf, &s_buf).sqrt();
+            if n > 1e-8 {
+                let inv = 1.0 / n;
+                for x in s_buf.iter_mut() {
+                    *x *= inv;
+                }
+            }
             let mut best = f32::MIN;
             for rr in r.saturating_sub(reach)..(r + reach + 1).min(rows) {
                 for cc in c.saturating_sub(reach)..(c + reach + 1).min(cols) {
-                    let dot: f32 = s.iter().zip(&m[rr * cols + cc]).map(|(a, b)| a * b).sum();
+                    let idx = (rr * cols + cc) * dim;
+                    let dot = blueprint_cpu_kernels::dot_f32_simd(&s_buf, &m_flat[idx..idx + dim]);
                     best = best.max(dot);
                 }
             }
             sum += best;
         }
     }
-    Some(sum / (rows * cols).max(1) as f32)
+    Some(sum / cells.max(1) as f32)
 }
 
 impl MasterSet {
@@ -692,7 +729,7 @@ mod tests {
         let swap = other.patch(6).to_vec();
         scan.patches[6 * 64..7 * 64].copy_from_slice(&swap);
         let ink = || page(400, 300, &[], 250);
-        let set = MasterSet { pages: vec![Master::new("다른 도면", &other, ink(), 3), Master::new("원본", &master, ink(), 3)] };
+        let set = MasterSet::from_pages(vec![Master::new("다른 도면", &other, ink(), 3), Master::new("원본", &master, ink(), 3)]);
         let best = set.best_match(&scan).unwrap();
         assert_eq!(set.pages[best.index].id(), "원본");
         assert!(best.similarity > 0.9 && best.margin > 0.5, "{best:?}");
@@ -723,7 +760,7 @@ mod tests {
             scan.patches[i * 64..(i + 1) * 64].copy_from_slice(other.patch(i));
         }
         let ink = || page(400, 300, &[], 250);
-        let set = MasterSet { pages: vec![Master::new("다른 도면", &b, ink(), 3), Master::new("원본", &a, ink(), 3)] };
+        let set = MasterSet::from_pages(vec![Master::new("다른 도면", &b, ink(), 3), Master::new("원본", &a, ink(), 3)]);
         let mean = set.best_match_by(&scan, MatchMethod::Mean).unwrap();
         let centered = set.best_match_by(&scan, MatchMethod::Centered).unwrap();
         let chamfer = set.best_match_by(&scan, MatchMethod::Chamfer).unwrap();

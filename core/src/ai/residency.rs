@@ -237,8 +237,9 @@ impl Loaded {
             imatrix::record(name, x)?;
         }
         match self.get(name)? {
-            // CUDA 의 기본 곱은 활성값을 8비트로 줄입니다. 판단 스케일을 맞춘 ROCm · Vulkan 과 같은 값이 나오도록 정확한 곱을 씁니다.
-            Weight::Quant(m) if x.device().is_cuda() => Ok(m.forward_exact(x)?),
+            // CUDA · Metal 의 기본 곱은 활성값 정밀도를 낮추거나 호스트로 풀 수 있습니다.
+            // candle@881b3c8 의 Metal 네이티브 Q8 `forward_exact` 와 CUDA 정확한 곱을 함께 씁니다.
+            Weight::Quant(m) if x.device().is_cuda() || x.device().is_metal() => Ok(m.forward_exact(x)?),
             Weight::Quant(m) => Ok(m.forward(x)?),
             Weight::Dense(w) if w.rank() == 2 => dense_linear(x, w),
             Weight::Dense(w) => bail!("{name}: 선형 가중치가 아닙니다 (모양 {:?})", w.dims()),
@@ -876,16 +877,26 @@ impl Residency {
         }
         // 올리기 전에 장치에 실제로 자리가 있는지 봅니다. 다른 프로세스가 같은 GPU 를 쓰고 있으면 예산을 잡은 때와 여유가 달라졌을 수 있습니다.
         let on_device = spec_heap_bytes(spec, group, &self.device)?;
-        // 앞 계산이 놓은 작업 버퍼는 메모리 풀에 남아 있다가 이 묶음을 올릴 때 다시 쓰입니다. 그러면 올린 만큼 여유가 줄지 않아
-        // 가중치가 호스트에 남은 것처럼 보이므로, 먼저 돌려받아야 올리기 전후의 차이가 이 묶음의 크기가 됩니다
-        // (Metal 은 동기화할 때 돌려주고, ROCm · CUDA · Vulkan 은 풀을 비워야 돌려줍니다).
-        if !self.device.is_cpu() {
+        // 큰 묶음(>= 64 MiB: `weights_missing_from_device` 측정 대상)일 때만 사전 동기화·풀 반환을 수행하고,
+        // 작은 묶음(Output · Head 등)은 여유 메모리가 모자랄 때만 지연 정리해 핫패스 스톨을 줄입니다.
+        let needs_measure_drain = on_device >= (64 << 20);
+        if !self.device.is_cpu() && needs_measure_drain {
             let _ = self.device.synchronize_all();
             if !self.device.is_metal() {
                 let _ = self.device.trim_memory_pool(0);
             }
         }
         let (mut free_before, mut buffers_before) = (self.free_bytes(), self.tensor_buffer_bytes());
+        if !self.device.is_cpu()
+            && !needs_measure_drain
+            && check_headroom(group, on_device, free_before, headroom_bytes()).is_err()
+        {
+            let _ = self.device.synchronize_all();
+            if !self.device.is_metal() {
+                let _ = self.device.trim_memory_pool(0);
+            }
+            (free_before, buffers_before) = (self.free_bytes(), self.tensor_buffer_bytes());
+        }
         // 남겨 둔 묶음이 있으면 공존 여유까지 남아야 올립니다. 모자라면 남겨 둔 묶음을 먼저 내립니다 (저사양 GPU 는 예전과 같아짐).
         if !self.pinned.is_empty() && check_headroom(group, on_device, free_before, headroom_bytes() + self.coexist.margin).is_err() {
             self.release_pinned()?;
@@ -896,8 +907,10 @@ impl Residency {
         }
         let t0 = Instant::now();
         let loaded = load_group(spec, group, &self.device)?;
-        // 올리는 쪽 복사가 끝났음을 보장해야 이후의 여유 메모리 측정이 의미가 있습니다.
-        let _ = self.device.synchronize_all();
+        // 큰 묶음 측정이 필요할 때만 복사 완료 동기화로 `free_after` 를 확정합니다.
+        if needs_measure_drain && !self.device.is_cpu() {
+            let _ = self.device.synchronize_all();
+        }
         let (free_after, buffers_after) = (self.free_bytes(), self.tensor_buffer_bytes());
         if let (Some(before), Some(after)) = (free_before, free_after) {
             let observed = before.saturating_sub(after);
