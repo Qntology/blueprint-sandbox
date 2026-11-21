@@ -68,6 +68,12 @@ struct Layer {
     global: bool,
 }
 
+struct StepTables {
+    global_rope: (Tensor, Tensor),
+    local_rope: (Tensor, Tensor),
+    window: Tensor,
+}
+
 /// granite 임베딩 모델 (CPU · F32 계산, 낱말 임베딩 표만 BF16 그대로)
 pub struct TextEmbedder {
     tokenizer: Tokenizer,
@@ -77,6 +83,7 @@ pub struct TextEmbedder {
     final_norm: Tensor,
     cfg: Config,
     device: Device,
+    tables: Mutex<HashMap<usize, Arc<StepTables>>>,
 }
 
 impl std::fmt::Debug for TextEmbedder {
@@ -136,7 +143,7 @@ impl TextEmbedder {
             });
         }
         let final_norm = f32w(take("final_norm.weight")?)?;
-        Ok(Self { tokenizer, tok_embeddings, emb_norm, layers, final_norm, cfg, device })
+        Ok(Self { tokenizer, tok_embeddings, emb_norm, layers, final_norm, cfg, device, tables: Mutex::new(HashMap::new()) })
     }
 
     pub fn dim(&self) -> usize {
@@ -164,6 +171,27 @@ impl TextEmbedder {
         self.embed_ids(&ids)
     }
 
+    fn step_tables(&self, len: usize) -> Result<Arc<StepTables>> {
+        if let Some(t) = self.tables.lock().unwrap_or_else(|p| p.into_inner()).get(&len) {
+            return Ok(Arc::clone(t));
+        }
+        let cfg = &self.cfg;
+        let global_rope = self.rope(len, cfg.global_rope_theta)?;
+        let local_rope = self.rope(len, cfg.local_rope_theta.unwrap_or(cfg.global_rope_theta))?;
+        let half = (cfg.local_attention / 2) as i64;
+        let window: Vec<f32> = (0..len as i64)
+            .flat_map(|i| (0..len as i64).map(move |j| if (i - j).abs() <= half { 0.0 } else { f32::NEG_INFINITY }))
+            .collect();
+        let window = Tensor::from_vec(window, (1, len, len), &self.device)?;
+        let entry = Arc::new(StepTables { global_rope, local_rope, window });
+        let mut guard = self.tables.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.len() >= 64 {
+            guard.clear();
+        }
+        guard.insert(len, Arc::clone(&entry));
+        Ok(entry)
+    }
+
     pub fn embed_ids(&self, ids: &[u32]) -> Result<Vec<f32>> {
         let cfg = &self.cfg;
         let len = ids.len();
@@ -171,12 +199,7 @@ impl TextEmbedder {
         let hd = cfg.hidden_size / heads;
         let ids_t = Tensor::from_vec(ids.to_vec(), (len,), &self.device)?;
         let mut h = layer_norm(&self.tok_embeddings.index_select(&ids_t, 0)?.to_dtype(DType::F32)?, &self.emb_norm, cfg.norm_eps)?;
-        let global_rope = self.rope(len, cfg.global_rope_theta)?;
-        let local_rope = self.rope(len, cfg.local_rope_theta.unwrap_or(cfg.global_rope_theta))?;
-        // 창 주의: |i - j| ≤ local_attention / 2 만 봅니다 (transformers sliding_window_bidirectional_overlay)
-        let half = (cfg.local_attention / 2) as i64;
-        let window: Vec<f32> = (0..len as i64).flat_map(|i| (0..len as i64).map(move |j| if (i - j).abs() <= half { 0.0 } else { f32::NEG_INFINITY })).collect();
-        let window = Tensor::from_vec(window, (1, len, len), &self.device)?;
+        let tables = self.step_tables(len)?;
         let scale = (hd as f64).powf(-0.5);
         for layer in &self.layers {
             let x = match &layer.attn_norm {
@@ -187,12 +210,12 @@ impl TextEmbedder {
             let q = qkv.narrow(1, 0, 1)?.squeeze(1)?.transpose(0, 1)?.contiguous()?;
             let k = qkv.narrow(1, 1, 1)?.squeeze(1)?.transpose(0, 1)?.contiguous()?;
             let v = qkv.narrow(1, 2, 1)?.squeeze(1)?.transpose(0, 1)?.contiguous()?;
-            let (cos, sin) = if layer.global { &global_rope } else { &local_rope };
+            let (cos, sin) = if layer.global { &tables.global_rope } else { &tables.local_rope };
             let q = (q.broadcast_mul(cos)? + rotate_half(&q)?.broadcast_mul(sin)?)?;
             let k = (k.broadcast_mul(cos)? + rotate_half(&k)?.broadcast_mul(sin)?)?;
             let mut scores = (q.matmul(&k.t()?)? * scale)?;
             if !layer.global {
-                scores = scores.broadcast_add(&window)?;
+                scores = scores.broadcast_add(&tables.window)?;
             }
             let probs = candle_nn::ops::softmax_last_dim(&scores)?;
             let attn = probs.matmul(&v)?.transpose(0, 1)?.contiguous()?.reshape((len, cfg.hidden_size))?;
@@ -250,9 +273,9 @@ impl CachedEmbedder {
     }
 }
 
-/// 두 정규화 벡터의 코사인 (= 내적)
+/// 두 정규화 벡터의 코사인 (= 내적, SIMD 가속)
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    blueprint_cpu_kernels::dot_f32_simd(a, b)
 }
 
 #[cfg(test)]

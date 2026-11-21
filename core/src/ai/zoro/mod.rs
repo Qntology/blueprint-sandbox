@@ -250,30 +250,24 @@ impl ZoroBackbone {
     /// 글자가 있으면 그 언어로 다시 잘라 나머지를 읽습니다 (한 문서의 조각들, [`crate::ai::trim::Langs::decisive`]).
     pub fn read_images(&self, images: &[image::RgbImage], instruction: &str, max_tokens: usize, max_pixels: usize) -> Result<Vec<ImageReading>> {
         let _run = self.lock_run();
-        if self.model.trim_auto() {
+        let auto = self.model.trim_auto();
+        if auto {
             // 새 문서는 12 개 언어의 행으로 시작합니다 (앞 문서의 언어로 잘린 행을 이어 쓰지 않음, 이미지가 한 장이어도)
             self.model.retrim(&self.tokenizer, crate::ai::trim::Langs::all())?;
         }
-        if self.model.trim_auto() && images.len() > 1 {
-            let mut out = self.read_images_held(&images[..1], instruction, max_tokens, max_pixels)?;
-            // 첫 장에 라틴 밖 글자가 있을 때만 그 언어로 자릅니다 (`Langs::decisive`, 라틴 문자뿐이면 12 개 언어의 행 그대로)
-            if let Some(langs) = crate::ai::trim::Langs::decisive(&out[0].text) {
-                self.model.retrim(&self.tokenizer, langs)?;
-            }
-            out.extend(self.read_images_held(&images[1..], instruction, max_tokens, max_pixels)?);
-            return Ok(out);
-        }
-        self.read_images_held(images, instruction, max_tokens, max_pixels)
+        // 모든 이미지를 비전 단계 1회로 인코딩한 뒤 텍스트 블록을 올리고, 첫 장에서 문서 언어가 확정되면
+        // 32개 텍스트 블록은 유지한 채 `Group::Head` 만 교체합니다.
+        self.read_images_held(images, instruction, max_tokens, max_pixels, auto)
     }
 
     /// 지금의 출력 투영으로 읽습니다.
     pub fn read_images_now(&self, images: &[image::RgbImage], instruction: &str, max_tokens: usize, max_pixels: usize) -> Result<Vec<ImageReading>> {
         let _run = self.lock_run();
-        self.read_images_held(images, instruction, max_tokens, max_pixels)
+        self.read_images_held(images, instruction, max_tokens, max_pixels, false)
     }
 
     /// [`Self::read_images_now`] 의 본체 (생성 잠금을 쥔 쪽에서 부릅니다)
-    fn read_images_held(&self, images: &[image::RgbImage], instruction: &str, max_tokens: usize, max_pixels: usize) -> Result<Vec<ImageReading>> {
+    fn read_images_held(&self, images: &[image::RgbImage], instruction: &str, max_tokens: usize, max_pixels: usize, auto_retrim: bool) -> Result<Vec<ImageReading>> {
         let cfg = self.model.vision_config()?;
         let pad = self.tokenizer.token_to_id("<|image_pad|>").context("토크나이저에 <|image_pad|> 가 없습니다")?;
         let head = self.tokenizer.encode("<|im_start|>user\n<|vision_start|>")?.ids;
@@ -290,7 +284,14 @@ impl ZoroBackbone {
         let stop = STOP_TOKENS.iter().filter_map(|t| self.tokenizer.token_to_id(t)).collect();
         let opts = GenerateOptions::new(max_tokens, stop).with_speculation(self.speculation);
         let items: Vec<(&[u32], &vision::VisionImage, model::ImageSlot)> = prepared.iter().map(|(ids, p, s)| (ids.as_slice(), p, *s)).collect();
-        let outs = self.model.generate_with_images(&items, &opts)?;
+        let outs = if auto_retrim && items.len() > 1 {
+            self.model.generate_with_images_retrim(&items, &opts, Some(&self.tokenizer), |first| {
+                let text = self.tokenizer.decode(&first.tokens)?;
+                Ok(crate::ai::trim::Langs::decisive(&text))
+            })?
+        } else {
+            self.model.generate_with_images(&items, &opts)?
+        };
         outs.into_iter()
             .zip(&prepared)
             .map(|((out, vision_ms), (_, _, slot))| {

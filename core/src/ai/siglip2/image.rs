@@ -65,16 +65,18 @@ impl HeightWidth for RgbImage {
 }
 
 fn patchify(img: &RgbImage, patch: usize) -> Vec<f32> {
+    static LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    let lut = LUT.get_or_init(|| std::array::from_fn(|i| i as f32 / 255.0 * 2.0 - 1.0));
     let (w, h) = (img.width() as usize, img.height() as usize);
     let raw = img.as_raw();
     let mut out = Vec::with_capacity(w * h * 3);
     for r in 0..h / patch {
         for c in 0..w / patch {
             for y in r * patch..(r + 1) * patch {
-                for x in c * patch..(c + 1) * patch {
-                    for ch in 0..3 {
-                        out.push(raw[(y * w + x) * 3 + ch] as f32 / 255.0 * 2.0 - 1.0);
-                    }
+                let row_off = (y * w + c * patch) * 3;
+                let slice = &raw[row_off..row_off + patch * 3];
+                for &b in slice {
+                    out.push(lut[b as usize]);
                 }
             }
         }

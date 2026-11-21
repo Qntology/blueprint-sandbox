@@ -158,6 +158,45 @@ where
         self.run_locked(&mut res, inputs, each)
     }
 
+    /// 비전 단계를 **한 번만** 거쳐 모든 입력을 인코딩한 뒤 언어 단계로 진입하고, 첫 결과 뒤 `after_first` 가 `true` 를 돌려주면
+    /// 텍스트 블록은 장치에 유지한 채 `Group::Output` 만 교체하고 나머지 입력을 이어 디코딩합니다.
+    pub fn recognize_with_retrim(&self, inputs: &[E::Input], mut after_first: impl FnMut(&D, &D::Output) -> Result<bool>) -> Result<Vec<D::Output>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut res = self.residency.lock().unwrap_or_else(|p| p.into_inner());
+        let t = Instant::now();
+        let features = {
+            let handles = res.enter(&self.spec, &vision_phase())?;
+            self.encoder.encode_many(&PhaseCtx { residency: &*res }, &handles[0], inputs)?
+        };
+        trace::record("gocr", "비전", t.elapsed().as_secs_f64() * 1e3, json!({ "inputs": inputs.len() }));
+        let t = Instant::now();
+        let handles = res.enter(&self.spec, &language_phase(self.blocks))?;
+        let mut weights = LanguageWeights { blocks: Arc::clone(&handles[0]), output: Arc::clone(&handles[1]) };
+        drop(handles);
+        let mut out = Vec::with_capacity(features.len());
+        let mut iter = features.into_iter();
+        if let Some(first_f) = iter.next() {
+            let first = self.decoder.decode(&PhaseCtx { residency: &*res }, &weights, first_f)?;
+            let need_reload = inputs.len() > 1 && after_first(&self.decoder, &first)?;
+            out.push(first);
+            if need_reload {
+                // 텍스트 블록은 상주 유지, 출력 투영 묶음(`Group::Output`)만 교체합니다.
+                let blocks = weights.blocks;
+                drop(weights.output);
+                res.release(Group::Output)?;
+                let handles = res.enter(&self.spec, &language_phase(self.blocks))?;
+                weights = LanguageWeights { blocks, output: Arc::clone(&handles[1]) };
+            }
+            for f in iter {
+                out.push(self.decoder.decode(&PhaseCtx { residency: &*res }, &weights, f)?);
+            }
+        }
+        trace::record("gocr", "언어", t.elapsed().as_secs_f64() * 1e3, json!({ "inputs": inputs.len() }));
+        Ok(out)
+    }
+
     fn run_locked<R>(&self, res: &mut Residency, inputs: &[E::Input], mut each: impl FnMut(usize, &D, &PhaseCtx<'_>, &LanguageWeights, E::Features) -> Result<R>) -> Result<Vec<R>> {
         if inputs.is_empty() {
             return Ok(Vec::new());

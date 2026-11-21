@@ -330,11 +330,33 @@ pub fn write_gguf(path: &Path, metadata: &[(String, Value)], tensors: Vec<OutTen
     w.flush()?;
     let total = w.at;
     drop(w);
-    if path.exists() {
-        std::fs::remove_file(path).with_context(|| format!("{} 를 바꿀 수 없습니다 (앱이 열고 있으면 끄고 다시 하세요)", path.display()))?;
-    }
-    std::fs::rename(&tmp, path)?;
+    replace_file_atomically(&tmp, path)?;
     Ok(total)
+}
+
+/// 크래시 시 기존 파일이 사라지지 않도록 임시 파일을 대상 경로로 원자적 교체합니다.
+fn replace_file_atomically(tmp: &Path, path: &Path) -> Result<()> {
+    match std::fs::rename(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) if path.exists() => {
+            let bak = path.with_extension("gguf.bak");
+            let _ = std::fs::remove_file(&bak);
+            std::fs::rename(path, &bak).with_context(|| {
+                format!("{} 를 바꿀 수 없습니다 (앱이 열고 있으면 끄고 다시 하세요)", path.display())
+            })?;
+            match std::fs::rename(tmp, path) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&bak);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = std::fs::rename(&bak, path);
+                    Err(e).with_context(|| format!("{} 를 교체하지 못했습니다", path.display()))
+                }
+            }
+        }
+        Err(e) => Err(e).with_context(|| format!("{} 로 옮기지 못했습니다", path.display())),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

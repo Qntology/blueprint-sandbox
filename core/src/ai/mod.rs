@@ -39,6 +39,7 @@ pub mod tokenizer;
 pub mod trace;
 pub mod trim;
 pub mod verify;
+pub mod vision_prune;
 pub mod weights;
 pub mod zoro;
 

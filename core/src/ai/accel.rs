@@ -85,21 +85,21 @@ pub fn select_device_with(pref: DevicePref) -> Result<Device> {
     }
 }
 
-/// 쓸 GPU 번호를 직접 정하는 환경 변수. 없으면 여유 VRAM 이 가장 많은 GPU 를 고릅니다 (Metal · Vulkan 은 0번).
+/// 쓸 GPU 번호를 직접 정하는 환경 변수. 없으면 여유 VRAM 이 가장 많은 GPU 를 고릅니다 (Metal 은 0번).
 pub const GPU_ENV: &str = "BLUEPRINT_GPU";
 
-#[cfg_attr(not(any(test, feature = "cuda", feature = "rocm")), allow(dead_code))]
+#[cfg_attr(not(any(test, feature = "cuda", feature = "rocm", feature = "metal", feature = "vulkan")), allow(dead_code))]
 fn parse_gpu(s: &str) -> Result<usize> {
     s.trim().parse().map_err(|_| anyhow!("{GPU_ENV}={s:?}: 0 이상의 GPU 번호여야 합니다"))
 }
 
-#[cfg_attr(not(any(test, feature = "cuda", feature = "rocm")), allow(dead_code))]
+#[cfg_attr(not(any(feature = "cuda", feature = "rocm", feature = "metal", feature = "vulkan")), allow(dead_code))]
 fn gpu_override() -> Result<Option<usize>> {
     std::env::var(GPU_ENV).ok().filter(|v| !v.trim().is_empty()).map(|v| parse_gpu(&v)).transpose()
 }
 
 /// 여유 VRAM 이 가장 많은 GPU (logis-center `get_best_device_info` 와 같음). 같으면 앞 번호이고, 모두 재지 못했으면 0번입니다.
-#[cfg_attr(not(any(test, feature = "cuda", feature = "rocm")), allow(dead_code))]
+#[cfg_attr(not(any(test, feature = "cuda", feature = "rocm", feature = "vulkan")), allow(dead_code))]
 fn best_gpu(free: &[(usize, u64)]) -> usize {
     for (id, bytes) in free {
         eprintln!("[BLUEPRINT-ACCEL] GPU {id}: 여유 VRAM {:.2} GB", *bytes as f64 / 1e9);
@@ -166,7 +166,9 @@ fn open_rocm() -> Result<Option<Device>> {
             best_gpu(&free)
         }
     };
-    Ok(Some(Device::new_rocm(id)?))
+    let dev = Device::new_rocm(id)?;
+    ROCM_USED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(Some(dev))
 }
 
 #[cfg(not(feature = "rocm"))]
@@ -222,10 +224,33 @@ fn open_metal() -> Result<Option<Device>> {
 
 #[cfg(feature = "vulkan")]
 fn open_vulkan() -> Result<Option<Device>> {
-    if candle_core::vulkan_backend::device_count().unwrap_or(0) == 0 {
+    let count = candle_core::vulkan_backend::device_count().unwrap_or(0);
+    if count == 0 {
         return Ok(None);
     }
-    Ok(Some(Device::new_vulkan(gpu_override()?.unwrap_or(0))?))
+    if let Some(id) = gpu_override()? {
+        return Ok(Some(Device::new_vulkan(id)?));
+    }
+    let probe_count = count.min(8);
+    if probe_count == 1 {
+        return Ok(Some(Device::new_vulkan(0)?));
+    }
+    let mut devices: Vec<(usize, Device)> = Vec::with_capacity(probe_count);
+    for id in 0..probe_count {
+        if let Ok(d) = Device::new_vulkan(id) {
+            devices.push((id, d));
+        }
+    }
+    if devices.is_empty() {
+        return Ok(Some(Device::new_vulkan(0)?));
+    }
+    let free: Vec<(usize, u64)> = devices
+        .iter()
+        .enumerate()
+        .map(|(slot, (_, d))| (slot, d.mem_info().ok().flatten().map_or(0, |(free, _)| free as u64)))
+        .collect();
+    let best_slot = best_gpu(&free);
+    Ok(Some(devices.swap_remove(best_slot).1))
 }
 
 #[cfg(not(feature = "vulkan"))]
@@ -260,23 +285,27 @@ pub fn dense_dtype(device: &Device) -> DType {
 /// 정상 종료 경로를 타게 하는 환경 변수 (`0`). 멈춤을 재현할 때만 씁니다.
 pub const FAST_EXIT_ENV: &str = "BLUEPRINT_ROCM_FAST_EXIT";
 
+static ROCM_USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 프로세스가 ROCm 장치를 한 번이라도 열었는지 표시합니다.
+pub fn mark_rocm_used() {
+    ROCM_USED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(windows)]
 extern "system" {
     fn GetCurrentProcess() -> *mut std::ffi::c_void;
     fn TerminateProcess(process: *mut std::ffi::c_void, code: u32) -> i32;
 }
 
-/// ROCm 을 쓴 Windows 프로세스를 끝냅니다. `main` 의 마지막에 부릅니다. 그 밖의 장치에서는 아무것도 하지 않고 돌아옵니다.
-///
-/// `ExitProcess` 는 다른 스레드를 먼저 끝낸 뒤 DLL 을 내리는데, `rocblas.dll` 의 종료 처리가 `amdhip64` 를 부르고
-/// `amdhip64` 는 이미 사라진 HIP 런타임 스레드를 기다리며 무한히 돕니다. 이렇게 멈춘 프로세스는 코어 하나를 계속 쓰고 `taskkill` 로도 끝나지 않습니다
-/// (logis-center 측정 68번 중 2번, zorogravity 에서도 재현). GPU 작업을 끝내고 출력을 비운 뒤 DLL 해제를 건너뛰어 끝냅니다.
-pub fn finish_process(device: &Device, code: u32) {
+/// ROCm 을 한 번이라도 사용한 Windows 프로세스를 안전하게 종료합니다 (`&Device` 핸들이 없어도 호출 가능).
+pub fn rocm_exit_now_if_used(code: u32) {
     use std::io::Write;
-    if !matches!(device, Device::Rocm(_)) || std::env::var(FAST_EXIT_ENV).is_ok_and(|v| v.trim() == "0") {
+    if !ROCM_USED.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var(FAST_EXIT_ENV).is_ok_and(|v| v.trim() == "0")
+    {
         return;
     }
-    let _ = device.synchronize_all();
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     #[cfg(windows)]
@@ -285,6 +314,22 @@ pub fn finish_process(device: &Device, code: u32) {
     }
     #[cfg(not(windows))]
     let _ = code;
+}
+
+/// ROCm 을 쓴 Windows 프로세스를 끝냅니다. `main` 의 마지막에 부릅니다. 그 밖의 장치에서는 아무것도 하지 않고 돌아옵니다.
+///
+/// `ExitProcess` 는 다른 스레드를 먼저 끝낸 뒤 DLL 을 내리는데, `rocblas.dll` 의 종료 처리가 `amdhip64` 를 부르고
+/// `amdhip64` 는 이미 사라진 HIP 런타임 스레드를 기다리며 무한히 돕니다. 이렇게 멈춘 프로세스는 코어 하나를 계속 쓰고 `taskkill` 로도 끝나지 않습니다
+/// (logis-center 측정 68번 중 2번, zorogravity 에서도 재현). GPU 작업을 끝내고 출력을 비운 뒤 DLL 해제를 건너뛰어 끝냅니다.
+pub fn finish_process(device: &Device, code: u32) {
+    if matches!(device, Device::Rocm(_)) {
+        mark_rocm_used();
+        let _ = device.synchronize_all();
+    }
+    if !matches!(device, Device::Rocm(_)) {
+        return;
+    }
+    rocm_exit_now_if_used(code);
 }
 
 pub fn is_gpu(device: &Device) -> bool {
@@ -299,6 +344,18 @@ pub fn backend_name(device: &Device) -> &'static str {
         Device::Vulkan(_) => "vulkan",
         Device::Cpu => "cpu",
         _ => "other",
+    }
+}
+
+/// 백엔드와 장치 번호(ordinal)를 포함한 표시 이름 (예: `rocm:0`, `vulkan:1`, `cpu`).
+pub fn device_label(device: &Device) -> String {
+    match device.location() {
+        candle_core::DeviceLocation::Cpu => "cpu".to_string(),
+        candle_core::DeviceLocation::Cuda { gpu_id } => format!("cuda:{gpu_id}"),
+        candle_core::DeviceLocation::Rocm { gpu_id } => format!("rocm:{gpu_id}"),
+        candle_core::DeviceLocation::Metal { gpu_id } => format!("metal:{gpu_id}"),
+        candle_core::DeviceLocation::Vulkan { gpu_id } => format!("vulkan:{gpu_id}"),
+        candle_core::DeviceLocation::OpenCl { gpu_id } => format!("opencl:{gpu_id}"),
     }
 }
 

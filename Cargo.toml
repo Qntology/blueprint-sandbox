@@ -5,14 +5,14 @@
 # 참고 구현: https://github.com/Qntology/zoro-gravity (5-Gate 파이프라인 · 가중치 상주 관리 · 앱 구조)
 
 [workspace]
-members = ["core", "tools/model-settings", "app/src-tauri"]
+members = ["crates/blueprint-cpu-kernels", "core", "tools/model-settings", "app/src-tauri"]
 resolver = "2"
 
 [patch.crates-io]
-# 포크의 candle-core · candle-nn 으로 바꿉니다. GitHub 의 Qntology master 를 받습니다 (zoro-gravity 와 같은 방식).
+# 포크의 candle-core · candle-nn 으로 바꿉니다. GitHub 의 Qntology master(PR #15: Pack C fused decoder + Pack A/C lm_head CS + ROCm conv2d + Metal Q8) 를 받습니다.
 # 로컬 워킹트리로 바꾸려면 git 줄을 주석 처리하고 아래 path 줄의 주석을 푸세요.
-candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
-candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "881b3c807a2fedff0e1fa9e9a80ee16cc0e93463" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "881b3c807a2fedff0e1fa9e9a80ee16cc0e93463" }
 # candle-core = { path = "../candle-rocm-vulkan/candle-core" }
 # candle-nn = { path = "../candle-rocm-vulkan/candle-nn" }
 
@@ -24,6 +24,10 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.candle-rocm]
 opt-level = 3
+[profile.dev.package.blueprint-cpu-kernels]
+opt-level = 3
 
 [profile.release]
 opt-level = 3
+lto = "thin"
+codegen-units = 1

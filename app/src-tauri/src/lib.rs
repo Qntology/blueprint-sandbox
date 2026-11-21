@@ -226,7 +226,7 @@ fn random_u32() -> u32 {
 }
 
 fn engine_ready() -> bool {
-    status().iter().all(|s| s.installed || s.entry.repo.is_none())
+    status().iter().all(|s| s.installed || !s.entry.required)
 }
 
 fn local_time(at: DateTime<Utc>) -> String {

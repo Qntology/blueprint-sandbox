@@ -62,6 +62,10 @@ pub fn smart_resize(height: usize, width: usize, factor: usize) -> Result<(usize
 
 /// 바이큐빅으로 맞춘 RGB 이미지를 패치로 자릅니다.
 pub fn patchify(img: &RgbImage, patch: usize, merge: usize) -> Result<PreparedImage> {
+    static LUT: std::sync::OnceLock<[[f32; 256]; 3]> = std::sync::OnceLock::new();
+    let lut = LUT.get_or_init(|| {
+        std::array::from_fn(|ch| std::array::from_fn(|i| (i as f32 / 255.0 - IMAGE_MEAN[ch]) / IMAGE_STD[ch]))
+    });
     let (w, h) = (img.width() as usize, img.height() as usize);
     if !h.is_multiple_of(patch * merge) || !w.is_multiple_of(patch * merge) {
         bail!("이미지 크기 {h}×{w} 가 {} 의 배수가 아닙니다", patch * merge);
@@ -75,10 +79,11 @@ pub fn patchify(img: &RgbImage, patch: usize, merge: usize) -> Result<PreparedIm
                 for j in 0..merge {
                     let (r0, c0) = ((mr * merge + i) * patch, (mc * merge + j) * patch);
                     for ch in 0..3 {
+                        let ch_lut = &lut[ch];
                         for y in r0..r0 + patch {
-                            for x in c0..c0 + patch {
-                                let v = raw[(y * w + x) * 3 + ch] as f32 / 255.0;
-                                patches.push((v - IMAGE_MEAN[ch]) / IMAGE_STD[ch]);
+                            let row_base = (y * w + c0) * 3 + ch;
+                            for x in 0..patch {
+                                patches.push(ch_lut[raw[row_base + x * 3] as usize]);
                             }
                         }
                     }

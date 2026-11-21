@@ -76,13 +76,18 @@ fn median(mut v: Vec<f32>) -> f32 {
 pub fn run(scores: &[&[f32]], active: &[bool], protected: &[bool]) -> Arena {
     let k = scores.len();
     let mut alive = vec![true; k];
-    let contested: Vec<f32> = compete(scores, &alive, active).iter().filter(|c| c.contested).map(|c| c.margin).collect();
+    let mut cells = compete(scores, &alive, active);
+    let contested: Vec<f32> = cells.iter().filter(|c| c.contested).map(|c| c.margin).collect();
     let gate = if contested.len() < MIN_CONTESTED { 0.0 } else { median(contested) * MARGIN_RATIO };
 
     let mut rounds = 0;
+    let mut dirty = false;
     for _ in 0..MAX_ROUNDS {
         rounds += 1;
-        let cells = compete(scores, &alive, active);
+        if dirty {
+            cells = compete(scores, &alive, active);
+            dirty = false;
+        }
         let mut firm = vec![0usize; k];
         for c in &cells {
             if let Some(o) = c.owner.filter(|_| c.margin >= gate) {
@@ -94,8 +99,12 @@ pub fn run(scores: &[&[f32]], active: &[bool], protected: &[bool]) -> Arena {
             break;
         }
         losers.iter().for_each(|&i| alive[i] = false);
+        dirty = true;
     }
-    Arena { cells: compete(scores, &alive, active), alive, gate, rounds }
+    if dirty {
+        cells = compete(scores, &alive, active);
+    }
+    Arena { cells, alive, gate, rounds }
 }
 
 #[cfg(test)]
