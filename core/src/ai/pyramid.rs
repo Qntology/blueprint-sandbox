@@ -13,8 +13,8 @@
 //!   (예전 `output_rest.weight` 없음). 묶인 임베딩 모델(zoro)은 파일을 더 만들지 않고 실행할 때 행 보기로 자릅니다.
 //!
 //! 만든 파일은 모델 폴더에 두고 `active.json` 의 `pyramid` 에 적습니다 (배분 · 재료 · [`RECIPE`]). 레시피가 바뀌면 앱이 다시 만듭니다
-//! ([`ensure`], 사용할 때 양자화). 엔진은 K 형식을 장치에서 곱하는 백엔드(ROCm · CUDA · Metal · CPU)에서만 이 파일을 엽니다.
-//! 포크의 Vulkan 은 Q8_0 만 장치에서 곱하고 나머지는 호스트에서 곱하므로 q8 파일 그대로입니다 ([`supports_k_quants`]).
+//! ([`ensure`], 사용할 때 양자화). `candle@b90b12c` 부터 Vulkan 도 `GpuQuant` 로 Q8_0 · Q4_0 · Q4_K · Q5_K · Q6_K 를 장치 VRAM 에서
+//! 직접 곱하므로 ROCm · CUDA · Metal · Vulkan · CPU 모두 피라미드 파일을 씁니다 ([`supports_k_quants`]).
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -49,10 +49,10 @@ pub const RECIPE: u32 = 4;
 const CHUNK_ELEMS: usize = 1 << 22;
 const ALIGN: u64 = 32;
 
-/// 이 장치가 K 형식(Q4_K 등)을 장치에서 곱하는가. 포크의 Vulkan 은 Q8_0 만 장치에서 곱하고 나머지는 호스트 메모리에서 CPU 로 곱합니다
-/// (`candle-core/src/quantized/vulkan.rs`). 그런 백엔드에서 피라미드 파일을 쓰면 가중치가 VRAM 대신 RAM 에서 CPU 로 계산됩니다.
-pub fn supports_k_quants(device: &Device) -> bool {
-    !device.is_vulkan()
+/// 이 장치가 K 형식(Q4_K · Q5_K · Q6_K)을 장치에서 곱하는가.
+/// `candle@b90b12c` 의 Vulkan `GpuQuant` 도 Q8_0 · Q4_0 · Q4_K · Q5_K · Q6_K 를 장치 VRAM 에서 직접 곱합니다.
+pub fn supports_k_quants(_device: &Device) -> bool {
+    true
 }
 
 /// `BLUEPRINT_PYRAMID` 와 장치로 피라미드 파일을 쓸지 정합니다.

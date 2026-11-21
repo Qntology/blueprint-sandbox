@@ -183,9 +183,18 @@ impl KvCodec {
 
     /// 압축 행 구간들 `(k, v)` 위의 인과 주의. `q` `[H, n, D]` 는 구간을 이은 끝의 `n` 토큰입니다. 결과는 `[H, n, D]` (F32).
     pub fn attend_rows(&self, q: &Tensor, segments: &[(&Tensor, &Tensor)], scale: f64) -> Result<Tensor> {
+        let sized: Vec<(&Tensor, &Tensor, usize)> = segments
+            .iter()
+            .map(|(k, v)| Ok((*k, *v, k.dim(1)?)))
+            .collect::<Result<Vec<_>>>()?;
+        self.attend_blocks(q, &sized, scale)
+    }
+
+    /// 용량 예약 버퍼 `(k_buf, v_buf, active_rows)` 구간들 위의 인과 주의 (`Tensor::cat`/`narrow` 복사 없음).
+    pub fn attend_blocks(&self, q: &Tensor, segments: &[(&Tensor, &Tensor, usize)], scale: f64) -> Result<Tensor> {
         let held = segments
             .iter()
-            .map(|(k, v)| Ok((k.unsqueeze(0)?, v.unsqueeze(0)?, k.dim(1)?)))
+            .map(|(k, v, rows)| Ok((k.unsqueeze(0)?, v.unsqueeze(0)?, *rows)))
             .collect::<Result<Vec<_>>>()?;
         let blocks: Vec<KvBlockRef<'_>> = held.iter().map(|(k, v, rows)| KvBlockRef { k, v, rows: *rows }).collect();
         let cfg = FlashAttnConfig::new(scale as f32).causal();
@@ -258,7 +267,8 @@ fn codec_probe(device: &Device, d: usize) -> Result<(f32, f32)> {
     Ok((quant, dequant))
 }
 
-/// 압축 행 위의 어텐션 `[실제 헤드 구성, 토큰 300개의 이력 + 새 토큰 1개]` 를 CPU 에서 복원한 K · V 의 어텐션과 비교합니다.
+/// 압축 행 위의 어텐션 `[실제 헤드 구성, 토큰 300개]` (단일 토큰 `q_len=1` 과 투기적 디코드 `q_len=4`) 를
+/// CPU 에서 복원한 K · V 의 어텐션과 비교합니다.
 fn fused_probe(device: &Device, q_heads: usize, kv_heads: usize, d: usize) -> Result<f32> {
     const KEYS: usize = 300;
     let cpu = Device::Cpu;
@@ -266,24 +276,33 @@ fn fused_probe(device: &Device, q_heads: usize, kv_heads: usize, d: usize) -> Re
     let seed = 0x7A00 + d as u64;
     let k = Tensor::from_vec(verify::det_normal(kv_heads * KEYS * d, seed), (kv_heads, KEYS, d), &cpu)?;
     let v = Tensor::from_vec(verify::det_normal(kv_heads * KEYS * d, seed + 1), (kv_heads, KEYS, d), &cpu)?;
-    let q = (Tensor::from_vec(verify::det_normal(q_heads * d, seed + 2), (q_heads, 1, d), &cpu)? * 2.0)?;
     let on_gpu = KvCodec::new(d, device)?;
     let on_cpu = KvCodec::new(d, &cpu)?;
     let (k_rows, v_rows) = (on_gpu.pack_k(&k.to_device(device)?)?, on_gpu.pack_v(&v.to_device(device)?)?);
-    let got = on_gpu.attend_rows(&q.to_device(device)?, &[(&k_rows, &v_rows)], scale)?.to_device(&cpu)?;
     let (kd, vd) = (on_cpu.unpack_k(&on_cpu.pack_k(&k)?)?, on_cpu.unpack_v(&on_cpu.pack_v(&v)?)?);
-    let want = attend_all(&q, &kd, &vd, scale)?;
-    verify::rel_err(&got, &want)
+    let mut worst = 0f32;
+    for (idx, q_len) in [1usize, 4usize].into_iter().enumerate() {
+        let q = (Tensor::from_vec(
+            verify::det_normal(q_heads * q_len * d, seed + 2 + idx as u64),
+            (q_heads, q_len, d),
+            &cpu,
+        )? * 2.0)?;
+        let got = on_gpu.attend_rows(&q.to_device(device)?, &[(&k_rows, &v_rows)], scale)?.to_device(&cpu)?;
+        let want = attend_all(&q, &kd, &vd, scale)?;
+        worst = worst.max(verify::rel_err(&got, &want)?);
+    }
+    Ok(worst)
 }
 
-/// 이력 전체를 보는 새 토큰 하나의 어텐션 (CPU 기준값)
+/// 이력 전체를 보는 끝 `q_len` 개 토큰의 인과 어텐션 (CPU 기준값)
 fn attend_all(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
     let n = k.dim(1)?;
-    let last = |x: &Tensor| -> Result<Tensor> { Ok(x.narrow(1, n - 1, 1)?.contiguous()?) };
-    let past = |x: &Tensor| -> Result<Tensor> { Ok(x.narrow(1, 0, n - 1)?.contiguous()?) };
+    let q_len = q.dim(1)?;
+    let last = |x: &Tensor| -> Result<Tensor> { Ok(x.narrow(1, n - q_len, q_len)?.contiguous()?) };
+    let past = |x: &Tensor| -> Result<Tensor> { Ok(x.narrow(1, 0, n - q_len)?.contiguous()?) };
     let (h, hkv) = (q.dim(0)?, k.dim(0)?);
     let kt = |x: &Tensor| -> Result<Tensor> { Ok(x.transpose(1, 2)?.contiguous()?) };
-    let mask = StepMask::new(AttnMode::Causal, 1, h / hkv, q.device())?;
+    let mask = StepMask::new(AttnMode::Causal, q_len, h / hkv, q.device())?;
     attend(q, &kt(&last(k)?)?, &last(v)?, &[(&kt(&past(k)?)?, &past(v)?)], &mask, scale)
 }
 

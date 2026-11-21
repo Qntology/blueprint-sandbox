@@ -955,7 +955,13 @@ impl Residency {
         }
         let model = cur.id;
         let released: Vec<(Group, u64)> = groups.iter().filter_map(|g| cur.groups.remove(g).map(|l| (*g, l.device_bytes))).collect();
-        self.settle();
+        let released_total: u64 = released.iter().map(|(_, b)| *b).sum();
+        if released_total < (64 << 20) && !cur.groups.is_empty() {
+            // 작은 묶음(Head · Output 등)만 내리고 모델은 계속 상주할 때는 ROCm 256 MiB 핫 풀을 유지합니다.
+            self.settle_keep_hot();
+        } else {
+            self.settle();
+        }
         let (free_after, buffers_after) = (self.free_bytes(), self.tensor_buffer_bytes());
         let millis = t0.elapsed().as_millis() as u64 / released.len().max(1) as u64;
         for (group, bytes) in released {
@@ -979,6 +985,15 @@ impl Residency {
         if let Err(e) = self.device.trim_memory_pool(0) {
             eprintln!("[BLUEPRINT-MEM] 메모리 풀 반환 실패: {e}");
         }
+    }
+
+    /// 모델 내 소규모 전환(예: retrim 중 Head 교체)용 보수적 정리: ROCm 은 256 MiB 핫 풀을 유지합니다.
+    fn settle_keep_hot(&self) {
+        if self.device.is_cpu() {
+            return;
+        }
+        let _ = self.device.bind_to_thread();
+        accel::trim_idle_gpu_pool(&self.device);
     }
 
     fn record(&mut self, t: Transition) {
@@ -1024,19 +1039,25 @@ fn device_bytes_of(meta: &TensorMeta, device: &Device) -> u64 {
 
 /// 텐서 하나가 **장치 힙**에 차지할 바이트 수 (아래 [`estimate_device_heap_bytes`])
 fn heap_bytes_of(meta: &TensorMeta, device: &Device) -> u64 {
+    use candle_core::quantized::GgmlDType;
     match (plan_tensor(meta, device), device) {
         (_, Device::Cpu) => 0,
-        (Plan::Quant, Device::Vulkan(_)) => {
-            if meta.dtype == candle_core::quantized::GgmlDType::Q8_0 { meta.bytes / 34 * 36 } else { 0 }
-        }
+        (Plan::Quant, Device::Vulkan(_)) => match meta.dtype {
+            // `candle-core/src/vulkan_backend/qgpu.rs` 의 GpuQuant VRAM 패킹 크기와 동일합니다.
+            GgmlDType::Q8_0 => meta.bytes / 34 * 36,
+            GgmlDType::Q4_0 => meta.bytes / 18 * 20,
+            GgmlDType::Q4K | GgmlDType::Q5K => meta.bytes,
+            GgmlDType::Q6K => meta.bytes / 210 * 212,
+            _ => 0,
+        },
         (Plan::Quant, _) => meta.bytes,
         (Plan::Dense(_), Device::Vulkan(_)) => 0,
         (Plan::Dense(dtype), _) => (meta.elems() * dtype.size_in_bytes()) as u64,
     }
 }
 
-/// 묶음이 **장치 힙**에 차지할 바이트 수 (Vulkan 은 일반 텐서가 호스트 메모리라 제외, Q8_0 은 블록마다 스케일을 F32 로 펴서 34 → 36 바이트,
-/// Q8_0 밖의 양자화 형식은 포크의 Vulkan 이 호스트에서 곱하므로 제외). 장치 여유 메모리(`mem_info`)와 비교하는 값입니다.
+/// 묶음이 **장치 힙**에 차지할 바이트 수 (Vulkan 은 일반 텐서가 호스트 메모리라 제외, 양자화 가중치는 `GpuQuant` 가
+/// DEVICE_LOCAL VRAM 에 올리는 Q8_0 · Q4_0 · Q4_K · Q5_K · Q6_K 의 패킹 바이트를 합산). 장치 여유 메모리(`mem_info`)와 비교하는 값입니다.
 pub fn estimate_device_heap_bytes(file: &WeightFile, group: Group, device: &Device) -> Result<u64> {
     sum_group(file, group, |meta| heap_bytes_of(&meta, device))
 }

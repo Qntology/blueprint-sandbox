@@ -9,10 +9,10 @@ members = ["crates/blueprint-cpu-kernels", "core", "tools/model-settings", "app/
 resolver = "2"
 
 [patch.crates-io]
-# 포크의 candle-core · candle-nn 으로 바꿉니다. GitHub 의 Qntology master(PR #15: Pack C fused decoder + Pack A/C lm_head CS + ROCm conv2d + Metal Q8) 를 받습니다.
+# 포크의 candle-core · candle-nn 으로 바꿉니다. 백엔드 추론 속도 · 양자화 최적화 로드맵(b90b12c)을 받습니다.
 # 로컬 워킹트리로 바꾸려면 git 줄을 주석 처리하고 아래 path 줄의 주석을 푸세요.
-candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "881b3c807a2fedff0e1fa9e9a80ee16cc0e93463" }
-candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "881b3c807a2fedff0e1fa9e9a80ee16cc0e93463" }
+candle-core = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "b90b12c4abe5d5cd5e23cfe2e05c2489ae867d9a" }
+candle-nn = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "b90b12c4abe5d5cd5e23cfe2e05c2489ae867d9a" }
 # candle-core = { path = "../candle-rocm-vulkan/candle-core" }
 # candle-nn = { path = "../candle-rocm-vulkan/candle-nn" }
 

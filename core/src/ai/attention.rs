@@ -383,12 +383,16 @@ impl StepMask {
 
 #[derive(Default)]
 pub struct LayerCache {
-    /// `[Hkv, D, T]` (전치해 둔 키). 코덱이 있으면 `[Hkv, T, 워드]` 압축 행입니다.
+    /// `[Hkv, D, T]` (비압축 전치 키).
     base_kt: Option<Tensor>,
-    /// `[Hkv, T, D]`. 코덱이 있으면 `[Hkv, T, 워드]` 압축 행입니다.
+    /// `[Hkv, T, D]` (비압축 값).
     base_v: Option<Tensor>,
     tail_kt: Option<Tensor>,
     tail_v: Option<Tensor>,
+    /// 압축 코덱 용량 예약 버퍼 `[Hkv, cap, words]` (토큰당 `Tensor::cat` 없이 `slice_set` 으로 제자리 기록).
+    packed_k: Option<Tensor>,
+    packed_v: Option<Tensor>,
+    packed_len: usize,
     codec: Option<Arc<KvCodec>>,
 }
 
@@ -399,27 +403,52 @@ impl LayerCache {
 
     pub fn push(&mut self, kt: &Tensor, v: &Tensor) -> Result<()> {
         // 실측 감시가 압축을 끈 층은 아직 비어 있으므로 원본으로 이어 갑니다.
-        if self.codec.as_ref().is_some_and(|c| c.broken()) && self.segments().is_empty() {
+        if self.codec.as_ref().is_some_and(|c| c.broken()) && self.packed_len == 0 && self.segments().is_empty() {
             self.codec = None;
         }
-        let (kt, v, key_axis) = match &self.codec {
-            Some(c) => (c.pack_k(&kt.transpose(1, 2)?.contiguous()?)?, c.pack_v(v)?, 1),
-            None => (kt.clone(), v.clone(), 2),
-        };
+        if let Some(c) = &self.codec {
+            let k_new = c.pack_k(&kt.transpose(1, 2)?.contiguous()?)?;
+            let v_new = c.pack_v(v)?;
+            let (hkv, add, kw) = k_new.dims3()?;
+            let vw = v_new.dim(2)?;
+            let new_len = self.packed_len + add;
+            let cap = self.packed_k.as_ref().map_or(Ok(0), |t| t.dim(1))?;
+            if new_len > cap {
+                let next_cap = new_len.max((cap * 2).max(256));
+                let new_k = Tensor::zeros((hkv, next_cap, kw), k_new.dtype(), k_new.device())?;
+                let new_v = Tensor::zeros((hkv, next_cap, vw), v_new.dtype(), v_new.device())?;
+                if self.packed_len > 0 {
+                    if let (Some(ok), Some(ov)) = (&self.packed_k, &self.packed_v) {
+                        let old_k = ok.narrow(1, 0, self.packed_len)?.contiguous()?;
+                        let old_v = ov.narrow(1, 0, self.packed_len)?.contiguous()?;
+                        new_k.slice_set(&old_k, 1, 0)?;
+                        new_v.slice_set(&old_v, 1, 0)?;
+                    }
+                }
+                self.packed_k = Some(new_k);
+                self.packed_v = Some(new_v);
+            }
+            if let (Some(bk), Some(bv)) = (&mut self.packed_k, &mut self.packed_v) {
+                bk.slice_set(&k_new.contiguous()?, 1, self.packed_len)?;
+                bv.slice_set(&v_new.contiguous()?, 1, self.packed_len)?;
+            }
+            self.packed_len = new_len;
+            return Ok(());
+        }
         self.tail_kt = Some(match self.tail_kt.take() {
-            Some(t) => Tensor::cat(&[&t, &kt], key_axis)?,
-            None => kt,
+            Some(t) => Tensor::cat(&[&t, kt], 2)?,
+            None => kt.clone(),
         });
         self.tail_v = Some(match self.tail_v.take() {
-            Some(t) => Tensor::cat(&[&t, &v], 1)?,
-            None => v,
+            Some(t) => Tensor::cat(&[&t, v], 1)?,
+            None => v.clone(),
         });
         let tail_len = self.tail_v.as_ref().map_or(Ok(0), |t| t.dim(1))?;
         if tail_len >= TAIL_LIMIT || self.base_v.is_none() {
             let (tk, tv) = (self.tail_kt.take(), self.tail_v.take());
             if let (Some(tk), Some(tv)) = (tk, tv) {
                 self.base_kt = Some(match self.base_kt.take() {
-                    Some(b) => Tensor::cat(&[&b, &tk], key_axis)?,
+                    Some(b) => Tensor::cat(&[&b, &tk], 2)?,
                     None => tk,
                 });
                 self.base_v = Some(match self.base_v.take() {
@@ -442,42 +471,50 @@ impl LayerCache {
         out
     }
 
-    /// 캐시가 차지하는 바이트 수
+    /// 캐시가 차지하는 논리 바이트 수 (실제 저장된 토큰 기준)
     pub fn stored_bytes(&self) -> usize {
+        if self.packed_len > 0 {
+            if let (Some(k), Some(v)) = (&self.packed_k, &self.packed_v) {
+                let (hkv, _, kw) = k.dims3().unwrap_or((0, 0, 0));
+                let vw = v.dim(2).unwrap_or(0);
+                return hkv * self.packed_len * (kw * k.dtype().size_in_bytes() + vw * v.dtype().size_in_bytes());
+            }
+        }
         let bytes = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
         self.segments().iter().map(|(k, v)| bytes(k) + bytes(v)).sum()
     }
 
     /// 새 토큰의 질의 `q` `[H, n, D]` 로 캐시와 새 키 · 값을 읽어 `[H, n, D]` 를 돌려줍니다.
     ///
-    /// 압축 캐시는 logis-center `turbo_kv_step` 과 같이 나눕니다. 이력이 없으면 원본으로, 새 토큰이 하나면 압축 행 위에서 바로,
-    /// 여러 토큰이면 이력만 풀어서 새 토큰의 원본과 함께 계산합니다.
+    /// 압축 캐시는 logis-center `turbo_kv_step` 과 같이 나눕니다. 이력이 없으면 원본으로, 새 토큰이 4개 이하(단일 디코드 ·
+    /// 투기적 검증)면 용량 예약 압축 블록(`KvBlockRef`) 위에서 바로, 더 길면 이력만 풀어서 계산합니다.
     pub fn attend(&self, q: &Tensor, kt: &Tensor, v: &Tensor, mask: &StepMask, scale: f64) -> Result<Tensor> {
-        let past = self.segments();
         let Some(codec) = &self.codec else {
+            let past = self.segments();
             // 디코딩 패스(새 토큰 몇 개)는 커널 하나로 (ROCm, 자가 검증 통과 시). 아니면 행렬곱 경로.
             if let Some(out) = super::fused_attention::attend(q, kt, v, &past, mask.mode == AttnMode::Causal, scale)? {
                 return Ok(out);
             }
             return attend(q, kt, v, &past, mask, scale);
         };
-        if past.is_empty() {
+        if self.packed_len == 0 {
             let out = attend(q, kt, v, &[], mask, scale)?;
             codec.watch(q, kt, v, &out, scale)?;
             return Ok(out);
         }
-        if q.dim(1)? == 1 && mask.mode == AttnMode::Causal && codec.fused() {
+        let (Some(pk), Some(pv)) = (&self.packed_k, &self.packed_v) else {
+            return attend(q, kt, v, &[], mask, scale);
+        };
+        if q.dim(1)? <= 4 && mask.mode == AttnMode::Causal && codec.fused() {
             let (k_new, v_new) = (codec.pack_k(&kt.transpose(1, 2)?.contiguous()?)?, codec.pack_v(v)?);
-            let mut rows = past;
-            rows.push((&k_new, &v_new));
-            return codec.attend_rows(q, &rows, scale);
+            let new_rows = k_new.dim(1)?;
+            return codec.attend_blocks(q, &[(pk, pv, self.packed_len), (&k_new, &v_new, new_rows)], scale);
         }
-        let plain = past
-            .iter()
-            .map(|(k, v)| Ok((codec.unpack_k(k)?.transpose(1, 2)?.contiguous()?, codec.unpack_v(v)?)))
-            .collect::<Result<Vec<_>>>()?;
-        let refs: Vec<(&Tensor, &Tensor)> = plain.iter().map(|(k, v)| (k, v)).collect();
-        attend(q, kt, v, &refs, mask, scale)
+        let k_active = pk.narrow(1, 0, self.packed_len)?;
+        let v_active = pv.narrow(1, 0, self.packed_len)?;
+        let plain_k = codec.unpack_k(&k_active)?.transpose(1, 2)?.contiguous()?;
+        let plain_v = codec.unpack_v(&v_active)?;
+        attend(q, kt, v, &[(&plain_k, &plain_v)], mask, scale)
     }
 }
 
@@ -620,16 +657,37 @@ mod tests {
         compare("rms_norm", candle_nn::ops::rms_norm(&on(&a)?, &on(&norm)?, 1e-6)?, rms_norm_composed(&a, &norm, 1e-6)?)?;
 
         // 기준은 가중치만 푼 정확한 곱입니다. 기본 곱은 장치에 따라 활성값도 8비트로 줄여서 그만큼의 오차를 허용합니다.
+        // K-quant(Q4_0 · Q4K · Q5K · Q6K) 까지 함께 검증해 ROCm w8a16 및 Vulkan GpuQuant 셰이더를 실기에서 확인합니다.
         let dir = TempDir::new("attn-gpu");
-        let path = dir.0.join("q8.gguf");
-        write_gguf(&path, &[("general.architecture", Value::String("zoro".into()))], &[("w".into(), t(det_normal(16 * 64, 36), &[16, 64]), GgmlDType::Q8_0)])?;
+        let path = dir.0.join("quants.gguf");
+        let w256 = t(det_normal(16 * 256, 36), &[16, 256]);
+        let qtypes = [
+            ("q8_0", GgmlDType::Q8_0, 1e-2f32),
+            ("q4_0", GgmlDType::Q4_0, 2e-2f32),
+            ("q4k", GgmlDType::Q4K, 2e-2f32),
+            ("q5k", GgmlDType::Q5K, 2e-2f32),
+            ("q6k", GgmlDType::Q6K, 2e-2f32),
+        ];
+        let entries: Vec<(String, Tensor, GgmlDType)> = qtypes
+            .iter()
+            .map(|(name, dt, _)| ((*name).to_string(), w256.clone(), *dt))
+            .collect();
+        write_gguf(&path, &[("general.architecture", Value::String("zoro".into()))], &entries)?;
         let file = WeightFile::open(&path)?;
-        let (on_gpu, on_cpu) = (QMatMul::from_qtensor(file.read_qtensor("w", &device)?)?, QMatMul::from_qtensor(file.read_qtensor("w", &Device::Cpu)?)?);
-        let x = t(det_normal(n * 64, 37), &[n, 64]);
+        let x = t(det_normal(n * 256, 37), &[n, 256]);
         let row = x.narrow(0, 0, 1)?.contiguous()?;
-        compare("Q8_0 정확한 곱", on_gpu.forward_exact(&on(&x)?)?, on_cpu.forward_exact(&x)?)?;
-        within("Q8_0 곱 여러 행", 1e-2, on_gpu.forward(&on(&x)?)?, on_cpu.forward_exact(&x)?)?;
-        within("Q8_0 곱 한 행", 1e-2, on_gpu.forward(&on(&row)?)?, on_cpu.forward_exact(&row)?)?;
+        for (name, _, tol) in qtypes {
+            let on_gpu = QMatMul::from_qtensor(file.read_qtensor(name, &device)?)?;
+            let on_cpu = QMatMul::from_qtensor(file.read_qtensor(name, &Device::Cpu)?)?;
+            within(&format!("{name} 정확한 곱"), 1e-3, on_gpu.forward_exact(&on(&x)?)?, on_cpu.forward_exact(&x)?)?;
+            within(&format!("{name} 곱 여러 행"), tol, on_gpu.forward(&on(&x)?)?, on_cpu.forward_exact(&x)?)?;
+            within(&format!("{name} 곱 한 행"), tol, on_gpu.forward(&on(&row)?)?, on_cpu.forward_exact(&row)?)?;
+        }
+        assert!(crate::ai::verify::decoder_ops_trusted(&device), "decoder_ops 자가 검증 통과");
+        assert!(crate::ai::verify::lm_head_argmax_trusted(&device), "lm_head_argmax_cs 자가 검증 통과");
+        if device.is_rocm() {
+            assert!(crate::ai::verify::lm_head_quant_argmax_trusted(&device), "ROCm fused_quant_argmax_cs 자가 검증 통과");
+        }
 
         assert!(wrong.is_empty(), "틀린 연산: {wrong:?}");
         println!("[DEVICE-CHECK] {} 기본 연산: 모두 허용 오차 안", accel::backend_name(&device));

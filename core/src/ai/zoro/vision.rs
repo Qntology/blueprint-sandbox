@@ -117,8 +117,6 @@ pub fn smart_resize(h: usize, w: usize, factor: usize, min_pixels: usize, max_pi
 /// 이미지를 패치 행렬로 만듭니다. 크기를 맞춘 뒤 `(x − 0.5) / 0.5` 로 정규화하고, 패치를 2 × 2 병합 창 순서로 늘어놓습니다.
 /// 시간축(같은 프레임 두 장)은 가중치 쪽에서 더해 두므로(`PREPARE`) 패치마다 한 프레임 값만 둡니다.
 pub fn prepare(img: &RgbImage, cfg: &VisionConfig, max_pixels: usize) -> Result<VisionImage> {
-    static LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
-    let lut = LUT.get_or_init(|| std::array::from_fn(|i| (i as f32 / 255.0 - MEAN) / STD));
     let (w0, h0) = (img.width() as usize, img.height() as usize);
     if w0 == 0 || h0 == 0 {
         bail!("빈 이미지입니다");
@@ -126,29 +124,19 @@ pub fn prepare(img: &RgbImage, cfg: &VisionConfig, max_pixels: usize) -> Result<
     let (h, w) = smart_resize(h0, w0, cfg.factor(), MIN_PIXELS.min(max_pixels), max_pixels);
     let owned = if (w, h) == (w0, h0) { None } else { Some(resize(img, w as u32, h as u32, FilterType::CatmullRom)) };
     let src = owned.as_ref().unwrap_or(img);
-    let raw = src.as_raw();
     let (ps, m) = (cfg.patch, cfg.merge);
     let (gh, gw) = (h / ps, w / ps);
-    let per = 3 * ps * ps;
-    let mut patches = Vec::with_capacity(gh * gw * per);
-    for br in 0..gh / m {
-        for bc in 0..gw / m {
-            for i in 0..m {
-                for j in 0..m {
-                    let (r, col) = (br * m + i, bc * m + j);
-                    let (r0, c0) = (r * ps, col * ps);
-                    for c in 0..3 {
-                        for y in 0..ps {
-                            let row_base = ((r0 + y) * w + c0) * 3 + c;
-                            for x in 0..ps {
-                                patches.push(lut[raw[row_base + x * 3] as usize]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let mut patches = vec![0.0f32; gh * gw * 3 * ps * ps];
+    blueprint_cpu_kernels::patchify_norm_chw_merge_u8_f32(
+        src.as_raw(),
+        w,
+        h,
+        ps,
+        m,
+        [MEAN; 3],
+        [STD; 3],
+        &mut patches,
+    );
     Ok(VisionImage { patches, grid_h: gh, grid_w: gw })
 }
 

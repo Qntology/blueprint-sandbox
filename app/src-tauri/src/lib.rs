@@ -262,7 +262,7 @@ struct ModelRow {
     bytes_on_disk: u64,
     installed: bool,
     importable: bool,
-    /// 원본 BF16 에서 한 번 양자화해 만들어 둔 피라미드 배분 (있으면 ROCm · CUDA · Metal 에서 이 파일을 씀)
+    /// 원본 BF16 에서 한 번 양자화해 만들어 둔 피라미드 배분 (있으면 ROCm · CUDA · Metal · Vulkan 에서 이 파일을 씀)
     pyramid: Option<String>,
     /// 모델 폴더에 원본 BF16 (`bf16/`) 이 있는가 (피라미드 양자화의 재료)
     original: bool,
