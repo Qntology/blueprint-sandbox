@@ -13,7 +13,7 @@ use candle_core::{Device, Tensor};
 
 use super::config::GocrConfig;
 pub use crate::ai::attention::{top1, top3, AttnMode};
-use crate::ai::attention::{residual_rms_norm_inplace, rms_norm, silu_mul, LayerCache, StepMask};
+use crate::ai::attention::{residual_rms_norm_inplace, rms_norm, rotate_pairs, silu_mul, LayerCache, StepMask};
 use crate::ai::head::{self, HeadMap};
 use crate::ai::kv_turbo::KvCodec;
 use crate::ai::residency::Loaded;
@@ -148,18 +148,6 @@ pub fn rope_tables(cfg: &GocrConfig, pos: &[Pos], device: &Device) -> Result<(Te
     Ok((Tensor::from_vec(cos, (n, half), device)?, Tensor::from_vec(sin, (n, half), device)?))
 }
 
-/// 인접한 두 차원을 한 쌍으로 회전: `(x₀, x₁) → (x₀ cos − x₁ sin, x₁ cos + x₀ sin)`. `x`: `[H, n, D]`
-fn rotate_pairs(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let (h, n, d) = x.dims3()?;
-    let pairs = x.reshape((h, n, d / 2, 2))?;
-    let a = pairs.narrow(3, 0, 1)?.squeeze(3)?;
-    let b = pairs.narrow(3, 1, 1)?.squeeze(3)?;
-    let (c, s) = (cos.unsqueeze(0)?, sin.unsqueeze(0)?);
-    let ra = (a.broadcast_mul(&c)? - b.broadcast_mul(&s)?)?;
-    let rb = (b.broadcast_mul(&c)? + a.broadcast_mul(&s)?)?;
-    Ok(Tensor::stack(&[ra, rb], 3)?.reshape((h, n, d))?)
-}
-
 /// 언어 단계에서 받은 가중치로 돌아가는 디코더
 pub struct Decoder<'a> {
     pub cfg: &'a GocrConfig,
@@ -177,21 +165,43 @@ impl Decoder<'_> {
         let n = x.dim(0)?;
         let mask = StepMask::new(mode, n, self.cfg.n_heads / self.cfg.n_kv_heads, x.device())?;
         let mut h = x.clone();
+        let mut pending_delta: Option<Tensor> = None;
         let mut layers = Vec::with_capacity(self.cfg.n_layers);
         for i in 0..self.cfg.n_layers {
-            let (next, kv) = self.layer(&cache.layers[i], i, h, &cos, &sin, &mask)?;
-            h = next;
+            let (next_x, next_delta, kv) = self.layer(&cache.layers[i], i, h, pending_delta.as_ref(), &cos, &sin, &mask)?;
+            h = next_x;
+            pending_delta = Some(next_delta);
             layers.push(kv);
+        }
+        if let Some(delta) = pending_delta {
+            h = (h + delta)?;
         }
         Ok((h, PendingKv { layers, n }))
     }
 
-    fn layer(&self, lc: &LayerCache, i: usize, x: Tensor, cos: &Tensor, sin: &Tensor, mask: &StepMask) -> Result<(Tensor, (Tensor, Tensor))> {
+    #[allow(clippy::too_many_arguments)]
+    fn layer(
+        &self,
+        lc: &LayerCache,
+        i: usize,
+        x: Tensor,
+        pending_delta: Option<&Tensor>,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: &StepMask,
+    ) -> Result<(Tensor, Tensor, (Tensor, Tensor))> {
         let w = self.blocks;
         let p = |s: &str| format!("blk.{i}.{s}");
         let eps = self.cfg.rms_eps;
         let t = profile::mark(&x);
-        let h = rms_norm(&x, w.dense(&p("attn_norm.weight"))?, eps)?;
+        // 🌟 [SPD-08] 직전 층의 FFN 잔차(`pending_delta`)와 이번 층 `attn_norm` 을 1회 인플레이스 커널로 융합합니다.
+        let (x, h) = match pending_delta {
+            Some(delta) => residual_rms_norm_inplace(x, delta, w.dense(&p("attn_norm.weight"))?, eps)?,
+            None => {
+                let normed = rms_norm(&x, w.dense(&p("attn_norm.weight"))?, eps)?;
+                (x, normed)
+            }
+        };
         profile::lap(4, t, &h);
         let (a, kv) = self.attention(lc, i, &h, cos, sin, mask)?;
         let t = profile::mark(&a);
@@ -205,9 +215,8 @@ impl Decoder<'_> {
         let m = w.linear(&p("ffn_down.weight"), &silu_mul(&gate, &up)?)?;
         let t = profile::lap(3, t, &m);
         let m = rms_norm(&m, w.dense(&p("post_ffn_norm.weight"))?, eps)?;
-        let out = (x + m)?;
-        profile::lap(4, t, &out);
-        Ok((out, kv))
+        profile::lap(4, t, &m);
+        Ok((x, m, kv))
     }
 
     fn attention(&self, lc: &LayerCache, i: usize, h: &Tensor, cos: &Tensor, sin: &Tensor, mask: &StepMask) -> Result<(Tensor, (Tensor, Tensor))> {

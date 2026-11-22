@@ -64,6 +64,19 @@ pub fn headroom_bytes() -> u64 {
     env_mb(HEADROOM_ENV).unwrap_or(DEFAULT_HEADROOM_MB) << 20
 }
 
+/// 장치별 KV/작업 버퍼 여유. CUDA 는 Vulkan 처럼 512 MB 고정 예약이 없어 기본 256 MB 로 두어
+/// 4 GB VRAM 에서 원본(F32) KV 상주 여유를 확보합니다 (`BLUEPRINT_VRAM_HEADROOM_MB` 지정 시 우선).
+pub fn headroom_bytes_for(device: &Device) -> u64 {
+    if let Some(mb) = env_mb(HEADROOM_ENV) {
+        return mb << 20;
+    }
+    if device.is_cuda() {
+        256 << 20
+    } else {
+        DEFAULT_HEADROOM_MB << 20
+    }
+}
+
 fn allow_host_weights() -> bool {
     std::env::var(ALLOW_HOST_ENV).map(|v| v == "1").unwrap_or(false)
 }

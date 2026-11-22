@@ -12,13 +12,20 @@ rem 3) CUDA 13 headers need the standard preprocessor on MSVC, hence NVCC_PREPEN
 set "VCVARS="
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if exist "%VSWHERE%" for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VCVARS=%%i\VC\Auxiliary\Build\vcvars64.bat"
+if not defined VCVARS if exist "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 if not defined VCVARS goto :no_vcvars
 if not exist "%VCVARS%" goto :no_vcvars
 
 call "%VCVARS%" > nul 2>&1
 echo [CUDA] MSVC toolset %VCToolsVersion%
 
-if defined CUDA_PATH set "PATH=%CUDA_PATH%\bin;%PATH%"
+if not defined NVCC_CCBIN (
+    for /f "delims=" %%c in ('where cl.exe 2^>nul') do if not defined NVCC_CCBIN set "NVCC_CCBIN=%%c"
+)
+
+if defined CUDA_PATH set "PATH=%CUDA_PATH%\bin\x64;%CUDA_PATH%\bin;%PATH%"
 where nvcc > nul 2>&1
 if errorlevel 1 goto :no_nvcc
 

@@ -9,10 +9,10 @@ members = ["crates/blueprint-cpu-kernels", "core", "tools/model-settings", "app/
 resolver = "2"
 
 [patch.crates-io]
-# 포크의 candle-core · candle-nn 으로 바꿉니다. CUDA 실기 검증 및 최적화 개선(6c3e5a1)을 받습니다.
+# 포크의 candle-core · candle-nn 으로 바꿉니다. CUDA 실기 검증 및 최적화 개선(6c3e5a1 + CudaFunction/w8a16 캐시·cat_rows·compute_cap)을 받습니다.
 # 로컬 워킹트리로 바꾸려면 git 줄을 주석 처리하고 아래 path 줄의 주석을 푸세요.
-candle-core = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "6c3e5a13066db93148bbfbdee662caa2a0477f2f" }
-candle-nn = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "6c3e5a13066db93148bbfbdee662caa2a0477f2f" }
+candle-core = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "36c88e3d57de7a1459ac7d228c88f0cf63990356" }
+candle-nn = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "36c88e3d57de7a1459ac7d228c88f0cf63990356" }
 # candle-core = { path = "../candle-rocm-vulkan/candle-core" }
 # candle-nn = { path = "../candle-rocm-vulkan/candle-nn" }
 
