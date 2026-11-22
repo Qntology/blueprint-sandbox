@@ -4,7 +4,7 @@
 
 use candle_core::{Device, Result, Tensor};
 
-/// 비전 패치 프루닝 환경 변수 (`off` 기본 · `1`/`halo`/`scatter` 활성)
+/// 비전 패치 프루닝 환경 변수 (`off` 기본 · `1`/`halo`/`scatter` 활성 · `drop` 압축 토큰 직접 전달)
 pub const PRUNE_ENV: &str = "BLUEPRINT_VISION_PRUNE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -12,6 +12,8 @@ pub enum PruneMode {
     Off,
     /// 비전 블록만 생존 패치로 압축 실행하고, 블록 출력 뒤 원래 `H_m × W_m` 위치로 복원합니다.
     Halo1HopScatter,
+    /// 생존 패치만 유지하고 배경 토큰을 복원 없이 드롭해 LLM 프리필/디코드 토큰 수를 직접 절감합니다.
+    Halo1HopDrop,
 }
 
 impl PruneMode {
@@ -19,6 +21,7 @@ impl PruneMode {
         match std::env::var(PRUNE_ENV) {
             Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
                 "1" | "on" | "true" | "halo" | "scatter" => Self::Halo1HopScatter,
+                "drop" | "halo-drop" => Self::Halo1HopDrop,
                 _ => Self::Off,
             },
             Err(_) => Self::Off,

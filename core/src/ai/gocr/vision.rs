@@ -11,7 +11,9 @@ use candle_core::{DType, Device, Tensor};
 
 use super::config::GocrConfig;
 use super::image::PreparedImage;
-use crate::ai::attention::{full_attention, layer_norm, rms_norm, silu_mul, Rope, ATTN_QUERY_CHUNK};
+use crate::ai::attention::{
+    full_attention, layer_norm, residual_rms_norm_inplace, rms_norm, silu_mul, Rope, ATTN_QUERY_CHUNK,
+};
 use crate::ai::residency::{Loaded, Prepare};
 use crate::ai::vision_prune::{plan_1hop_halo, scatter_groups, PruneMode};
 
@@ -32,9 +34,8 @@ fn reshapes(name: &str) -> bool {
 fn prepare(name: &str, t: Tensor) -> candle_core::Result<Tensor> {
     if name == "model.visual.patch_embed.proj.weight" {
         let (d, ct, h, w) = t.dims4()?;
-        let dtype = t.dtype();
-        let summed = t.to_dtype(DType::F32)?.reshape((d, 3, ct / 3, h, w))?.sum(2)?;
-        summed.reshape((d, 3 * h * w))?.to_dtype(dtype)
+        let w5 = t.reshape((d, 3, ct / 3, h, w))?;
+        candle_nn::fold_conv3d_temporal_weight(&w5)?.reshape((d, 3 * h * w))
     } else if name == "model.visual.downsample.weight" && t.rank() == 4 {
         // 피라미드 파일(`ai::pyramid`)은 이미 [출력, 입력 × 2 × 2] 로 펴서 양자화해 둡니다.
         let (o, c, h, w) = t.dims4()?;
@@ -122,8 +123,10 @@ fn attention(cfg: &GocrConfig, w: &Loaded, b: &str, h: &Tensor, rope: &Rope, bat
 fn block(cfg: &GocrConfig, w: &Loaded, i: usize, x: &Tensor, rope: &Rope, batch: usize) -> Result<Tensor> {
     let b = format!("blocks.{i}");
     let h = norm(w, &format!("{b}.norm1"), x, cfg.v_rms_eps)?;
-    let x = (x + attention(cfg, w, &b, &h, rope, batch)?)?;
-    let h = norm(w, &format!("{b}.norm2"), &x, cfg.v_rms_eps)?;
+    let attn_out = attention(cfg, w, &b, &h, rope, batch)?;
+    let n2_w = w.dense(&format!("{P}.{b}.norm2.weight"))?;
+    let n2_w = if n2_w.dtype() == DType::F32 { n2_w.clone() } else { n2_w.to_dtype(DType::F32)? };
+    let (x, h) = residual_rms_norm_inplace(x.clone(), &attn_out, &n2_w, cfg.v_rms_eps)?;
     let gate = linear_bias(w, &format!("{b}.mlp.gate_proj"), &h)?;
     let up = linear_bias(w, &format!("{b}.mlp.up_proj"), &h)?;
     let down = linear_bias(w, &format!("{b}.mlp.down_proj"), &silu_mul(&gate, &up)?)?;
@@ -171,8 +174,12 @@ pub fn encode_batch(cfg: &GocrConfig, w: &Loaded, imgs: &[&PreparedImage], devic
         (Tensor::from_vec(kept_px, (n_kept, plen), device)?, kept_rope, n_kept)
     } else {
         let n = batch * first.n_patches();
-        let patches: Vec<f32> = imgs.iter().flat_map(|i| i.patches.iter().copied()).collect();
-        let x = Tensor::from_vec(patches, (n, cfg.patch_len()), device)?;
+        let x = if batch == 1 {
+            Tensor::from_slice(&first.patches, (n, cfg.patch_len()), device)?
+        } else {
+            let patches: Vec<f32> = imgs.iter().flat_map(|i| i.patches.iter().copied()).collect();
+            Tensor::from_vec(patches, (n, cfg.patch_len()), device)?
+        };
         let rope = vision_rope(cfg, first.grid_h, first.grid_w, device)?;
         (x, rope, n)
     };
@@ -189,9 +196,13 @@ pub fn encode_batch(cfg: &GocrConfig, w: &Loaded, imgs: &[&PreparedImage], devic
     // 병합기
     let h = linear(w, "merger.proj", &x)?;
     let h = merger_norm(w, &h)?.gelu_erf()?;
-    let gate = linear(w, "merger.gate_proj", &h)?;
-    let up = linear(w, "merger.up_proj", &h)?;
-    let merged = linear(w, "merger.down_proj", &silu_mul(&gate, &up)?)?;
+    let h_f32 = if h.dtype() == DType::F32 { h } else { h.to_dtype(DType::F32)? };
+    let act = w.fused_gate_up_silu(
+        &format!("{P}.merger.gate_proj.weight"),
+        &format!("{P}.merger.up_proj.weight"),
+        &h_f32,
+    )?;
+    let merged = linear(w, "merger.down_proj", &act)?;
     if let Some(ref plan) = prune {
         Ok(scatter_groups(&merged, plan, device)?)
     } else {

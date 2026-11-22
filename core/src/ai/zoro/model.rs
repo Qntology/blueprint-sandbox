@@ -24,7 +24,7 @@ use candle_nn::ops::sigmoid;
 use super::config::{LayerKind, ZoroConfig};
 use super::vision;
 use super::ops::{gated_delta_state, gated_delta_state_on_host, gated_delta_step, gated_delta_step_on_host, gdn_config, gdn_on_device, GdnState, GdnWeights};
-use crate::ai::attention::{causal_attention, residual_rms_norm_inplace, rms_norm, silu_mul, AttnMode, Causal, LayerCache, Rope, StepMask, ATTN_QUERY_CHUNK};
+use crate::ai::attention::{causal_attention, residual_rms_norm_inplace, rms_norm, AttnMode, Causal, LayerCache, Rope, StepMask, ATTN_QUERY_CHUNK};
 use crate::ai::head::{self, HeadMap};
 use crate::ai::kv_turbo::{self, KvCodec, KvShape};
 use crate::ai::residency::{estimate_group_bytes, headroom_bytes, Budget, Group, Loaded, ModelId, ModelSpec, Phase, Prepare, Requant, Residency, SharedResidency};
@@ -256,11 +256,13 @@ pub fn mrope_axis(i: usize, sections: [usize; 3]) -> usize {
 /// 3축 위치의 RoPE 표 (앞쪽 `rope_dim` 차원을 앞뒤 절반으로 회전, 주파수마다 축은 [`mrope_axis`])
 pub fn mrope(pos: &[Pos3], rope_dim: usize, theta: f64, sections: [usize; 3], device: &Device) -> Result<Rope> {
     let half = rope_dim / 2;
+    let inv_axes: Vec<(usize, f64)> = (0..half)
+        .map(|i| (mrope_axis(i, sections), theta.powf(-(2.0 * i as f64) / rope_dim as f64)))
+        .collect();
     let (mut cos, mut sin) = (Vec::with_capacity(pos.len() * half), Vec::with_capacity(pos.len() * half));
     for p in pos {
-        for i in 0..half {
-            let inv = theta.powf(-(2.0 * i as f64) / rope_dim as f64);
-            let a = p[mrope_axis(i, sections)] as f64 * inv;
+        for &(axis, inv) in &inv_axes {
+            let a = p[axis] as f64 * inv;
             cos.push(a.cos() as f32);
             sin.push(a.sin() as f32);
         }
@@ -917,9 +919,7 @@ impl ZoroModel {
             _ => bail!("층 {i} 의 상태 종류가 층 구조와 다릅니다"),
         };
         let (x, h) = residual_rms_norm_inplace(x, &mix, w.dense(&p("post_attention_norm.weight"))?, eps)?;
-        let gate = w.linear(&p("ffn_gate.weight"), &h)?;
-        let up = w.linear(&p("ffn_up.weight"), &h)?;
-        let act = silu_mul(&gate, &up)?;
+        let act = w.fused_gate_up_silu(&p("ffn_gate.weight"), &p("ffn_up.weight"), &h)?;
         let down = w.linear(&p("ffn_down.weight"), &act)?;
         Ok(((x + down)?, pending))
     }
@@ -997,9 +997,9 @@ impl ZoroModel {
 
 /// 잰 장치에서만 추측합니다. 순전파 비용이 행 수에 비례하면 추측이 오히려 손해이기 때문입니다.
 fn speculation_for(device: &Device, has_masks: bool) -> Speculation {
-    if device.is_rocm() && has_masks {
+    if (device.is_rocm() || device.is_cuda()) && has_masks {
         ROCM_SPECULATION
-    } else if device.is_rocm() || device.is_vulkan() {
+    } else if device.is_rocm() || device.is_cuda() || device.is_vulkan() {
         LOOKUP_ONLY
     } else {
         Speculation::NONE

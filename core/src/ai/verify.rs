@@ -100,15 +100,26 @@ pub fn rel_err(a: &Tensor, b: &Tensor) -> Result<f32> {
 }
 
 /// 장치의 `candle_nn::ops::layer_norm` 커널이 CPU 기준과 일치하는지 검증합니다.
+/// 평균이 큰 행(`1000 + N(0,1)`)도 함께 점검해 단패스 `E[x²]-E[x]²` 소거 오차(BUG(LN-1))를 탐지합니다.
 pub fn layer_norm_trusted(device: &Device) -> bool {
-    trusted(device, "layer_norm", 1e-4, || {
-        let x = Tensor::from_vec(det_normal(4 * 128, 21), (4, 128), &Device::Cpu)?;
+    trusted(device, "layer_norm", 1e-3, || {
+        let mut raw = det_normal(4 * 128, 21);
+        // 후반 2행에 큰 DC 오프셋(+1000.0)을 더해 두 단계 중심 분산 정밀도를 검증합니다.
+        for v in &mut raw[2 * 128..] {
+            *v += 1000.0;
+        }
+        let x = Tensor::from_vec(raw, (4, 128), &Device::Cpu)?;
         let w = Tensor::from_vec(det_normal(128, 22), 128, &Device::Cpu)?;
         let b = Tensor::from_vec(det_normal(128, 23), 128, &Device::Cpu)?;
-        let mean = x.mean_keepdim(candle_core::D::Minus1)?;
-        let c = x.broadcast_sub(&mean)?;
+        let x64 = x.to_dtype(DType::F64)?;
+        let mean = x64.mean_keepdim(candle_core::D::Minus1)?;
+        let c = x64.broadcast_sub(&mean)?;
         let var = c.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-        let want = c.broadcast_div(&(var + 1e-5)?.sqrt()?)?.broadcast_mul(&w)?.broadcast_add(&b)?;
+        let want = c
+            .broadcast_div(&(var + 1e-5)?.sqrt()?)?
+            .to_dtype(DType::F32)?
+            .broadcast_mul(&w)?
+            .broadcast_add(&b)?;
         let got = candle_nn::ops::layer_norm(
             &x.to_device(device)?,
             &w.to_device(device)?,

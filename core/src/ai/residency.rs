@@ -245,6 +245,39 @@ impl Loaded {
             Weight::Dense(w) => bail!("{name}: 선형 가중치가 아닙니다 (모양 {:?})", w.dims()),
         }
     }
+
+    /// 단일 라운딩 융합 W8A16 SwiGLU (`silu(x @ gateᵀ) * (x @ upᵀ)`).
+    /// CUDA/ROCm 디코드(`M <= 8`)에서 두 가중치가 모두 Q8_0 `QTensor` 이면 `x` 를 1회만 읽고
+    /// 중간 `[M, I]` 텐서를 HBM 에 쓰지 않고 커널 1회로 계산합니다. 그 외는 기존 경로로 폴백합니다.
+    pub fn fused_gate_up_silu(&self, gate_name: &str, up_name: &str, x: &Tensor) -> Result<Tensor> {
+        if !imatrix::on()
+            && (x.device().is_cuda() || x.device().is_rocm())
+            && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
+        {
+            let k = *x.dims().last().unwrap_or(&0);
+            let m = if k > 0 { x.elem_count() / k } else { 0 };
+            if m > 0 && m <= 8 {
+                if let (Weight::Quant(g), Weight::Quant(u)) = (self.get(gate_name)?, self.get(up_name)?) {
+                    if let (
+                        candle_core::quantized::QMatMul::QTensor(gt),
+                        candle_core::quantized::QMatMul::QTensor(ut),
+                    ) = (g, u)
+                    {
+                        if gt.dtype() == candle_core::quantized::GgmlDType::Q8_0
+                            && ut.dtype() == candle_core::quantized::GgmlDType::Q8_0
+                            && gt.device().same_device(x.device())
+                            && ut.device().same_device(x.device())
+                        {
+                            return Ok(gt.fused_gate_up_silu(ut, x)?);
+                        }
+                    }
+                }
+            }
+        }
+        let gate = self.linear(gate_name, x)?;
+        let up = self.linear(up_name, x)?;
+        crate::ai::attention::silu_mul(&gate, &up)
+    }
 }
 
 /// 중요도 행렬 모으기: 선형 층마다 입력의 열별 제곱 평균 (llama.cpp `imatrix` 와 같은 뜻). 켰을 때만 [`Loaded::linear`] 가 모읍니다.

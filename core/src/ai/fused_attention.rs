@@ -193,13 +193,11 @@ mod rocm {
 
 #[cfg(all(test, feature = "rocm"))]
 mod tests {
-    use candle_core::Device;
-
     /// gocr (KV 헤드 8 · 질의 헤드 2 개씩 · 128) 와 Zoro-1 전체 주의 (4 · 4 개씩 · 256) 구성에서 CPU 기준과 같은가 (GPU 필요)
     #[test]
     #[ignore = "ROCm GPU 가 필요합니다"]
     fn the_kernel_matches_the_reference_attention() -> anyhow::Result<()> {
-        let device = Device::new_rocm(0)?;
+        let device = crate::ai::accel::test_gpu();
         for (hkv, rep, d) in [(8, 2, 128), (4, 4, 256), (2, 1, 64)] {
             let err = super::rocm::probe_error(&device, hkv, rep, d)?.expect("커널 이미지");
             assert!(err < 1e-4, "kv {hkv} · rep {rep} · d {d}: {err}");

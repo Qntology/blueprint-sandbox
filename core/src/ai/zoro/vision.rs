@@ -140,12 +140,11 @@ pub fn prepare(img: &RgbImage, cfg: &VisionConfig, max_pixels: usize) -> Result<
     Ok(VisionImage { patches, grid_h: gh, grid_w: gw })
 }
 
-/// 올릴 때 한 번 하는 변환: 패치 임베딩 합성곱 `[D, 3 × 2, 16, 16]` (채널 × 시간을 합친 모양)을 시간축으로 더해 `[D, 3 × 16 × 16]` 로 폅니다.
+/// 올릴 때 한 번 하는 변환: 패치 임베딩 합성곱 `[D, 3 × 2, 16, 16]` (채널 × 시간을 합친 모양)을 FP64 로 시간축 합산해 `[D, 3 × 16 × 16]` 로 폅니다.
 pub fn prepare_patch_embed(t: Tensor) -> candle_core::Result<Tensor> {
     let (d, ct, h, w) = t.dims4()?;
-    let dtype = t.dtype();
-    let summed = t.to_dtype(DType::F32)?.reshape((d, 3, ct / 3, h, w))?.sum(2)?;
-    summed.reshape((d, 3 * h * w))?.to_dtype(dtype)
+    let w5 = t.reshape((d, 3, ct / 3, h, w))?;
+    candle_nn::fold_conv3d_temporal_weight(&w5)?.reshape((d, 3 * h * w))
 }
 
 pub const PATCH_EMBED: &str = "model.visual.patch_embed.proj.weight";
@@ -264,7 +263,7 @@ pub fn encode(cfg: &VisionConfig, w: &Loaded, img: &VisionImage, device: &Device
         bail!("패치 격자 {} × {} 가 병합 {} 의 배수가 아닙니다", img.grid_h, img.grid_w, cfg.merge);
     }
     let pos = positions(cfg, img.grid_h, img.grid_w);
-    let x = Tensor::from_vec(img.patches.clone(), (n, 3 * cfg.patch * cfg.patch), device)?;
+    let x = Tensor::from_slice(&img.patches, (n, 3 * cfg.patch * cfg.patch), device)?;
     let mut x = (linear_bias(w, "patch_embed.proj", &x)? + position_embeddings(w, cfg, img.grid_h, img.grid_w, &pos, device)?)?;
     let rope = rope(cfg, &pos, device)?;
     for i in 0..cfg.depth {

@@ -418,7 +418,7 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=6c3e5a13066db93148bbfbdee662caa2a0477f2f#6c3e5a13066db93148bbfbdee662caa2a0477f2f"
+source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=855911873134d7a3f7206e78a9ac51cadfed28d3#855911873134d7a3f7206e78a9ac51cadfed28d3"
 dependencies = [
  "ash",
  "byteorder",
@@ -478,7 +478,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=6c3e5a13066db93148bbfbdee662caa2a0477f2f#6c3e5a13066db93148bbfbdee662caa2a0477f2f"
+source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=855911873134d7a3f7206e78a9ac51cadfed28d3#855911873134d7a3f7206e78a9ac51cadfed28d3"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -495,7 +495,7 @@ dependencies = [
 [[package]]
 name = "candle-rocm"
 version = "0.2.0"
-source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=6c3e5a13066db93148bbfbdee662caa2a0477f2f#6c3e5a13066db93148bbfbdee662caa2a0477f2f"
+source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=855911873134d7a3f7206e78a9ac51cadfed28d3#855911873134d7a3f7206e78a9ac51cadfed28d3"
 dependencies = [
  "candle-core",
 ]
@@ -2130,7 +2130,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hip-runtime"
 version = "0.2.0"
-source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=6c3e5a13066db93148bbfbdee662caa2a0477f2f#6c3e5a13066db93148bbfbdee662caa2a0477f2f"
+source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=855911873134d7a3f7206e78a9ac51cadfed28d3#855911873134d7a3f7206e78a9ac51cadfed28d3"
 dependencies = [
  "hip-sys",
 ]
@@ -2138,7 +2138,7 @@ dependencies = [
 [[package]]
 name = "hip-sys"
 version = "0.2.0"
-source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=6c3e5a13066db93148bbfbdee662caa2a0477f2f#6c3e5a13066db93148bbfbdee662caa2a0477f2f"
+source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=855911873134d7a3f7206e78a9ac51cadfed28d3#855911873134d7a3f7206e78a9ac51cadfed28d3"
 
 [[package]]
 name = "html5ever"
