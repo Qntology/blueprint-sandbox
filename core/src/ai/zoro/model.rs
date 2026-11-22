@@ -649,10 +649,15 @@ impl ZoroModel {
 
     /// 코덱이 있으면 전체 주의의 키 · 값을 FP8 로 압축해 보관합니다. 선형 주의의 순환 상태는 그대로입니다.
     pub fn new_state_with(&self, codec: Option<Arc<KvCodec>>) -> ZoroState {
+        self.new_state_with_capacity(codec, 0)
+    }
+
+    /// 코덱과 예상 총 토큰 수(`planned_tokens`)로 압축 버퍼를 초기 예약합니다.
+    pub fn new_state_with_capacity(&self, codec: Option<Arc<KvCodec>>, planned_tokens: usize) -> ZoroState {
         let layers = (0..self.cfg.n_layers)
             .map(|i| match self.cfg.kind(i) {
                 LayerKind::LinearAttention => LayerState::Linear(None),
-                LayerKind::FullAttention => LayerState::Full(LayerCache::new(codec.clone())),
+                LayerKind::FullAttention => LayerState::Full(LayerCache::with_capacity(codec.clone(), planned_tokens)),
             })
             .collect();
         ZoroState { layers, len: 0, delta: 0 }
@@ -855,10 +860,11 @@ impl ZoroModel {
         let device = res.device().clone();
         let loaded = res.enter(&self.spec, &self.generation_phase())?;
         let (blocks, output, table) = (&loaded[0], &loaded[1], &loaded[2]);
-        let codec = kv_turbo::plan(&self.kv_shape(prompt.len() + opts.max_tokens), &device, res.free_bytes(), headroom_bytes())?;
+        let planned_tokens = prompt.len() + opts.max_tokens;
+        let codec = kv_turbo::plan(&self.kv_shape(planned_tokens), &device, res.free_bytes(), headroom_bytes())?;
 
         let t = Instant::now();
-        let mut state = self.new_state_with(codec);
+        let mut state = self.new_state_with_capacity(codec, planned_tokens);
         let h = match image {
             None => self.advance(blocks, output, &device, &mut state, prompt)?,
             Some((tokens, slot)) => {

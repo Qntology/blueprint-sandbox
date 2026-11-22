@@ -163,6 +163,26 @@ impl KvCodec {
         self.broken.load(Ordering::Relaxed)
     }
 
+    /// 키 · 값 코덱이 모두 회전 없는 FP8(`tq_tile` 멀티-쿼리 프리필 직접 지원)인지
+    pub fn is_fp8(&self) -> bool {
+        self.kq.format() == QuantFormat::Fp8 && self.vq.format() == QuantFormat::Fp8
+    }
+
+    /// 실측 상대오차를 기록하고 커널 오동작 기준(`PROBE_BROKEN_REL`)을 넘으면 압축을 즉시 해제합니다 (`P4-F06`).
+    pub fn record_watch_rel_err(&self, device: &Device, rel: f32) -> bool {
+        let mut p = self.probe.lock().unwrap_or_else(|e| e.into_inner());
+        p.0 += 1;
+        p.1 += rel;
+        p.2 = p.2.max(rel);
+        if rel > PROBE_BROKEN_REL {
+            eprintln!("[BLUEPRINT-KV] ❌ 실측 오차 {:.1}% > {:.0}% → 이 장치에서 KV 압축을 끕니다", rel * 100.0, PROBE_BROKEN_REL * 100.0);
+            self.broken.store(true, Ordering::Relaxed);
+            verify::revoke(device, &codec_op(self.kq.dim()));
+            return false;
+        }
+        true
+    }
+
     /// 키 `[Hkv, T, D]` → 압축 행 `[Hkv, T, 워드]` (u32)
     pub fn pack_k(&self, k: &Tensor) -> Result<Tensor> {
         pack(&self.kq, k)
@@ -214,15 +234,7 @@ impl KvCodec {
         let v_rows = self.pack_v(v)?;
         let got = self.attend_rows(&q.narrow(1, n - 1, 1)?.contiguous()?, &[(&k_rows, &v_rows)], scale)?;
         let rel = verify::rel_err(&got, &exact.narrow(1, n - 1, 1)?.contiguous()?)?;
-        let mut p = self.probe.lock().unwrap_or_else(|e| e.into_inner());
-        p.0 += 1;
-        p.1 += rel;
-        p.2 = p.2.max(rel);
-        if rel > PROBE_BROKEN_REL {
-            eprintln!("[BLUEPRINT-KV] ❌ 실측 오차 {:.1}% > {:.0}% → 이 장치에서 KV 압축을 끕니다", rel * 100.0, PROBE_BROKEN_REL * 100.0);
-            self.broken.store(true, Ordering::Relaxed);
-            verify::revoke(device, &codec_op(self.kq.dim()));
-        }
+        let _ = self.record_watch_rel_err(device, rel);
         Ok(())
     }
 }
@@ -453,6 +465,18 @@ mod tests {
     fn a_cpu_plan_keeps_the_exact_cache() -> Result<()> {
         let s = KvShape { layers: 2, tokens: 10, q_heads: 4, kv_heads: 2, head_dim: 8 };
         assert!(plan(&s, &Device::Cpu, None, 0)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn watch_revokes_codec_on_broken_error() -> Result<()> {
+        let c = KvCodec::new(64, &Device::Cpu)?;
+        assert!(c.is_fp8());
+        assert!(!c.broken());
+        assert!(c.record_watch_rel_err(&Device::Cpu, 0.05));
+        assert!(!c.broken());
+        assert!(!c.record_watch_rel_err(&Device::Cpu, 0.85));
+        assert!(c.broken(), "rel > PROBE_BROKEN_REL must mark codec broken");
         Ok(())
     }
 }

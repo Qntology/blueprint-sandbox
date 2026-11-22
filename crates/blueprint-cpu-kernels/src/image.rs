@@ -379,4 +379,38 @@ mod tests {
             assert_eq!(a.to_bits(), b.to_bits(), "AVX2 vs scalar patchify bit-exact");
         }
     }
+
+    #[test]
+    fn patchify_chw_merge_parallel_branch_matches_reference() {
+        // hm = 4, wm = 4 -> hm * wm = 16 triggers rayon parallel branch (P4-F18).
+        let (w, h, p, m) = (112usize, 112usize, 14usize, 2usize);
+        let rgb: Vec<u8> = (0..w * h * 3).map(|i| ((i * 29 + 3) % 256) as u8).collect();
+        let mean = [0.481_454_66, 0.457_827_5, 0.408_210_7];
+        let std = [0.268_629_54, 0.261_302_6, 0.275_777_1];
+        let mut out = vec![0.0f32; (h / p) * (w / p) * 3 * p * p];
+        patchify_norm_chw_merge_u8_f32(&rgb, w, h, p, m, mean, std, &mut out);
+
+        let (gh, gw) = (h / p, w / p);
+        let pp = p * p;
+        let mut idx = 0usize;
+        for mr in 0..gh / m {
+            for mc in 0..gw / m {
+                for sr in 0..m {
+                    for sc in 0..m {
+                        let (r0, c0) = ((mr * m + sr) * p, (mc * m + sc) * p);
+                        for ch in 0..3 {
+                            for y in r0..r0 + p {
+                                for x in c0..c0 + p {
+                                    let want = (rgb[(y * w + x) * 3 + ch] as f32 / 255.0 - mean[ch]) / std[ch];
+                                    assert!((out[idx] - want).abs() < 1e-5, "parallel mismatch at {idx}");
+                                    idx += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(idx, (gh * gw) * 3 * pp);
+    }
 }

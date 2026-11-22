@@ -91,7 +91,12 @@ impl KvCache {
 
     /// 코덱이 있으면 키 · 값을 FP8 로 압축해 보관합니다.
     pub fn with_codec(n_layers: usize, codec: Option<Arc<KvCodec>>) -> Self {
-        Self { layers: (0..n_layers).map(|_| LayerCache::new(codec.clone())).collect(), len: 0 }
+        Self::with_codec_capacity(n_layers, codec, 0)
+    }
+
+    /// 코덱과 예상 총 토큰 수(`planned_tokens`)로 압축 버퍼를 초기 예약합니다 (재할당 복사 방지).
+    pub fn with_codec_capacity(n_layers: usize, codec: Option<Arc<KvCodec>>, planned_tokens: usize) -> Self {
+        Self { layers: (0..n_layers).map(|_| LayerCache::with_capacity(codec.clone(), planned_tokens)).collect(), len: 0 }
     }
 
     /// 캐시에 들어간 토큰 수

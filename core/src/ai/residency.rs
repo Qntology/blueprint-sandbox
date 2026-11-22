@@ -972,6 +972,8 @@ impl Residency {
 
     /// 동기화 → 작업 버퍼 반환 → 메모리 풀 반환 (logis-center 의 `settle_gpu_memory` 와 같은 순서)
     fn settle(&self) {
+        super::head::clear_device_caches();
+        super::siglip2::vision::clear_device_caches();
         if self.device.is_cpu() {
             return;
         }

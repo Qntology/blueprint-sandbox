@@ -215,7 +215,7 @@ fn repeat_kv(x: &Tensor, rep: usize) -> Result<Tensor> {
 
 /// 장치에서 주어진 `head_dim` 으로 `candle_nn::flash_attn` (비인과) 을 써도 되는지 검증합니다.
 fn flash_attn_dim_trusted(device: &Device, head_dim: usize) -> bool {
-    if device.is_cpu() {
+    if device.is_cpu() || head_dim == 0 || head_dim > 256 {
         return false;
     }
     let op = format!("flash_attn_d{head_dim}");
@@ -393,12 +393,22 @@ pub struct LayerCache {
     packed_k: Option<Tensor>,
     packed_v: Option<Tensor>,
     packed_len: usize,
+    /// 초기 계획 토큰 용량 (KV-PLAN `tokens` 를 최초 할당에 반영해 256→512→1024 재할당·복사 방지, P4-F13/P4-O02).
+    planned_cap: usize,
     codec: Option<Arc<KvCodec>>,
 }
 
 impl LayerCache {
     pub fn new(codec: Option<Arc<KvCodec>>) -> Self {
         Self { codec, ..Self::default() }
+    }
+
+    pub fn with_capacity(codec: Option<Arc<KvCodec>>, planned_tokens: usize) -> Self {
+        Self {
+            codec,
+            planned_cap: planned_tokens,
+            ..Self::default()
+        }
     }
 
     pub fn push(&mut self, kt: &Tensor, v: &Tensor) -> Result<()> {
@@ -414,7 +424,7 @@ impl LayerCache {
             let new_len = self.packed_len + add;
             let cap = self.packed_k.as_ref().map_or(Ok(0), |t| t.dim(1))?;
             if new_len > cap {
-                let next_cap = new_len.max((cap * 2).max(256));
+                let next_cap = new_len.max(self.planned_cap).max((cap * 2).max(256));
                 let new_k = Tensor::zeros((hkv, next_cap, kw), k_new.dtype(), k_new.device())?;
                 let new_v = Tensor::zeros((hkv, next_cap, vw), v_new.dtype(), v_new.device())?;
                 if self.packed_len > 0 {
@@ -505,7 +515,9 @@ impl LayerCache {
         let (Some(pk), Some(pv)) = (&self.packed_k, &self.packed_v) else {
             return attend(q, kt, v, &[], mask, scale);
         };
-        if q.dim(1)? <= 4 && mask.mode == AttnMode::Causal && codec.fused() {
+        let q_len = q.dim(1)?;
+        let direct_fp8_prefill = codec.is_fp8() && (q.device().is_cuda() || q.device().is_rocm());
+        if (q_len <= 4 || direct_fp8_prefill) && mask.mode == AttnMode::Causal && codec.fused() {
             let (k_new, v_new) = (codec.pack_k(&kt.transpose(1, 2)?.contiguous()?)?, codec.pack_v(v)?);
             let new_rows = k_new.dim(1)?;
             return codec.attend_blocks(q, &[(pk, pv, self.packed_len), (&k_new, &v_new, new_rows)], scale);
@@ -679,14 +691,28 @@ mod tests {
         for (name, _, tol) in qtypes {
             let on_gpu = QMatMul::from_qtensor(file.read_qtensor(name, &device)?)?;
             let on_cpu = QMatMul::from_qtensor(file.read_qtensor(name, &Device::Cpu)?)?;
+            #[cfg(feature = "vulkan")]
+            let vk_exec0 = if device.is_vulkan() {
+                candle_core::vulkan_backend::shaders::native_exec_count()
+            } else {
+                0
+            };
             within(&format!("{name} 정확한 곱"), 1e-3, on_gpu.forward_exact(&on(&x)?)?, on_cpu.forward_exact(&x)?)?;
             within(&format!("{name} 곱 여러 행"), tol, on_gpu.forward(&on(&x)?)?, on_cpu.forward_exact(&x)?)?;
             within(&format!("{name} 곱 한 행"), tol, on_gpu.forward(&on(&row)?)?, on_cpu.forward_exact(&row)?)?;
+            #[cfg(feature = "vulkan")]
+            if let Ok(vd) = device.as_vulkan_device() {
+                if !vd.is_cpu_device() && candle_core::vulkan_backend::shaders::native_enabled(vd) {
+                    let delta = candle_core::vulkan_backend::shaders::native_exec_count() - vk_exec0;
+                    assert!(delta > 0, "{name}: Vulkan GpuQuant 네이티브 셰이더 디스패치가 0 입니다 (P5-F07)");
+                }
+            }
         }
         assert!(crate::ai::verify::decoder_ops_trusted(&device), "decoder_ops 자가 검증 통과");
         assert!(crate::ai::verify::lm_head_argmax_trusted(&device), "lm_head_argmax_cs 자가 검증 통과");
+        assert!(crate::ai::verify::lm_head_dense_argmax_trusted(&device), "lm_head_dense_argmax_cs 자가 검증 통과");
         if device.is_rocm() {
-            assert!(crate::ai::verify::lm_head_quant_argmax_trusted(&device), "ROCm fused_quant_argmax_cs 자가 검증 통과");
+            assert!(crate::ai::verify::lm_head_quant_argmax_trusted(&device), "ROCm fused_quant_argmax_cs(M=12) 자가 검증 통과");
         }
 
         assert!(wrong.is_empty(), "틀린 연산: {wrong:?}");

@@ -235,12 +235,19 @@ fn open_vulkan() -> Result<Option<Device>> {
     if probe_count == 1 {
         return Ok(Some(Device::new_vulkan(0)?));
     }
-    let mut devices: Vec<(usize, Device)> = Vec::with_capacity(probe_count);
+    let mut hw_devices: Vec<(usize, Device)> = Vec::with_capacity(probe_count);
+    let mut cpu_devices: Vec<(usize, Device)> = Vec::new();
     for id in 0..probe_count {
         if let Ok(d) = Device::new_vulkan(id) {
-            devices.push((id, d));
+            let is_cpu = d.as_vulkan_device().is_ok_and(|v| v.is_cpu_device());
+            if is_cpu {
+                cpu_devices.push((id, d));
+            } else {
+                hw_devices.push((id, d));
+            }
         }
     }
+    let mut devices = if !hw_devices.is_empty() { hw_devices } else { cpu_devices };
     if devices.is_empty() {
         return Ok(Some(Device::new_vulkan(0)?));
     }
