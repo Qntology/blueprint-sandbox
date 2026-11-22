@@ -235,29 +235,28 @@ fn open_vulkan() -> Result<Option<Device>> {
     if probe_count == 1 {
         return Ok(Some(Device::new_vulkan(0)?));
     }
-    let mut hw_devices: Vec<(usize, Device)> = Vec::with_capacity(probe_count);
-    let mut cpu_devices: Vec<(usize, Device)> = Vec::new();
+    // 외장 GPU > 내장 GPU > 가상 > 기타 > 소프트웨어(CPU) 순으로 우선하고, 같은 계층 안에서 여유 VRAM 이 큰 장치를 고릅니다.
+    let mut best: Option<((u8, u64), Device)> = None;
     for id in 0..probe_count {
         if let Ok(d) = Device::new_vulkan(id) {
-            let is_cpu = d.as_vulkan_device().is_ok_and(|v| v.is_cpu_device());
-            if is_cpu {
-                cpu_devices.push((id, d));
-            } else {
-                hw_devices.push((id, d));
+            let tier: u8 = match d.as_vulkan_device().map(|v| v.device_type()) {
+                Ok("discrete") => 4,
+                Ok("integrated") => 3,
+                Ok("virtual") => 2,
+                Ok("other") => 1,
+                _ => 0,
+            };
+            let free = d.mem_info().ok().flatten().map_or(0, |(f, _)| f as u64);
+            let rank = (tier, free);
+            if best.as_ref().is_none_or(|(b_rank, _)| rank > *b_rank) {
+                best = Some((rank, d));
             }
         }
     }
-    let mut devices = if !hw_devices.is_empty() { hw_devices } else { cpu_devices };
-    if devices.is_empty() {
-        return Ok(Some(Device::new_vulkan(0)?));
+    match best {
+        Some((_, d)) => Ok(Some(d)),
+        None => Ok(Some(Device::new_vulkan(0)?)),
     }
-    let free: Vec<(usize, u64)> = devices
-        .iter()
-        .map(|(id, d)| (*id, d.mem_info().ok().flatten().map_or(0, |(free, _)| free as u64)))
-        .collect();
-    let best_id = best_gpu(&free);
-    let best_slot = devices.iter().position(|(id, _)| *id == best_id).unwrap_or(0);
-    Ok(Some(devices.swap_remove(best_slot).1))
 }
 
 #[cfg(not(feature = "vulkan"))]
@@ -380,20 +379,30 @@ pub fn device_ordinal(device: &Device) -> usize {
 
 /// 추론 구간 사이 유휴 GPU 메모리 풀을 보수적으로 정리합니다.
 ///
-/// ROCm 에서는 유휴 풀이 320 MiB 이상 쌓였을 때만 256 MiB 핫 풀을 남기고 돌려주어,
-/// 매 턴마다 `hipMallocAsync`/`hipFreeAsync` 로 인한 파이프라인 스톨을 방지합니다.
+/// CUDA · ROCm 에서는 유휴 풀이 320 MiB 이상 쌓였을 때만 256 MiB 핫 풀을 남기고 돌려주어,
+/// 매 턴마다 할당기 트림(`cuMemPoolTrimTo` / `hipMallocAsync`)으로 인한 파이프라인 스톨을 방지합니다.
 pub fn trim_idle_gpu_pool(device: &Device) {
+    const HIGH_WATER: usize = 320 << 20;
+    const KEEP_HOT: usize = 256 << 20;
     match device {
         #[cfg(feature = "rocm")]
         Device::Rocm(rd) => {
-            const HIGH_WATER: usize = 320 << 20;
-            const KEEP_HOT: usize = 256 << 20;
             if rd.pool_idle_bytes().unwrap_or(0) >= HIGH_WATER {
                 let _ = rd.trim_memory_pool_to(KEEP_HOT);
             }
         }
-        Device::Cuda(_) | Device::Vulkan(_) => {
-            let _ = device.trim_memory_pool(0);
+        #[cfg(feature = "cuda")]
+        Device::Cuda(cd) => {
+            if cd.pool_idle_bytes().unwrap_or(0) >= HIGH_WATER {
+                let _ = cd.trim_memory_pool(KEEP_HOT);
+            }
+        }
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(vd) => {
+            const VK_HIGH_WATER: usize = 64 << 20;
+            if vd.pooled_bytes() >= VK_HIGH_WATER {
+                let _ = vd.trim_memory_pool();
+            }
         }
         _ => {}
     }

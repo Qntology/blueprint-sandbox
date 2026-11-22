@@ -188,8 +188,8 @@ pub fn lm_head_argmax_trusted(device: &Device) -> bool {
             Some(&cids_t.to_device(device)?),
             Some(&cs_dev),
         )?;
-        let want_ids = want.ids.to_vec1::<u32>()?;
-        let got_ids = got.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
+        let (want_ids, _) = want.download_ids_and_mask()?;
+        let (got_ids, _) = got.download_ids_and_mask()?;
         if want_ids != got_ids {
             return Ok(f32::INFINITY);
         }
@@ -213,7 +213,9 @@ pub fn lm_head_dense_argmax_trusted(device: &Device) -> bool {
             None,
             None,
         )?;
-        if want.ids.to_vec1::<u32>()? != got.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()? {
+        let (want_ids, _) = want.download_ids_and_mask()?;
+        let (got_ids, _) = got.download_ids_and_mask()?;
+        if want_ids != got_ids {
             return Ok(f32::INFINITY);
         }
         let want_v = want.max_vals.as_ref().unwrap();
@@ -222,9 +224,9 @@ pub fn lm_head_dense_argmax_trusted(device: &Device) -> bool {
     })
 }
 
-/// ROCm Quantized Mode A `lm_head::fused_quant_argmax_cs` (0-byte `[M, V]` 로짓 물질화, `M > 8` 청킹 포함) 검증.
+/// CUDA · ROCm Quantized Mode A `lm_head::fused_quant_argmax_cs` (0-byte `[M, V]` 로짓 물질화, `M > 8` 청킹 포함) 검증.
 pub fn lm_head_quant_argmax_trusted(device: &Device) -> bool {
-    if !device.is_rocm() {
+    if !(device.is_rocm() || device.is_cuda()) {
         return false;
     }
     trusted(device, "lm_head_quant_argmax_cs", 1e-3, || {
@@ -240,8 +242,8 @@ pub fn lm_head_quant_argmax_trusted(device: &Device) -> bool {
             let want = candle_core::lm_head::logits_argmax_cs(&logits_ref, Some(&h_cpu), None, None)?;
             let q_dev = QTensor::quantize(&w_dev, dtype)?;
             let got = candle_core::lm_head::fused_quant_argmax_cs(&h_dev, &q_dev, None, None, None)?;
-            let want_ids = want.ids.to_vec1::<u32>()?;
-            let got_ids = got.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
+            let (want_ids, _) = want.download_ids_and_mask()?;
+            let (got_ids, _) = got.download_ids_and_mask()?;
             if want_ids != got_ids {
                 return Ok(f32::INFINITY);
             }
