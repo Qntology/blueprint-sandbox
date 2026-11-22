@@ -711,8 +711,12 @@ mod tests {
         assert!(crate::ai::verify::decoder_ops_trusted(&device), "decoder_ops 자가 검증 통과");
         assert!(crate::ai::verify::lm_head_argmax_trusted(&device), "lm_head_argmax_cs 자가 검증 통과");
         assert!(crate::ai::verify::lm_head_dense_argmax_trusted(&device), "lm_head_dense_argmax_cs 자가 검증 통과");
-        if device.is_rocm() {
-            assert!(crate::ai::verify::lm_head_quant_argmax_trusted(&device), "ROCm fused_quant_argmax_cs(M=12) 자가 검증 통과");
+        if device.is_rocm() || device.is_cuda() {
+            assert!(
+                crate::ai::verify::lm_head_quant_argmax_trusted(&device),
+                "{} fused_quant_argmax_cs(M=12) 자가 검증 통과",
+                accel::backend_name(&device)
+            );
         }
 
         assert!(wrong.is_empty(), "틀린 연산: {wrong:?}");

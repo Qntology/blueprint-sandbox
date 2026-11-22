@@ -283,7 +283,7 @@ pub fn top1_on_device(
 
 /// 소프트맥스 확률이 필요 없는 그리디 디코드 전용 고속 경로 (0-byte `[M, V]` 로짓 물질화).
 ///
-/// - ROCm + 양자화 가중치(`Q8_0|Q4_0|Q4K|Q5K|Q6K`): `fused_quant_argmax_cs` (Quantized Mode A, `M > 8` 자동 청킹)
+/// - CUDA · ROCm + 양자화 가중치(`Q8_0|Q4_0|Q4K|Q5K|Q6K`): `fused_quant_argmax_cs` (Quantized Mode A, `M > 8` 자동 청킹)
 /// - GPU + 밀집 가중치: `fused_linear_argmax_cs` (Dense Mode A)
 /// - 그 외: [`top1_on_device`] 로 안전하게 폴백합니다.
 pub fn top1_greedy_on_device(
@@ -307,7 +307,7 @@ pub fn top1_greedy_on_device(
                     qweight.dtype(),
                     GgmlDType::Q8_0 | GgmlDType::Q4_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
                 ) && k.is_multiple_of(qweight.dtype().block_size());
-                if dev.is_rocm() && quant_supported && super::verify::lm_head_quant_argmax_trusted(dev) {
+                if (dev.is_rocm() || dev.is_cuda()) && quant_supported && super::verify::lm_head_quant_argmax_trusted(dev) {
                     let cids_t = match map {
                         Some(m) => Some(cached_kept_on_device(&m.kept, dev)?),
                         None => None,
