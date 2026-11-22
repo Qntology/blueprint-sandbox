@@ -42,6 +42,12 @@ fn in_proj_cache() -> &'static Mutex<HashMap<(TensorId, TensorId), Arc<CachedInP
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// 장치에 캐시해 둔 위치 임베딩 · MAP 헤드 투영 조각을 비웁니다 (`Residency::settle` 호출 시 VRAM 누수 방지).
+pub(crate) fn clear_device_caches() {
+    pos_grid_cache().lock().unwrap_or_else(|p| p.into_inner()).clear();
+    in_proj_cache().lock().unwrap_or_else(|p| p.into_inner()).clear();
+}
+
 fn cached_pos_embed(pos_w: &Tensor, side: usize, d: usize, rows: usize, cols: usize, device: &Device) -> Result<Tensor> {
     let tid = pos_w.id();
     if let Some(t) = pos_grid_cache().lock().unwrap_or_else(|p| p.into_inner()).get(&(tid, rows, cols)) {

@@ -110,15 +110,61 @@ fn main() {
         panic!("hipcc 를 찾을 수 없습니다: HIPCC, ROCM_PATH 또는 HIP_PATH 를 정하세요 (rocm 기능은 kernels/attend.hip 을 컴파일함)");
     };
     let archs = archs(root.as_deref());
-    let mut cmd = Command::new(&cc);
-    cmd.arg("--genco");
-    for a in &archs {
-        cmd.arg(format!("--offload-arch={a}"));
+    let run_hipcc = |vc_override: Option<&Path>| -> Result<(), String> {
+        let mut cmd = Command::new(&cc);
+        if let Some(vc) = vc_override {
+            let mut s = vc.as_os_str().to_os_string();
+            s.push("\\");
+            cmd.env("VCToolsInstallDir", s);
+        }
+        cmd.arg("--genco");
+        for a in &archs {
+            cmd.arg(format!("--offload-arch={a}"));
+        }
+        cmd.args(["-O3", "-std=c++17", "-o"]).arg(&out).arg("kernels/attend.hip");
+        let res = cmd.output().map_err(|e| format!("{cc:?} 를 실행할 수 없습니다: {e}"))?;
+        if res.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{cc:?} 실패:\n{}\n{}",
+                String::from_utf8_lossy(&res.stdout),
+                String::from_utf8_lossy(&res.stderr)
+            ))
+        }
+    };
+    let mut res = run_hipcc(None);
+    // Windows VS 2022 17.15+ (MSVC 14.51+) <cmath> 충돌(__clang_hip_cmath.h) 시 14.4x 도구 집합으로 자동 폴백합니다.
+    if let Err(ref e) = res {
+        if cfg!(windows)
+            && std::env::var_os("VCToolsInstallDir").is_none()
+            && e.contains("__clang_hip_cmath.h")
+            && e.contains("cannot overload")
+        {
+            for edition in ["Community", "Professional", "Enterprise", "BuildTools"] {
+                let msvc_root = PathBuf::from(format!(
+                    r"C:\Program Files\Microsoft Visual Studio\2022\{edition}\VC\Tools\MSVC"
+                ));
+                if let Ok(entries) = std::fs::read_dir(&msvc_root) {
+                    let mut v144: Vec<PathBuf> = entries
+                        .filter_map(|e| e.ok().map(|e| e.path()))
+                        .filter(|p| {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .is_some_and(|s| s.starts_with("14.4"))
+                        })
+                        .collect();
+                    v144.sort();
+                    if let Some(vc) = v144.pop() {
+                        res = run_hipcc(Some(&vc));
+                        break;
+                    }
+                }
+            }
+        }
     }
-    cmd.args(["-O3", "-std=c++17", "-o"]).arg(&out).arg("kernels/attend.hip");
-    let res = cmd.output().unwrap_or_else(|e| panic!("{cc:?} 를 실행할 수 없습니다: {e}"));
-    if !res.status.success() {
-        panic!("{cc:?} 실패:\n{}\n{}", String::from_utf8_lossy(&res.stdout), String::from_utf8_lossy(&res.stderr));
+    if let Err(e) = res {
+        panic!("{e}");
     }
     println!("cargo:rustc-env=BLUEPRINT_HIP_ARCHS={}", archs.join(","));
 }

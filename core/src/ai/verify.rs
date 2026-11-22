@@ -199,6 +199,63 @@ pub fn lm_head_argmax_trusted(device: &Device) -> bool {
     })
 }
 
+/// GPU Dense Mode A `lm_head::fused_linear_argmax_cs` (0-byte `[M, V]` 로짓 물질화) 검증.
+pub fn lm_head_dense_argmax_trusted(device: &Device) -> bool {
+    trusted(device, "lm_head_dense_argmax_cs", 1e-3, || {
+        let (m, v, k) = (2usize, 128usize, 64usize);
+        let h_cpu = Tensor::from_vec(det_normal(m * k, 65), (m, k), &Device::Cpu)?;
+        let w_cpu = Tensor::from_vec(det_normal(v * k, 66), (v, k), &Device::Cpu)?;
+        let want = candle_core::lm_head::fused_linear_argmax_cs(&h_cpu, &w_cpu, None, None, None)?;
+        let got = candle_core::lm_head::fused_linear_argmax_cs(
+            &h_cpu.to_device(device)?,
+            &w_cpu.to_device(device)?,
+            None,
+            None,
+            None,
+        )?;
+        if want.ids.to_vec1::<u32>()? != got.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()? {
+            return Ok(f32::INFINITY);
+        }
+        let want_v = want.max_vals.as_ref().unwrap();
+        let got_v = got.max_vals.as_ref().unwrap().to_device(&Device::Cpu)?;
+        rel_err(&got_v, want_v)
+    })
+}
+
+/// ROCm Quantized Mode A `lm_head::fused_quant_argmax_cs` (0-byte `[M, V]` 로짓 물질화, `M > 8` 청킹 포함) 검증.
+pub fn lm_head_quant_argmax_trusted(device: &Device) -> bool {
+    if !device.is_rocm() {
+        return false;
+    }
+    trusted(device, "lm_head_quant_argmax_cs", 1e-3, || {
+        use candle_core::quantized::{GgmlDType, QTensor};
+        let (m, v, k) = (12usize, 128usize, 256usize);
+        let h_cpu = Tensor::from_vec(det_normal(m * k, 71), (m, k), &Device::Cpu)?;
+        let w_cpu = Tensor::from_vec(det_normal(v * k, 72), (v, k), &Device::Cpu)?;
+        let h_dev = h_cpu.to_device(device)?;
+        let w_dev = w_cpu.to_device(device)?;
+        for dtype in [GgmlDType::Q8_0, GgmlDType::Q4_0, GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
+            let q_cpu = QTensor::quantize(&w_cpu, dtype)?;
+            let logits_ref = q_cpu.forward_exact(&h_cpu)?;
+            let want = candle_core::lm_head::logits_argmax_cs(&logits_ref, Some(&h_cpu), None, None)?;
+            let q_dev = QTensor::quantize(&w_dev, dtype)?;
+            let got = candle_core::lm_head::fused_quant_argmax_cs(&h_dev, &q_dev, None, None, None)?;
+            let want_ids = want.ids.to_vec1::<u32>()?;
+            let got_ids = got.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
+            if want_ids != got_ids {
+                return Ok(f32::INFINITY);
+            }
+            if let (Some(wv), Some(gv)) = (want.max_vals.as_ref(), got.max_vals.as_ref()) {
+                let err = rel_err(&gv.to_device(&Device::Cpu)?, wv)?;
+                if err > 1e-3 {
+                    return Ok(err);
+                }
+            }
+        }
+        Ok(0.0)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -117,12 +117,18 @@ pub fn patchify_norm_hwc_u8_f32(
     let patch_dim = patch_size * patch_size * 3;
     assert_eq!(out.len(), gh * gw * patch_dim);
 
-    let scale = [
+    let mut scale = [
         1.0 / (255.0 * std[0]),
         1.0 / (255.0 * std[1]),
         1.0 / (255.0 * std[2]),
     ];
     let bias = [-mean[0] / std[0], -mean[1] / std[1], -mean[2] / std[2]];
+    for c in 0..3 {
+        let hi = (1.0 - mean[c]) / std[c];
+        if 255.0f32.mul_add(scale[c], bias[c]) > hi {
+            scale[c] = f32::from_bits(scale[c].to_bits().saturating_sub(1));
+        }
+    }
     let row_bytes = width * 3;
     let patch_row_floats = patch_size * 3;
 
@@ -198,9 +204,129 @@ pub fn patchify_norm_hwc_u8_f32(
     }
 }
 
+/// Converts HWC `u8` RGB buffer directly into normalized `f32` patches in CHW-per-patch merge-group
+/// layout `(mr, mc, sr, sc, ch, py, px)` (`temporal_patch_size = 1`, as temporal frames are folded
+/// into the projection weights at load time).
+///
+/// Matches the exact layout expected by gocr and Zoro vision encoders with rayon parallelism and
+/// FMA-folded `(px * scale[c] + bias[c])` normalization in one L1-hot sweep.
+#[allow(clippy::too_many_arguments)]
+pub fn patchify_norm_chw_merge_u8_f32(
+    rgb_hwc: &[u8],
+    width: usize,
+    height: usize,
+    patch_size: usize,
+    merge_size: usize,
+    mean: [f32; 3],
+    std: [f32; 3],
+    out: &mut [f32],
+) {
+    assert!(patch_size > 0 && merge_size > 0);
+    assert!(width % (patch_size * merge_size) == 0);
+    assert!(height % (patch_size * merge_size) == 0);
+    assert_eq!(rgb_hwc.len(), width * height * 3);
+
+    let gh = height / patch_size;
+    let gw = width / patch_size;
+    let hm = gh / merge_size;
+    let wm = gw / merge_size;
+    let pp = patch_size * patch_size;
+    let patch_dim = 3 * pp;
+    let group_patches = merge_size * merge_size;
+    let group_floats = group_patches * patch_dim;
+    assert_eq!(out.len(), gh * gw * patch_dim);
+
+    let mut scale = [
+        1.0 / (255.0 * std[0]),
+        1.0 / (255.0 * std[1]),
+        1.0 / (255.0 * std[2]),
+    ];
+    let bias = [-mean[0] / std[0], -mean[1] / std[1], -mean[2] / std[2]];
+    for c in 0..3 {
+        let hi = (1.0 - mean[c]) / std[c];
+        if 255.0f32.mul_add(scale[c], bias[c]) > hi {
+            scale[c] = f32::from_bits(scale[c].to_bits().saturating_sub(1));
+        }
+    }
+    let row_bytes = width * 3;
+
+    let process_mr = |(mr, out_mr): (usize, &mut [f32])| {
+        for mc in 0..wm {
+            let dst_grp = &mut out_mr[mc * group_floats..(mc + 1) * group_floats];
+            let mut sub = 0usize;
+            for sr in 0..merge_size {
+                let y0 = (mr * merge_size + sr) * patch_size;
+                for sc in 0..merge_size {
+                    let x0 = (mc * merge_size + sc) * patch_size;
+                    let dst_patch = &mut dst_grp[sub * patch_dim..(sub + 1) * patch_dim];
+                    let (dst_r, rest) = dst_patch.split_at_mut(pp);
+                    let (dst_g, dst_b) = rest.split_at_mut(pp);
+                    let (sr0, sg0, sb0) = (scale[0], scale[1], scale[2]);
+                    let (br0, bg0, bb0) = (bias[0], bias[1], bias[2]);
+                    for py in 0..patch_size {
+                        let src_row = &rgb_hwc[(y0 + py) * row_bytes + x0 * 3..];
+                        let row_off = py * patch_size;
+                        for px in 0..patch_size {
+                            let b = px * 3;
+                            dst_r[row_off + px] = (src_row[b] as f32).mul_add(sr0, br0);
+                            dst_g[row_off + px] = (src_row[b + 1] as f32).mul_add(sg0, bg0);
+                            dst_b[row_off + px] = (src_row[b + 2] as f32).mul_add(sb0, bb0);
+                        }
+                    }
+                    sub += 1;
+                }
+            }
+        }
+    };
+
+    if hm * wm >= 16 {
+        out.par_chunks_mut(wm * group_floats)
+            .enumerate()
+            .for_each(process_mr);
+    } else {
+        out.chunks_mut(wm * group_floats)
+            .enumerate()
+            .for_each(process_mr);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn patchify_chw_merge_matches_scalar_reference() {
+        let (w, h, p, m) = (56usize, 56usize, 14usize, 2usize);
+        let rgb: Vec<u8> = (0..w * h * 3).map(|i| ((i * 23 + 11) % 256) as u8).collect();
+        let mean = [0.481_454_66, 0.457_827_5, 0.408_210_7];
+        let std = [0.268_629_54, 0.261_302_6, 0.275_777_1];
+        let mut out = vec![0.0f32; (h / p) * (w / p) * 3 * p * p];
+        patchify_norm_chw_merge_u8_f32(&rgb, w, h, p, m, mean, std, &mut out);
+
+        let mut want = Vec::with_capacity(out.len());
+        let (gh, gw) = (h / p, w / p);
+        for mr in 0..gh / m {
+            for mc in 0..gw / m {
+                for sr in 0..m {
+                    for sc in 0..m {
+                        let (r0, c0) = ((mr * m + sr) * p, (mc * m + sc) * p);
+                        for ch in 0..3 {
+                            for y in r0..r0 + p {
+                                for x in c0..c0 + p {
+                                    let v = (rgb[(y * w + x) * 3 + ch] as f32 / 255.0 - mean[ch]) / std[ch];
+                                    want.push(v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(out.len(), want.len());
+        for (i, (a, b)) in out.iter().zip(&want).enumerate() {
+            assert!((a - b).abs() < 1e-5, "mismatch at {i}: {a} vs {b}");
+        }
+    }
 
     #[test]
     fn patchify_siglip2_matches_scalar_reference() {
@@ -252,5 +378,39 @@ mod tests {
         for (a, b) in out_simd.iter().zip(out_scalar.iter()) {
             assert_eq!(a.to_bits(), b.to_bits(), "AVX2 vs scalar patchify bit-exact");
         }
+    }
+
+    #[test]
+    fn patchify_chw_merge_parallel_branch_matches_reference() {
+        // hm = 4, wm = 4 -> hm * wm = 16 triggers rayon parallel branch (P4-F18).
+        let (w, h, p, m) = (112usize, 112usize, 14usize, 2usize);
+        let rgb: Vec<u8> = (0..w * h * 3).map(|i| ((i * 29 + 3) % 256) as u8).collect();
+        let mean = [0.481_454_66, 0.457_827_5, 0.408_210_7];
+        let std = [0.268_629_54, 0.261_302_6, 0.275_777_1];
+        let mut out = vec![0.0f32; (h / p) * (w / p) * 3 * p * p];
+        patchify_norm_chw_merge_u8_f32(&rgb, w, h, p, m, mean, std, &mut out);
+
+        let (gh, gw) = (h / p, w / p);
+        let pp = p * p;
+        let mut idx = 0usize;
+        for mr in 0..gh / m {
+            for mc in 0..gw / m {
+                for sr in 0..m {
+                    for sc in 0..m {
+                        let (r0, c0) = ((mr * m + sr) * p, (mc * m + sc) * p);
+                        for ch in 0..3 {
+                            for y in r0..r0 + p {
+                                for x in c0..c0 + p {
+                                    let want = (rgb[(y * w + x) * 3 + ch] as f32 / 255.0 - mean[ch]) / std[ch];
+                                    assert!((out[idx] - want).abs() < 1e-5, "parallel mismatch at {idx}");
+                                    idx += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(idx, (gh * gw) * 3 * pp);
     }
 }

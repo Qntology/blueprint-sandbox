@@ -145,6 +145,67 @@ impl RestRescueGuard {
     }
 }
 
+struct KeptDeviceCache {
+    loc: candle_core::DeviceLocation,
+    kept: Vec<u32>,
+    tensor: Tensor,
+}
+
+struct CsDeviceCache {
+    loc: candle_core::DeviceLocation,
+    src_id: candle_core::TensorId,
+    mu_dev: Tensor,
+}
+
+fn kept_device_cache() -> &'static std::sync::Mutex<Option<KeptDeviceCache>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<KeptDeviceCache>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn cs_device_cache() -> &'static std::sync::Mutex<Option<CsDeviceCache>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CsDeviceCache>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 장치에 캐시해 둔 `HeadMap::kept` · `CsGuardParams::mu_rest` 텐서를 비웁니다 (`Residency::settle` 호출 시 VRAM 누수 방지).
+pub(crate) fn clear_device_caches() {
+    *kept_device_cache().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *cs_device_cache().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// `HeadMap::kept` 의 장치 텐서를 캐시해 매 디코드 토큰마다 반복되는 H2D 업로드를 제거합니다.
+fn cached_kept_on_device(kept: &[u32], dev: &Device) -> Result<Tensor> {
+    let loc = dev.location();
+    let mut guard = kept_device_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = guard.as_ref() {
+        if entry.loc == loc && entry.kept == kept {
+            return Ok(entry.tensor.clone());
+        }
+    }
+    let tensor = Tensor::from_slice(kept, (kept.len(),), dev)?;
+    *guard = Some(KeptDeviceCache { loc, kept: kept.to_vec(), tensor: tensor.clone() });
+    Ok(tensor)
+}
+
+/// `RestRescueGuard::cs.mu_rest` 의 장치 텐서를 캐시해 매 스텝 H2D 업로드를 제거합니다.
+fn cached_cs_on_device(cs: &candle_core::lm_head::CsGuardParams, dev: &Device) -> Result<candle_core::lm_head::CsGuardParams> {
+    let loc = dev.location();
+    let src_id = cs.mu_rest.id();
+    let mut guard = cs_device_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let mu_rest = if let Some(entry) = guard.as_ref().filter(|e| e.loc == loc && e.src_id == src_id) {
+        entry.mu_dev.clone()
+    } else {
+        let t = cs.mu_rest.to_device(dev)?;
+        *guard = Some(CsDeviceCache { loc, src_id, mu_dev: t.clone() });
+        t
+    };
+    Ok(candle_core::lm_head::CsGuardParams {
+        mu_rest,
+        w_rest_bound: cs.w_rest_bound,
+        b_rest_max: cs.b_rest_max,
+    })
+}
+
 /// Pack A/C 장치 내 그리디 1위 토큰 + 소프트맥스 확률 (`[n, V]` 전체 D2H 전송 제거).
 ///
 /// GPU 에서 `candle_core::lm_head::logits_argmax_cs` 로 argmax · `kept` 재매핑 · CS 상한 검사를 수행하고,
@@ -162,19 +223,15 @@ pub fn top1_on_device(
     let n = l.dim(0)?;
     if !dev.is_cpu() && super::verify::lm_head_argmax_trusted(dev) {
         let cids_t = match map {
-            Some(m) => Some(Tensor::from_slice(&m.kept, (m.kept.len(),), dev)?),
+            Some(m) => Some(cached_kept_on_device(&m.kept, dev)?),
             None => None,
         };
         let cs_dev = match guard {
-            Some(g) => Some(candle_core::lm_head::CsGuardParams {
-                mu_rest: g.cs.mu_rest.to_device(dev)?,
-                w_rest_bound: g.cs.w_rest_bound,
-                b_rest_max: g.cs.b_rest_max,
-            }),
+            Some(g) => Some(cached_cs_on_device(&g.cs, dev)?),
             None => None,
         };
         let res = candle_core::lm_head::logits_argmax_cs(&l, Some(h), cids_t.as_ref(), cs_dev.as_ref())?;
-        let mut ids = res.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
+        let (mut ids, rescue_opt) = res.download_ids_and_mask()?;
         let max_t = res.max_vals.as_ref().ok_or_else(|| anyhow::anyhow!("logits_argmax_cs max_vals 없음"))?;
         let max_vals = max_t.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
         let max_2d = max_t.reshape((n, 1))?;
@@ -182,10 +239,7 @@ pub fn top1_on_device(
             .flatten_all()?
             .to_device(&Device::Cpu)?
             .to_vec1::<f32>()?;
-        let rescue_flags = match res.rescue_mask {
-            Some(ref m) => m.to_device(&Device::Cpu)?.to_vec1::<u8>()?,
-            None => vec![0u8; n],
-        };
+        let rescue_flags = rescue_opt.unwrap_or_else(|| vec![0u8; n]);
         let mut probs: Vec<f32> = max_vals.iter().zip(&lse).map(|(&mx, &ls)| (mx - ls).exp()).collect();
         if let Some(g) = guard {
             if rescue_flags.iter().any(|&f| f != 0) {
@@ -209,9 +263,9 @@ pub fn top1_on_device(
     let mut out: Vec<(u32, f32)> = rows.iter().map(|row| top1(row, map)).collect();
     if let Some(g) = guard {
         let h_cpu = h.to_device(&Device::Cpu)?.to_dtype(candle_core::DType::F32)?.to_vec2::<f32>()?;
+        let mu = g.cs.mu_rest.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
         for i in 0..n {
             let (mx, _, lse) = stat_of(&rows[i]);
-            let mu = g.cs.mu_rest.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
             let xm = blueprint_cpu_kernels::dot_f32_simd(&h_cpu[i], &mu);
             let xn = blueprint_cpu_kernels::dot_f32_simd(&h_cpu[i], &h_cpu[i]).sqrt();
             let upper = xn.mul_add(g.cs.w_rest_bound, xm) + g.cs.b_rest_max;
@@ -225,6 +279,92 @@ pub fn top1_on_device(
         }
     }
     Ok(out)
+}
+
+/// 소프트맥스 확률이 필요 없는 그리디 디코드 전용 고속 경로 (0-byte `[M, V]` 로짓 물질화).
+///
+/// - ROCm + 양자화 가중치(`Q8_0|Q4_0|Q4K|Q5K|Q6K`): `fused_quant_argmax_cs` (Quantized Mode A, `M > 8` 자동 청킹)
+/// - GPU + 밀집 가중치: `fused_linear_argmax_cs` (Dense Mode A)
+/// - 그 외: [`top1_on_device`] 로 안전하게 폴백합니다.
+pub fn top1_greedy_on_device(
+    output: &Loaded,
+    full: &str,
+    map: Option<&HeadMap>,
+    guard: Option<&RestRescueGuard>,
+    h: &Tensor,
+) -> Result<Vec<u32>> {
+    use candle_core::quantized::{GgmlDType, QMatMul};
+    use super::residency::Weight;
+
+    let dev = h.device();
+    let name = map.map_or(full, |m| m.kept_name);
+    let n = h.dim(0)?;
+    if !dev.is_cpu() {
+        let mode_a_res = match output.get(name) {
+            Ok(Weight::Quant(QMatMul::QTensor(qweight))) => {
+                let k = h.dim(1)?;
+                let quant_supported = matches!(
+                    qweight.dtype(),
+                    GgmlDType::Q8_0 | GgmlDType::Q4_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
+                ) && k.is_multiple_of(qweight.dtype().block_size());
+                if dev.is_rocm() && quant_supported && super::verify::lm_head_quant_argmax_trusted(dev) {
+                    let cids_t = match map {
+                        Some(m) => Some(cached_kept_on_device(&m.kept, dev)?),
+                        None => None,
+                    };
+                    let cs_dev = match guard {
+                        Some(g) => Some(cached_cs_on_device(&g.cs, dev)?),
+                        None => None,
+                    };
+                    candle_core::lm_head::fused_quant_argmax_cs(h, qweight, None, cids_t.as_ref(), cs_dev.as_ref()).ok()
+                } else {
+                    None
+                }
+            }
+            Ok(Weight::Dense(w)) | Ok(Weight::Quant(QMatMul::Tensor(w)))
+                if w.rank() == 2 && super::verify::lm_head_dense_argmax_trusted(dev) =>
+            {
+                let cids_t = match map {
+                    Some(m) => Some(cached_kept_on_device(&m.kept, dev)?),
+                    None => None,
+                };
+                let cs_dev = match guard {
+                    Some(g) => Some(cached_cs_on_device(&g.cs, dev)?),
+                    None => None,
+                };
+                let h_aligned = if h.dtype() == w.dtype() {
+                    h.clone()
+                } else {
+                    h.to_dtype(w.dtype())?
+                };
+                candle_core::lm_head::fused_linear_argmax_cs(&h_aligned, w, None, cids_t.as_ref(), cs_dev.as_ref()).ok()
+            }
+            _ => None,
+        };
+        if let Some(res) = mode_a_res {
+            let (mut ids, rescue_opt) = res.download_ids_and_mask()?;
+            if let (Some(g), Some(rescue_flags), Some(max_t)) = (guard, rescue_opt, res.max_vals.as_ref()) {
+                if rescue_flags.iter().any(|&f| f != 0) {
+                    let max_vals = max_t.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+                    let h_cpu = h
+                        .to_device(&Device::Cpu)?
+                        .to_dtype(candle_core::DType::F32)?
+                        .to_vec2::<f32>()?;
+                    for i in 0..n {
+                        if rescue_flags[i] != 0 {
+                            if let Some((rid, rval)) = g.best_rest(&h_cpu[i]) {
+                                if rval > max_vals[i] || (rval == max_vals[i] && rid < ids[i]) {
+                                    ids[i] = rid;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(ids);
+        }
+    }
+    Ok(top1_on_device(output, full, map, guard, h)?.into_iter().map(|(id, _)| id).collect())
 }
 
 /// 행 하나에서 확률이 큰 토큰 셋 (`attention::top3` 와 같은 약속, 번호는 전체 어휘). 모자라면 `(u32::MAX, 0.0)`.
@@ -324,6 +464,8 @@ mod tests {
         let got = top1_on_device(&loaded[0], "token_embd.weight", Some(&map), Some(&guard), &h)?;
         let got_ids: Vec<u32> = got.iter().map(|(id, _)| *id).collect();
         assert_eq!(got_ids, want, "CS 가드 구출 결과는 전체 어휘 argmax 와 100% 일치해야 합니다");
+        let got_greedy = top1_greedy_on_device(&loaded[0], "token_embd.weight", Some(&map), Some(&guard), &h)?;
+        assert_eq!(got_greedy, want, "top1_greedy_on_device 결과도 전체 어휘 argmax 와 일치해야 합니다");
         Ok(())
     }
 }

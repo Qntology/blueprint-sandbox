@@ -235,21 +235,28 @@ fn open_vulkan() -> Result<Option<Device>> {
     if probe_count == 1 {
         return Ok(Some(Device::new_vulkan(0)?));
     }
-    let mut devices: Vec<(usize, Device)> = Vec::with_capacity(probe_count);
+    let mut hw_devices: Vec<(usize, Device)> = Vec::with_capacity(probe_count);
+    let mut cpu_devices: Vec<(usize, Device)> = Vec::new();
     for id in 0..probe_count {
         if let Ok(d) = Device::new_vulkan(id) {
-            devices.push((id, d));
+            let is_cpu = d.as_vulkan_device().is_ok_and(|v| v.is_cpu_device());
+            if is_cpu {
+                cpu_devices.push((id, d));
+            } else {
+                hw_devices.push((id, d));
+            }
         }
     }
+    let mut devices = if !hw_devices.is_empty() { hw_devices } else { cpu_devices };
     if devices.is_empty() {
         return Ok(Some(Device::new_vulkan(0)?));
     }
     let free: Vec<(usize, u64)> = devices
         .iter()
-        .enumerate()
-        .map(|(slot, (_, d))| (slot, d.mem_info().ok().flatten().map_or(0, |(free, _)| free as u64)))
+        .map(|(id, d)| (*id, d.mem_info().ok().flatten().map_or(0, |(free, _)| free as u64)))
         .collect();
-    let best_slot = best_gpu(&free);
+    let best_id = best_gpu(&free);
+    let best_slot = devices.iter().position(|(id, _)| *id == best_id).unwrap_or(0);
     Ok(Some(devices.swap_remove(best_slot).1))
 }
 
@@ -356,6 +363,39 @@ pub fn device_label(device: &Device) -> String {
         candle_core::DeviceLocation::Metal { gpu_id } => format!("metal:{gpu_id}"),
         candle_core::DeviceLocation::Vulkan { gpu_id } => format!("vulkan:{gpu_id}"),
         candle_core::DeviceLocation::OpenCl { gpu_id } => format!("opencl:{gpu_id}"),
+    }
+}
+
+/// 장치의 GPU 순번(ordinal). CPU 이면 0.
+pub fn device_ordinal(device: &Device) -> usize {
+    match device.location() {
+        candle_core::DeviceLocation::Cpu => 0,
+        candle_core::DeviceLocation::Cuda { gpu_id }
+        | candle_core::DeviceLocation::Rocm { gpu_id }
+        | candle_core::DeviceLocation::Metal { gpu_id }
+        | candle_core::DeviceLocation::Vulkan { gpu_id }
+        | candle_core::DeviceLocation::OpenCl { gpu_id } => gpu_id,
+    }
+}
+
+/// 추론 구간 사이 유휴 GPU 메모리 풀을 보수적으로 정리합니다.
+///
+/// ROCm 에서는 유휴 풀이 320 MiB 이상 쌓였을 때만 256 MiB 핫 풀을 남기고 돌려주어,
+/// 매 턴마다 `hipMallocAsync`/`hipFreeAsync` 로 인한 파이프라인 스톨을 방지합니다.
+pub fn trim_idle_gpu_pool(device: &Device) {
+    match device {
+        #[cfg(feature = "rocm")]
+        Device::Rocm(rd) => {
+            const HIGH_WATER: usize = 320 << 20;
+            const KEEP_HOT: usize = 256 << 20;
+            if rd.pool_idle_bytes().unwrap_or(0) >= HIGH_WATER {
+                let _ = rd.trim_memory_pool_to(KEEP_HOT);
+            }
+        }
+        Device::Cuda(_) | Device::Vulkan(_) => {
+            let _ = device.trim_memory_pool(0);
+        }
+        _ => {}
     }
 }
 

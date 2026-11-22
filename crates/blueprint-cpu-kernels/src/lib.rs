@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub mod attn;
 pub mod image;
 pub use attn::{stream_attention_f32, stream_attention_f32_masked, CpuStreamAttnCfg};
-pub use image::patchify_norm_hwc_u8_f32;
+pub use image::{patchify_norm_chw_merge_u8_f32, patchify_norm_hwc_u8_f32};
 
 static FORCE_SCALAR: AtomicBool = AtomicBool::new(false);
 
