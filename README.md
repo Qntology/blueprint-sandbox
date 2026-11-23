@@ -65,7 +65,7 @@ cargo run -p blueprint-core --release --example sds_eval
 
 | OS | 앱 | 예제 (기본 `plant_probe`) |
 | --- | --- | --- |
-| Windows | `run\windows\app.bat` (Vulkan) · `run\windows\app-rocm.bat` (AMD ROCm) | `run\windows\rocm.bat` · `vulkan.bat` · `cuda.bat` |
+| Windows | `run\windows\app.bat` (Vulkan) · `run\windows\app-cuda.bat` (CUDA) · `run\windows\app-rocm.bat` (AMD ROCm) | `run\windows\rocm.bat` · `vulkan.bat` · `cuda.bat` |
 | Linux | `run/linux/app.sh` | `run/linux/rocm.sh` · `vulkan.sh` · `cuda.sh` |
 | macOS | `run/macos/app.command` (Apple Silicon Metal) | `run/macos/metal.command` · `vulkan.command` |
 

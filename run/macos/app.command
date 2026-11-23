@@ -5,5 +5,5 @@ set -e
 cd "$(dirname "$0")/../.."
 export CARGO_TARGET_DIR="$PWD/target-metal"
 cd app
-npm install
-exec npx tauri dev --release --no-watch --features metal -- --no-default-features
+[ -d node_modules ] || npm install
+exec npx tauri dev --release --no-watch --features metal "$@" -- --no-default-features
