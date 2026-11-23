@@ -29,7 +29,7 @@ use super::gguf_model::{load_active, load_active_on};
 use super::head::HeadMap;
 use super::kv_turbo::{self, KvShape};
 use super::ocr::{LanguageDecoder, LanguageWeights, OcrEngine, PhaseCtx, VisionEncoder};
-use super::residency::{headroom_bytes, Group, Loaded, SharedResidency};
+use super::residency::{headroom_bytes_for, Group, Loaded, SharedResidency};
 use super::speculative::{decode, BlockDiffusion, BlockModel, DecodeOptions, Pick};
 use super::tokenizer::ModelTokenizer;
 use super::weights::WeightFile;
@@ -261,7 +261,7 @@ impl GocrLanguage {
         let p = self.prefill(f, device)?;
         let c = &self.cfg;
         let shape = KvShape { layers: c.n_layers, tokens: p.pos.len() + self.max_tokens, q_heads: c.n_heads, kv_heads: c.n_kv_heads, head_dim: c.head_dim };
-        let mut cache = KvCache::with_codec_capacity(c.n_layers, kv_turbo::plan(&shape, device, free, headroom_bytes())?, shape.tokens);
+        let mut cache = KvCache::with_codec_capacity(c.n_layers, kv_turbo::plan(&shape, device, free, headroom_bytes_for(device))?, shape.tokens);
         let (h, kv) = dec.forward(&cache, &p.embeds, &p.pos, AttnMode::Causal)?;
         cache.commit(&kv, p.pos.len())?;
         let first = dec.last_pick(&h)?;
