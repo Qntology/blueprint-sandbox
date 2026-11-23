@@ -8,7 +8,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BACKEND="$1"
+BACKEND="${1:-}"
+[ -n "$BACKEND" ] || { echo "[run] 사용법: bash scripts/run-unix.sh <cuda|rocm|metal|vulkan> [예제] [예제 인자...]" >&2; exit 1; }
 shift
 EXAMPLE="${1:-plant_probe}"
 [ $# -gt 0 ] && shift

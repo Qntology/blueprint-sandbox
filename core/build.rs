@@ -141,10 +141,15 @@ fn main() {
             && e.contains("__clang_hip_cmath.h")
             && e.contains("cannot overload")
         {
-            for edition in ["Community", "Professional", "Enterprise", "BuildTools"] {
-                let msvc_root = PathBuf::from(format!(
-                    r"C:\Program Files\Microsoft Visual Studio\2022\{edition}\VC\Tools\MSVC"
-                ));
+            for base in [
+                r"C:\Program Files\Microsoft Visual Studio\2022\Community",
+                r"C:\Program Files\Microsoft Visual Studio\2022\Professional",
+                r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise",
+                r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools",
+                r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools",
+                r"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools",
+            ] {
+                let msvc_root = PathBuf::from(base).join(r"VC\Tools\MSVC");
                 if let Ok(entries) = std::fs::read_dir(&msvc_root) {
                     let mut v144: Vec<PathBuf> = entries
                         .filter_map(|e| e.ok().map(|e| e.path()))

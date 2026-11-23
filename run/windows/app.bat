@@ -1,11 +1,14 @@
 @echo off
-rem Runs the blueprint app. Missing models download on start, with progress in the settings panel.
+setlocal
+rem Runs the blueprint app (Vulkan). Missing models download on start, with progress in the settings panel.
 cd /d "%~dp0..\..\app"
-call npm install
+if not exist "node_modules\.bin\tauri.cmd" (
+    call npm install
+    if errorlevel 1 goto :failed
+)
+call npx tauri dev %*
 if errorlevel 1 goto :failed
-call npm run tauri dev
-if errorlevel 1 goto :failed
-exit /b 0
+endlocal & exit /b 0
 :failed
 pause
-exit /b 1
+endlocal & exit /b 1
