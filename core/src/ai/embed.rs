@@ -265,7 +265,35 @@ impl CachedEmbedder {
     }
 
     pub fn embed_all(&self, texts: &[String]) -> Result<Vec<Arc<Vec<f32>>>> {
-        texts.iter().map(|t| self.embed(t)).collect()
+        if texts.len() <= 1 {
+            return texts.iter().map(|t| self.embed(t)).collect();
+        }
+        let mut out: Vec<Option<Arc<Vec<f32>>>> = Vec::with_capacity(texts.len());
+        let mut misses: Vec<(usize, &str)> = Vec::new();
+        {
+            let guard = self.cache.lock().map_err(|_| anyhow!("캐시 잠금"))?;
+            for (i, t) in texts.iter().enumerate() {
+                if let Some(v) = guard.get(t.as_str()) {
+                    out.push(Some(v.clone()));
+                } else {
+                    out.push(None);
+                    misses.push((i, t.as_str()));
+                }
+            }
+        }
+        if !misses.is_empty() {
+            use rayon::prelude::*;
+            let computed: Vec<(usize, String, Arc<Vec<f32>>)> = misses
+                .par_iter()
+                .map(|&(i, s)| Ok((i, s.to_string(), Arc::new(self.model.embed(s)?))))
+                .collect::<Result<Vec<_>>>()?;
+            let mut guard = self.cache.lock().map_err(|_| anyhow!("캐시 잠금"))?;
+            for (i, key, vec) in computed {
+                guard.insert(key, vec.clone());
+                out[i] = Some(vec);
+            }
+        }
+        Ok(out.into_iter().map(|v| v.expect("all slots filled")).collect())
     }
 
     pub fn cached(&self) -> usize {

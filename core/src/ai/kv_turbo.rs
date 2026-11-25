@@ -20,6 +20,40 @@ use candle_core::{Device, Tensor};
 use candle_nn::flash_attn::FlashAttnConfig;
 use candle_nn::turbo_quant::{attention_packed_blocks, KvBlockRef, TurboQuantizer};
 
+pub use candle_nn::kv_offload::SuperSlabBundle;
+pub use candle_nn::vision_decode::{
+    DeltaRope, HeteroMultimodalKvCache, VisMicroPageIndex, VisOcrNgramDraft,
+};
+
+/// Attention Sink (앞 4~16 토큰) 및 경계 레이어(`0`, `num_layers - 1`)를 저비트 KV 압축에서
+/// 보호하기 위한 정밀도 가드 정책 (Parts 1/3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvLayerProtectionPolicy {
+    pub sink_tokens: usize,
+    pub protect_edge_layers: bool,
+}
+
+impl Default for KvLayerProtectionPolicy {
+    fn default() -> Self {
+        Self {
+            sink_tokens: 8,
+            protect_edge_layers: true,
+        }
+    }
+}
+
+impl KvLayerProtectionPolicy {
+    #[inline]
+    pub fn is_protected_layer(&self, layer_idx: usize, num_layers: usize) -> bool {
+        self.protect_edge_layers && (layer_idx == 0 || (num_layers > 0 && layer_idx + 1 == num_layers))
+    }
+
+    #[inline]
+    pub fn is_sink_token(&self, token_pos: usize) -> bool {
+        token_pos < self.sink_tokens
+    }
+}
+
 use crate::ai::attention::{attend, AttnMode, StepMask};
 use crate::ai::{accel, verify};
 

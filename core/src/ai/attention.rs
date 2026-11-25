@@ -120,12 +120,13 @@ impl Rope {
             bail!("회전 차원은 양의 짝수여야 합니다: {rope_dim}");
         }
         let half = rope_dim / 2;
+        let inv_freq: Vec<f64> = (0..half).map(|i| theta.powf(-(2.0 * i as f64) / rope_dim as f64)).collect();
         let mut cos = Vec::with_capacity(t * half);
         let mut sin = Vec::with_capacity(t * half);
         for pos in start..start + t {
-            for i in 0..half {
-                let inv_freq = theta.powf(-(2.0 * i as f64) / rope_dim as f64);
-                let angle = pos as f64 * inv_freq;
+            let p = pos as f64;
+            for &inv in &inv_freq {
+                let angle = p * inv;
                 cos.push(angle.cos() as f32);
                 sin.push(angle.sin() as f32);
             }
@@ -537,6 +538,9 @@ pub struct LayerCache {
     /// 초기 계획 토큰 용량 (KV-PLAN `tokens` 를 최초 할당에 반영해 256→512→1024 재할당·복사 방지, P4-F13/P4-O02).
     planned_cap: usize,
     codec: Option<Arc<KvCodec>>,
+    /// `attend()` 에서 방금 패킹한 `(kt.id(), v.id(), k_new, v_new)` 을 캐시해 바로 뒤따르는
+    /// `commit()` -> `push()` 의 중복 FP8/TQ 양자화를 제거합니다.
+    last_packed: std::sync::Mutex<Option<(candle_core::TensorId, candle_core::TensorId, Tensor, Tensor)>>,
 }
 
 impl LayerCache {
@@ -558,8 +562,16 @@ impl LayerCache {
             self.codec = None;
         }
         if let Some(c) = &self.codec {
-            let k_new = c.pack_k(&kt.transpose(1, 2)?.contiguous()?)?;
-            let v_new = c.pack_v(v)?;
+            let cached = self
+                .last_packed
+                .get_mut()
+                .ok()
+                .and_then(Option::take)
+                .filter(|(kid, vid, _, _)| *kid == kt.id() && *vid == v.id());
+            let (k_new, v_new) = match cached {
+                Some((_, _, kn, vn)) => (kn, vn),
+                None => (c.pack_k(&kt.transpose(1, 2)?.contiguous()?)?, c.pack_v(v)?),
+            };
             let (hkv, add, kw) = k_new.dims3()?;
             let vw = v_new.dim(2)?;
             let new_len = self.packed_len + add;
@@ -738,11 +750,15 @@ impl LayerCache {
             return attend(q, kt, v, &[], mask, scale);
         };
         let q_len = q.dim(1)?;
-        let direct_fp8_prefill = codec.is_fp8() && (q.device().is_cuda() || q.device().is_rocm());
+        let direct_fp8_prefill = codec.is_fp8() && (q.device().is_cuda() || q.device().is_rocm() || q.device().is_vulkan());
         if (q_len <= 4 || direct_fp8_prefill) && mask.mode == AttnMode::Causal && codec.fused() {
             let (k_new, v_new) = (codec.pack_k(&kt.transpose(1, 2)?.contiguous()?)?, codec.pack_v(v)?);
             let new_rows = k_new.dim(1)?;
-            return codec.attend_blocks(q, &[(pk, pv, self.packed_len), (&k_new, &v_new, new_rows)], scale);
+            let out = codec.attend_blocks(q, &[(pk, pv, self.packed_len), (&k_new, &v_new, new_rows)], scale)?;
+            if let Ok(mut slot) = self.last_packed.lock() {
+                *slot = Some((kt.id(), v.id(), k_new, v_new));
+            }
+            return Ok(out);
         }
         let k_active = pk.narrow(1, 0, self.packed_len)?;
         let v_active = pv.narrow(1, 0, self.packed_len)?;

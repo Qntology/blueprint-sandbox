@@ -272,9 +272,20 @@ impl ZoroBackbone {
         let pad = self.tokenizer.token_to_id("<|image_pad|>").context("토크나이저에 <|image_pad|> 가 없습니다")?;
         let head = self.tokenizer.encode("<|im_start|>user\n<|vision_start|>")?.ids;
         let tail = self.tokenizer.encode(&format!("<|vision_end|>{instruction}<|im_end|>\n{ANSWER_START}"))?.ids;
-        let mut prepared = Vec::with_capacity(images.len());
-        for image in images {
-            let p = vision::prepare(image, &cfg, max_pixels)?;
+        let prepared_imgs: Vec<vision::VisionImage> = if images.len() > 1 {
+            use rayon::prelude::*;
+            images
+                .par_iter()
+                .map(|image| vision::prepare(image, &cfg, max_pixels))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            images
+                .iter()
+                .map(|image| vision::prepare(image, &cfg, max_pixels))
+                .collect::<Result<Vec<_>>>()?
+        };
+        let mut prepared = Vec::with_capacity(prepared_imgs.len());
+        for p in prepared_imgs {
             let slot = model::ImageSlot { at: head.len(), rows: p.grid_h / cfg.merge, cols: p.grid_w / cfg.merge };
             let mut ids = head.clone();
             ids.extend(std::iter::repeat_n(pad, slot.tokens()));

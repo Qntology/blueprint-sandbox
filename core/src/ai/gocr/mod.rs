@@ -283,7 +283,13 @@ impl GocrLanguage {
         let text = self.tokenizer.decode(&out.tokens)?;
         let mean = if out.confs.is_empty() { 0.0 } else { out.confs.iter().sum::<f32>() / out.confs.len() as f32 };
         let min = out.confs.iter().copied().fold(1.0f32, f32::min);
-        let char_confidence = char_confidences(text.chars().count(), &out.tokens, &out.confs, |ids| self.tokenizer.decode(ids))?;
+        let char_confidence = char_confidences_fast(
+            &text,
+            &out.tokens,
+            &out.confs,
+            |id| self.tokenizer.token_bytes(id),
+            |ids| self.tokenizer.decode(ids),
+        )?;
         let alt_pieces = alt_pieces(&text, &out.tokens, &out.confs, &out.alts, |id| self.tokenizer.token_bytes(id));
         Ok(OcrOutput {
             text,
@@ -375,6 +381,58 @@ pub fn alt_supports(text: &str, pieces: &[AltPiece], i: usize, want: char, max_c
         cand.extend_from_slice(&base[b1..]);
         p.alts.iter().any(|(alt, prob)| *prob >= MIN_ALT_PROB && s + alt.len() > b0 && cand.starts_with(alt) && !base[s..].starts_with(alt))
     })
+}
+
+/// O(N) 바이트 스트리밍 기반 글자 신뢰도 변환. 토큰 바이트의 연결이 `text` 와 정확히 같으면
+/// 매 토큰마다 `decode(&tokens[..=i])` 를 O(N²) 반복하지 않고 UTF-8 경계를 O(N) 으로 누적합니다.
+/// 특수·정규화 토큰으로 바이트가 어긋나면 기존 [`char_confidences`] 로 안전하게 폴백합니다.
+fn char_confidences_fast(
+    text: &str,
+    tokens: &[u32],
+    confs: &[f32],
+    token_bytes: impl Fn(u32) -> Option<Vec<u8>>,
+    decode: impl Fn(&[u32]) -> Result<String>,
+) -> Result<Vec<f32>> {
+    let chars = text.chars().count();
+    if tokens.len() != confs.len() {
+        return char_confidences(chars, tokens, confs, decode);
+    }
+    let Some(pieces) = tokens.iter().map(|&t| token_bytes(t)).collect::<Option<Vec<Vec<u8>>>>() else {
+        return char_confidences(chars, tokens, confs, decode);
+    };
+    let total_bytes: usize = pieces.iter().map(Vec::len).sum();
+    if total_bytes != text.len() {
+        return char_confidences(chars, tokens, confs, decode);
+    }
+    let target = text.as_bytes();
+    let mut off = 0usize;
+    for p in &pieces {
+        if &target[off..off + p.len()] != p.as_slice() {
+            return char_confidences(chars, tokens, confs, decode);
+        }
+        off += p.len();
+    }
+
+    // `text` 는 유효한 UTF-8 이므로 누적 바이트 경계 `cum` 이하로 완전히 끝난 글자 수만 O(N) 전진.
+    let mut char_ends = text.char_indices().map(|(b, ch)| b + ch.len_utf8()).peekable();
+    let mut out = Vec::with_capacity(chars);
+    let mut carry = 1.0f32;
+    let mut cum = 0usize;
+    let mut completed = 0usize;
+    for (p, &c) in pieces.iter().zip(confs.iter()) {
+        carry = carry.min(c);
+        cum += p.len();
+        while char_ends.peek().is_some_and(|&end| end <= cum) {
+            char_ends.next();
+            completed += 1;
+        }
+        if completed > out.len() {
+            out.resize(completed, carry);
+            carry = 1.0;
+        }
+    }
+    out.resize(chars, carry);
+    Ok(out)
 }
 
 /// 토큰 신뢰도를 글자 신뢰도로 옮깁니다. 글자 하나가 토큰 둘에 걸치면 둘 중 낮은 값을 씁니다.
@@ -625,4 +683,30 @@ mod tests {
         assert!(alt_pieces("2 입!", &[0, 1, 2], &[0.99, 0.55, 0.98], &alts, tb).is_empty());
     }
 
+    #[test]
+    fn char_confidences_fast_matches_reference_on_split_utf8() -> Result<()> {
+        let text = "2 입래현";
+        let bytes: Vec<Vec<u8>> = vec![
+            b"2".to_vec(),
+            vec![0x20, 0xEC, 0x9E], // " " + leading 2 bytes of '입'
+            vec![0x85],             // trailing byte of '입'
+            vec![0xEB, 0x9E, 0x98], // '래'
+            vec![0xED, 0x98],       // leading 2 bytes of '현'
+            vec![0x84],             // trailing byte of '현'
+        ];
+        let tokens = [0u32, 1, 2, 3, 4, 5];
+        let confs = [0.99f32, 0.55, 0.80, 0.92, 0.95, 0.40];
+        let tb = |id: u32| bytes.get(id as usize).cloned();
+        let dec = |ids: &[u32]| -> Result<String> {
+            let mut raw = Vec::new();
+            for &id in ids {
+                raw.extend_from_slice(&bytes[id as usize]);
+            }
+            Ok(String::from_utf8_lossy(&raw).into_owned())
+        };
+        let want = char_confidences(text.chars().count(), &tokens, &confs, dec)?;
+        let got = char_confidences_fast(text, &tokens, &confs, tb, dec)?;
+        assert_eq!(got, want, "O(N) char_confidences_fast must match O(N^2) reference exactly");
+        Ok(())
+    }
 }
