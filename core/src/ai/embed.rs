@@ -229,7 +229,7 @@ impl TextEmbedder {
         }
         let h = layer_norm(&h, &self.final_norm, cfg.norm_eps)?;
         let cls: Vec<f32> = h.get(0)?.to_vec1()?;
-        let norm = cls.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        let norm = (cls.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt().max(1e-12)) as f32;
         Ok(cls.into_iter().map(|x| x / norm).collect())
     }
 }

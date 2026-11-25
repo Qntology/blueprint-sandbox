@@ -158,6 +158,26 @@ impl Rope {
         if self.rot > d {
             bail!("회전 차원 {} 가 head_dim {d} 보다 큽니다", self.rot);
         }
+        // 🌟 [SPD-06] GPU 에서는 융합 rotary_emb::rope 커널 1회 발사로 8개 텐서 연산을 대체합니다.
+        if !x.device().is_cpu() && fused_rope_trusted(x.device()) {
+            let rot_in = if self.rot == d {
+                x.contiguous()?
+            } else {
+                x.narrow(2, 0, self.rot)?.contiguous()?
+            };
+            let rot_out = candle_nn::rotary_emb::rope(
+                &rot_in.unsqueeze(0)?,
+                &self.cos.contiguous()?,
+                &self.sin.contiguous()?,
+            )?
+            .squeeze(0)?;
+            return if self.rot == d {
+                Ok(rot_out)
+            } else {
+                let pass = x.narrow(2, self.rot, d - self.rot)?;
+                Ok(Tensor::cat(&[&rot_out, &pass], 2)?)
+            };
+        }
         let half = self.rot / 2;
         let x1 = x.narrow(2, 0, half)?;
         let x2 = x.narrow(2, half, half)?;
@@ -171,6 +191,72 @@ impl Rope {
             Ok(Tensor::cat(&[&o1, &o2, &pass], 2)?)
         }
     }
+}
+
+fn fused_rope_trusted(device: &Device) -> bool {
+    verify::trusted(device, "rope", 1e-4, || {
+        let (h, t, d) = (2usize, 8usize, 32usize);
+        let x = Tensor::from_vec(verify::det_normal(h * t * d, 41), (h, t, d), &Device::Cpu)?;
+        let cos = Tensor::from_vec(verify::det_normal(t * (d / 2), 42), (t, d / 2), &Device::Cpu)?;
+        let sin = Tensor::from_vec(verify::det_normal(t * (d / 2), 43), (t, d / 2), &Device::Cpu)?;
+        let half = d / 2;
+        let x1 = x.narrow(2, 0, half)?;
+        let x2 = x.narrow(2, half, half)?;
+        let (c, s) = (cos.unsqueeze(0)?, sin.unsqueeze(0)?);
+        let o1 = (x1.broadcast_mul(&c)? - x2.broadcast_mul(&s)?)?;
+        let o2 = (x2.broadcast_mul(&c)? + x1.broadcast_mul(&s)?)?;
+        let want = Tensor::cat(&[&o1, &o2], 2)?;
+        let got = candle_nn::rotary_emb::rope(
+            &x.to_device(device)?.unsqueeze(0)?,
+            &cos.to_device(device)?,
+            &sin.to_device(device)?,
+        )?
+        .squeeze(0)?;
+        verify::rel_err(&got.to_device(&Device::Cpu)?, &want)
+    })
+}
+
+fn fused_rope_i_trusted(device: &Device) -> bool {
+    verify::trusted(device, "rope_i", 1e-4, || {
+        let (h, t, d) = (2usize, 8usize, 32usize);
+        let x = Tensor::from_vec(verify::det_normal(h * t * d, 44), (h, t, d), &Device::Cpu)?;
+        let cos = Tensor::from_vec(verify::det_normal(t * (d / 2), 45), (t, d / 2), &Device::Cpu)?;
+        let sin = Tensor::from_vec(verify::det_normal(t * (d / 2), 46), (t, d / 2), &Device::Cpu)?;
+        let pairs = x.reshape((h, t, d / 2, 2))?;
+        let a = pairs.narrow(3, 0, 1)?.squeeze(3)?;
+        let b = pairs.narrow(3, 1, 1)?.squeeze(3)?;
+        let (c, s) = (cos.unsqueeze(0)?, sin.unsqueeze(0)?);
+        let ra = (a.broadcast_mul(&c)? - b.broadcast_mul(&s)?)?;
+        let rb = (b.broadcast_mul(&c)? + a.broadcast_mul(&s)?)?;
+        let want = Tensor::stack(&[ra, rb], 3)?.reshape((h, t, d))?;
+        let got = candle_nn::rotary_emb::rope_i(
+            &x.to_device(device)?.unsqueeze(0)?,
+            &cos.to_device(device)?,
+            &sin.to_device(device)?,
+        )?
+        .squeeze(0)?;
+        verify::rel_err(&got.to_device(&Device::Cpu)?, &want)
+    })
+}
+
+/// 인접 쌍 회전(`gocr` mRoPE): GPU 에서는 융합 `rope_i` 커널 1회 발사로 처리합니다.
+pub fn rotate_pairs(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    if !x.device().is_cpu() && fused_rope_i_trusted(x.device()) {
+        return Ok(candle_nn::rotary_emb::rope_i(
+            &x.contiguous()?.unsqueeze(0)?,
+            &cos.contiguous()?,
+            &sin.contiguous()?,
+        )?
+        .squeeze(0)?);
+    }
+    let (h, n, d) = x.dims3()?;
+    let pairs = x.reshape((h, n, d / 2, 2))?;
+    let a = pairs.narrow(3, 0, 1)?.squeeze(3)?;
+    let b = pairs.narrow(3, 1, 1)?.squeeze(3)?;
+    let (c, s) = (cos.unsqueeze(0)?, sin.unsqueeze(0)?);
+    let ra = (a.broadcast_mul(&c)? - b.broadcast_mul(&s)?)?;
+    let rb = (b.broadcast_mul(&c)? + a.broadcast_mul(&s)?)?;
+    Ok(Tensor::stack(&[ra, rb], 3)?.reshape((h, n, d))?)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -298,12 +384,63 @@ pub fn full_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, chunk: usi
     Ok(if outs.len() == 1 { outs.remove(0) } else { Tensor::cat(&outs, 1)? })
 }
 
+/// 장치에서 주어진 `head_dim` 으로 인과 `candle_nn::flash_attn` (프리필 · 디코드 · 장문맥 split-KV 1x4096)을 써도 되는지 검증합니다.
+fn flash_attn_causal_trusted(device: &Device, head_dim: usize) -> bool {
+    if device.is_cpu() || head_dim == 0 || head_dim > 256 {
+        return false;
+    }
+    let op = format!("flash_attn_causal_d{head_dim}");
+    verify::trusted(device, &op, 5e-3, || {
+        use candle_nn::flash_attn::{flash_attn_bhsd, flash_attn_unfused, FlashAttnConfig};
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let cfg = FlashAttnConfig::new(scale).causal();
+        let cases: [(usize, usize, usize, usize, u64); 3] = [
+            (4, 2, 32, 32, 1),
+            (4, 2, 1, 300, 2),
+            (4, 2, 1, 4096, 3),
+        ];
+        let mut worst = 0f32;
+        for (hq, hkv, lq, lk, seed) in cases {
+            let q = Tensor::from_vec(verify::det_normal(hq * lq * head_dim, 0xFA00 + seed * 10 + head_dim as u64), (1, hq, lq, head_dim), &Device::Cpu)?;
+            let k = Tensor::from_vec(verify::det_normal(hkv * lk * head_dim, 0xFA01 + seed * 10 + head_dim as u64), (1, hkv, lk, head_dim), &Device::Cpu)?;
+            let v = Tensor::from_vec(verify::det_normal(hkv * lk * head_dim, 0xFA02 + seed * 10 + head_dim as u64), (1, hkv, lk, head_dim), &Device::Cpu)?;
+            let want = flash_attn_unfused(
+                &q.transpose(1, 2)?.contiguous()?,
+                &k.transpose(1, 2)?.contiguous()?,
+                &v.transpose(1, 2)?.contiguous()?,
+                &cfg,
+            )?
+            .transpose(1, 2)?
+            .contiguous()?;
+            let got = flash_attn_bhsd(
+                &q.to_device(device)?,
+                &k.to_device(device)?,
+                &v.to_device(device)?,
+                &cfg.clone().fused(true),
+            )?
+            .to_device(&Device::Cpu)?;
+            worst = worst.max(verify::rel_err(&got, &want)?);
+        }
+        Ok(worst)
+    })
+}
+
 /// `softmax(q kᵀ · scale + 마스크) v`. `q`: `[H, T, D]`, `k`·`v`: `[Hkv, T, D]`, 결과 `[H, T, D]`.
 pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, causal: &Causal) -> Result<Tensor> {
-    let (h, t, _) = q.dims3()?;
+    let (h, t, d) = q.dims3()?;
     let hkv = k.dim(0)?;
     if hkv == 0 || !h.is_multiple_of(hkv) {
         bail!("질의 헤드 {h} 는 KV 헤드 {hkv} 의 배수여야 합니다");
+    }
+    // 🌟 [SPD-07] GPU 에서는 인과 FlashAttention 으로 repeat_kv · [H, chunk, T] 점수 행렬 할당을 제거합니다.
+    if !q.device().is_cpu() && flash_attn_causal_trusted(q.device(), d) {
+        let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scale as f32).causal().fused(true);
+        let q4 = q.unsqueeze(0)?.contiguous()?;
+        let k4 = k.unsqueeze(0)?.contiguous()?;
+        let v4 = v.unsqueeze(0)?.contiguous()?;
+        if let Ok(out) = candle_nn::flash_attn::flash_attn_bhsd(&q4, &k4, &v4, &cfg) {
+            return Ok(out.squeeze(0)?);
+        }
     }
     let k = repeat_kv(k, h / hkv)?;
     let v = repeat_kv(v, h / hkv)?;
@@ -384,12 +521,16 @@ impl StepMask {
 
 #[derive(Default)]
 pub struct LayerCache {
-    /// `[Hkv, D, T]` (비압축 전치 키).
+    /// `[Hkv, D, T]` (비압축 전치 키 — CPU/레거시 경로).
     base_kt: Option<Tensor>,
-    /// `[Hkv, T, D]` (비압축 값).
+    /// `[Hkv, T, D]` (비압축 값 — CPU/레거시 경로).
     base_v: Option<Tensor>,
     tail_kt: Option<Tensor>,
     tail_v: Option<Tensor>,
+    /// 🌟 [SPD-07] CUDA/ROCm 비압축 원본 KV 사전할당 버퍼 `[Hkv, cap, D]` (토큰당 `Tensor::cat` 제거 + `flash_attn_blocks` 직접 소비).
+    plain_k: Option<Tensor>,
+    plain_v: Option<Tensor>,
+    plain_len: usize,
     /// 압축 코덱 용량 예약 버퍼 `[Hkv, cap, words]` (토큰당 `Tensor::cat` 없이 `slice_set` 으로 제자리 기록).
     packed_k: Option<Tensor>,
     packed_v: Option<Tensor>,
@@ -417,7 +558,7 @@ impl LayerCache {
 
     pub fn push(&mut self, kt: &Tensor, v: &Tensor) -> Result<()> {
         // 실측 감시가 압축을 끈 층은 아직 비어 있으므로 원본으로 이어 갑니다.
-        if self.codec.as_ref().is_some_and(|c| c.broken()) && self.packed_len == 0 && self.segments().is_empty() {
+        if self.codec.as_ref().is_some_and(|c| c.broken()) && self.packed_len == 0 && self.plain_len == 0 && self.segments().is_empty() {
             self.codec = None;
         }
         if let Some(c) = &self.codec {
@@ -455,6 +596,36 @@ impl LayerCache {
                 bv.slice_set(&v_new.contiguous()?, 1, self.packed_len)?;
             }
             self.packed_len = new_len;
+            return Ok(());
+        }
+        // 🌟 [SPD-07] CUDA/ROCm 비압축 KV 는 사전할당 `[Hkv, cap, D]` 버퍼에 제자리 기록합니다.
+        let dev = v.device();
+        if (dev.is_cuda() || dev.is_rocm()) && !super::fused_attention::enabled() && self.base_v.is_none() && self.tail_v.is_none() {
+            let k_htd = kt.transpose(1, 2)?.contiguous()?;
+            let v_htd = v.contiguous()?;
+            let (hkv, add, d) = v_htd.dims3()?;
+            let new_len = self.plain_len + add;
+            let cap = self.plain_k.as_ref().map_or(Ok(0), |t| t.dim(1))?;
+            if new_len > cap {
+                let next_cap = new_len.max(self.planned_cap).max((cap * 2).max(256));
+                let new_k = Tensor::zeros((hkv, next_cap, d), k_htd.dtype(), dev)?;
+                let new_v = Tensor::zeros((hkv, next_cap, d), v_htd.dtype(), dev)?;
+                if self.plain_len > 0 {
+                    if let (Some(ok), Some(ov)) = (&self.plain_k, &self.plain_v) {
+                        let old_k = ok.narrow(1, 0, self.plain_len)?.contiguous()?;
+                        let old_v = ov.narrow(1, 0, self.plain_len)?.contiguous()?;
+                        new_k.slice_set(&old_k, 1, 0)?;
+                        new_v.slice_set(&old_v, 1, 0)?;
+                    }
+                }
+                self.plain_k = Some(new_k);
+                self.plain_v = Some(new_v);
+            }
+            if let (Some(bk), Some(bv)) = (&mut self.plain_k, &mut self.plain_v) {
+                bk.slice_set(&k_htd, 1, self.plain_len)?;
+                bv.slice_set(&v_htd, 1, self.plain_len)?;
+            }
+            self.plain_len = new_len;
             return Ok(());
         }
         self.tail_kt = Some(match self.tail_kt.take() {
@@ -502,6 +673,12 @@ impl LayerCache {
                 return hkv * self.packed_len * (kw * k.dtype().size_in_bytes() + vw * v.dtype().size_in_bytes());
             }
         }
+        if self.plain_len > 0 {
+            if let (Some(k), Some(v)) = (&self.plain_k, &self.plain_v) {
+                let (hkv, _, d) = k.dims3().unwrap_or((0, 0, 0));
+                return hkv * self.plain_len * d * (k.dtype().size_in_bytes() + v.dtype().size_in_bytes());
+            }
+        }
         let bytes = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
         self.segments().iter().map(|(k, v)| bytes(k) + bytes(v)).sum()
     }
@@ -512,6 +689,51 @@ impl LayerCache {
     /// 투기적 검증)면 용량 예약 압축 블록(`KvBlockRef`) 위에서 바로, 더 길면 이력만 풀어서 계산합니다.
     pub fn attend(&self, q: &Tensor, kt: &Tensor, v: &Tensor, mask: &StepMask, scale: f64) -> Result<Tensor> {
         let Some(codec) = &self.codec else {
+            let dev = q.device();
+            let (_, n, d) = q.dims3()?;
+            // 🌟 [SPD-07] CUDA/ROCm 원본 KV: `flash_attn_blocks` 로 사전할당 과거 버퍼 + 새 토큰을 복사 없이 단일 융합 커널로 계산합니다.
+            let can_flash = !dev.is_cpu()
+                && !super::fused_attention::enabled()
+                && (mask.mode == AttnMode::Causal || n == 1)
+                && self.base_v.is_none()
+                && self.tail_v.is_none()
+                && flash_attn_causal_trusted(dev, d);
+            if can_flash {
+                use candle_nn::flash_attn::{flash_attn_bhsd, flash_attn_blocks, FlashAttnConfig};
+                use candle_nn::turbo_quant::KvBlockRef;
+                let mut cfg = FlashAttnConfig::new(scale as f32).fused(true);
+                if mask.mode == AttnMode::Causal {
+                    cfg = cfg.causal();
+                }
+                let q4 = q.unsqueeze(0)?.contiguous()?;
+                let k_new = kt.transpose(1, 2)?.contiguous()?.unsqueeze(0)?;
+                let v_new = v.contiguous()?.unsqueeze(0)?;
+                let flash_res = if self.plain_len > 0 {
+                    if let (Some(pk), Some(pv)) = (&self.plain_k, &self.plain_v) {
+                        let pk4 = pk.unsqueeze(0)?;
+                        let pv4 = pv.unsqueeze(0)?;
+                        let blocks = [
+                            KvBlockRef { k: &pk4, v: &pv4, rows: self.plain_len },
+                            KvBlockRef { k: &k_new, v: &v_new, rows: n },
+                        ];
+                        flash_attn_blocks(&q4, &blocks, &cfg)
+                    } else {
+                        flash_attn_bhsd(&q4, &k_new, &v_new, &cfg)
+                    }
+                } else {
+                    flash_attn_bhsd(&q4, &k_new, &v_new, &cfg)
+                };
+                if let Ok(out) = flash_res {
+                    return Ok(out.squeeze(0)?);
+                }
+            }
+            if self.plain_len > 0 {
+                if let (Some(pk), Some(pv)) = (&self.plain_k, &self.plain_v) {
+                    let pk_kt = pk.narrow(1, 0, self.plain_len)?.transpose(1, 2)?.contiguous()?;
+                    let pv_act = pv.narrow(1, 0, self.plain_len)?.contiguous()?;
+                    return attend(q, kt, v, &[(&pk_kt, &pv_act)], mask, scale);
+                }
+            }
             let past = self.segments();
             // 디코딩 패스(새 토큰 몇 개)는 커널 하나로 (ROCm, 자가 검증 통과 시). 아니면 행렬곱 경로.
             if let Some(out) = super::fused_attention::attend(q, kt, v, &past, mask.mode == AttnMode::Causal, scale)? {
@@ -873,6 +1095,68 @@ mod tests {
         let (exact, _) = read_after(None, TAIL_LIMIT * 2 + 7, 1, AttnMode::Causal)?;
         let (got, _) = read_after(Some(codec), TAIL_LIMIT * 2 + 7, 1, AttnMode::Causal)?;
         assert!(rel_err(&got, &exact)? < 0.1);
+        Ok(())
+    }
+
+    /// 🌟 CUDA 실기 검증: 사전할당 BHSD 원본 KV + `flash_attn_blocks`, 인과 `causal_attention`,
+    /// 융합 `Rope::apply` · `rotate_pairs`, 장문맥 split-KV (`1x4096`) 자가 검증.
+    #[test]
+    #[ignore = "GPU 장치(CUDA)가 필요합니다"]
+    fn device_cuda_flash_kv_and_fused_rope_match_cpu() -> Result<()> {
+        let dev = accel::test_gpu();
+        let cpu = Device::Cpu;
+        // 1) Fused RoPE (half-split + partial + interleaved pairs)
+        let (h, tt, d) = (4usize, 17usize, 64usize);
+        let x = t(det_normal(h * tt * d, 301), &[h, tt, d]);
+        let rope_cpu = Rope::span(5, tt, 32, 10000.0, &cpu)?;
+        let rope_gpu = Rope::span(5, tt, 32, 10000.0, &dev)?;
+        let r_want = rope_cpu.apply(&x)?;
+        let r_got = rope_gpu.apply(&x.to_device(&dev)?)?.to_device(&cpu)?;
+        assert!(rel_err(&r_got, &r_want)? < 1e-5, "partial fused RoPE mismatch");
+
+        let cos = t(det_normal(tt * (d / 2), 302), &[tt, d / 2]);
+        let sin = t(det_normal(tt * (d / 2), 303), &[tt, d / 2]);
+        let p_want = rotate_pairs(&x, &cos, &sin)?;
+        let p_got = rotate_pairs(&x.to_device(&dev)?, &cos.to_device(&dev)?, &sin.to_device(&dev)?)?.to_device(&cpu)?;
+        assert!(rel_err(&p_got, &p_want)? < 1e-5, "fused rotate_pairs mismatch");
+
+        // 2) Causal FlashAttention (whole-sequence GQA) + split-KV 1x4096 trust check
+        let (hq, hkv, d_attn, len) = (8usize, 2usize, 128usize, 48usize);
+        let scale = 1.0 / (d_attn as f64).sqrt();
+        let q = t(det_normal(hq * len * d_attn, 310), &[hq, len, d_attn]);
+        let k = t(det_normal(hkv * len * d_attn, 311), &[hkv, len, d_attn]);
+        let v = t(det_normal(hkv * len * d_attn, 312), &[hkv, len, d_attn]);
+        let ca_want = causal_attention(&q, &k, &v, scale, &Causal::new(len, 16, &cpu)?)?;
+        let ca_got = causal_attention(&q.to_device(&dev)?, &k.to_device(&dev)?, &v.to_device(&dev)?, scale, &Causal::new(len, 16, &dev)?)?.to_device(&cpu)?;
+        assert!(rel_err(&ca_got, &ca_want)? < 1e-3, "causal_attention CUDA FlashAttn mismatch");
+
+        // 3) Preallocated BHSD LayerCache + flash_attn_blocks (prefill -> decode 1 -> speculative 4)
+        let kt = k.transpose(1, 2)?.contiguous()?;
+        let cut = |ten: &Tensor, dim: usize, s: usize, l: usize| ten.narrow(dim, s, l).unwrap().contiguous().unwrap();
+        let mut lc_cpu = LayerCache::new(None);
+        let mut lc_gpu = LayerCache::with_capacity(None, len + 16);
+        let prefill = 32usize;
+        lc_cpu.push(&cut(&kt, 2, 0, prefill), &cut(&v, 1, 0, prefill))?;
+        lc_gpu.push(&cut(&kt, 2, 0, prefill).to_device(&dev)?, &cut(&v, 1, 0, prefill).to_device(&dev)?)?;
+        assert_eq!(lc_gpu.stored_bytes(), lc_cpu.stored_bytes());
+
+        for (step_off, step_n) in [(prefill, 1usize), (prefill + 1, 4usize)] {
+            let m_cpu = StepMask::new(AttnMode::Causal, step_n, hq / hkv, &cpu)?;
+            let m_gpu = StepMask::new(AttnMode::Causal, step_n, hq / hkv, &dev)?;
+            let q_s = cut(&q, 1, step_off, step_n);
+            let kt_s = cut(&kt, 2, step_off, step_n);
+            let v_s = cut(&v, 1, step_off, step_n);
+            let want = lc_cpu.attend(&q_s, &kt_s, &v_s, &m_cpu, scale)?;
+            let got = lc_gpu
+                .attend(&q_s.to_device(&dev)?, &kt_s.to_device(&dev)?, &v_s.to_device(&dev)?, &m_gpu, scale)?
+                .to_device(&cpu)?;
+            let err = rel_err(&got, &want)?;
+            assert!(err < 1e-3, "LayerCache flash_attn_blocks step n={step_n}: rel_err={err:.2e}");
+            lc_cpu.push(&kt_s, &v_s)?;
+            lc_gpu.push(&kt_s.to_device(&dev)?, &v_s.to_device(&dev)?)?;
+            assert_eq!(lc_gpu.stored_bytes(), lc_cpu.stored_bytes());
+        }
+        println!("[DEVICE-CHECK] {} flash_attn_blocks KV + causal_attention + fused RoPE OK", accel::backend_name(&dev));
         Ok(())
     }
 }

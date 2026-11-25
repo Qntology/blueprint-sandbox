@@ -9,14 +9,15 @@ members = ["crates/blueprint-cpu-kernels", "core", "tools/model-settings", "app/
 resolver = "2"
 
 [patch.crates-io]
-# 포크의 candle-core · candle-nn 으로 바꿉니다. Parts 1-6 커널·정밀도·LayerNorm(BUG LN-1) 수정(8559118)을 받습니다.
+# 포크의 candle-core · candle-nn 으로 바꿉니다. Qntology/candle-rocm-vulkan 통합 핀을 사용합니다.
 # 로컬 워킹트리로 바꾸려면 git 줄을 주석 처리하고 아래 path 줄의 주석을 푸세요.
-candle-core = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "855911873134d7a3f7206e78a9ac51cadfed28d3" }
-candle-nn = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "855911873134d7a3f7206e78a9ac51cadfed28d3" }
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "f73415d4d149d7949e8a6a94911af670e4e10f7f" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "f73415d4d149d7949e8a6a94911af670e4e10f7f" }
 # candle-core = { path = "../candle-rocm-vulkan/candle-core" }
 # candle-nn = { path = "../candle-rocm-vulkan/candle-nn" }
 
 [profile.dev]
+debug = 0
 incremental = true
 [profile.dev.package.candle-core]
 opt-level = 3

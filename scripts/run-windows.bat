@@ -14,6 +14,10 @@ setlocal
 cd /d "%~dp0.."
 
 set "BACKEND=%~1"
+if /i not "%BACKEND%"=="cuda" if /i not "%BACKEND%"=="rocm" if /i not "%BACKEND%"=="vulkan" (
+    echo [run] Usage: scripts\run-windows.bat ^<cuda^|rocm^|vulkan^> [example] [example arguments]
+    goto :failed
+)
 set "EXAMPLE=%~2"
 set "KEEP_WINDOW="
 if "%EXAMPLE%"=="" (

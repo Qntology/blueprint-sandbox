@@ -27,7 +27,7 @@ use super::ops::{gated_delta_state, gated_delta_state_on_host, gated_delta_step,
 use crate::ai::attention::{causal_attention, residual_rms_norm_inplace, rms_norm, AttnMode, Causal, LayerCache, Rope, StepMask, ATTN_QUERY_CHUNK};
 use crate::ai::head::{self, HeadMap};
 use crate::ai::kv_turbo::{self, KvCodec, KvShape};
-use crate::ai::residency::{estimate_group_bytes, headroom_bytes, Budget, Group, Loaded, ModelId, ModelSpec, Phase, Prepare, Requant, Residency, SharedResidency};
+use crate::ai::residency::{estimate_group_bytes, headroom_bytes_for, Budget, Group, Loaded, ModelId, ModelSpec, Phase, Prepare, Requant, Residency, SharedResidency};
 use crate::ai::speculative::{decode_stream, BlockDiffusion, Speculation, StreamModel, StreamOptions};
 use crate::ai::weights::WeightFile;
 
@@ -710,12 +710,25 @@ impl ZoroModel {
             gdn,
         };
         let mut layers = Vec::with_capacity(self.cfg.n_layers);
+        let mut pending_down: Option<Tensor> = None;
         for i in 0..self.cfg.n_layers {
-            let (y, pending) = self.layer(&ctx, blocks, i, x, Some(LayerRead { state: &state.layers[i], partial }))?;
-            x = y;
+            let (next_x, down, pending) = self.layer_step(
+                &ctx,
+                blocks,
+                i,
+                x,
+                pending_down.as_ref(),
+                Some(LayerRead { state: &state.layers[i], partial }),
+            )?;
+            x = next_x;
+            pending_down = Some(down);
             layers.push(pending.ok_or_else(|| anyhow!("층 {i} 의 상태가 없습니다"))?);
         }
-        Ok((rms_norm(&x, output.dense("output_norm.weight")?, self.cfg.rms_eps)?, PendingRead { layers, n }))
+        let normed = match pending_down {
+            Some(delta) => residual_rms_norm_inplace(x, &delta, output.dense("output_norm.weight")?, self.cfg.rms_eps)?.1,
+            None => rms_norm(&x, output.dense("output_norm.weight")?, self.cfg.rms_eps)?,
+        };
+        Ok((normed, PendingRead { layers, n }))
     }
 
     /// 읽은 토큰 앞 `keep` 개를 상태에 넣습니다. 전부가 아니면 선형 주의는 순환 입력으로 그 자리의 상태를 다시 계산합니다.
@@ -863,7 +876,7 @@ impl ZoroModel {
         let loaded = res.enter(&self.spec, &self.generation_phase())?;
         let (blocks, output, table) = (&loaded[0], &loaded[1], &loaded[2]);
         let planned_tokens = prompt.len() + opts.max_tokens;
-        let codec = kv_turbo::plan(&self.kv_shape(planned_tokens), &device, res.free_bytes(), headroom_bytes())?;
+        let codec = kv_turbo::plan(&self.kv_shape(planned_tokens), &device, res.free_bytes(), headroom_bytes_for(&device))?;
 
         let t = Instant::now();
         let mut state = self.new_state_with_capacity(codec, planned_tokens);
@@ -906,9 +919,30 @@ impl ZoroModel {
     }
 
     fn layer(&self, ctx: &Ctx, w: &Loaded, i: usize, x: Tensor, read: Option<LayerRead<'_>>) -> Result<(Tensor, Option<PendingLayer>)> {
+        let (x, down, pending) = self.layer_step(ctx, w, i, x, None, read)?;
+        Ok(((x + down)?, pending))
+    }
+
+    /// 🌟 [SPD-08] 직전 층의 FFN 잔차(`pending_down`)를 이번 층 `attn_norm` 과 인플레이스 융합하여
+    /// 층 경계 커널 발사를 2회 → 1회로 줄입니다.
+    fn layer_step(
+        &self,
+        ctx: &Ctx,
+        w: &Loaded,
+        i: usize,
+        x: Tensor,
+        pending_down: Option<&Tensor>,
+        read: Option<LayerRead<'_>>,
+    ) -> Result<(Tensor, Tensor, Option<PendingLayer>)> {
         let p = |s: &str| format!("blk.{i}.{s}");
         let eps = self.cfg.rms_eps;
-        let h = rms_norm(&x, w.dense(&p("attn_norm.weight"))?, eps)?;
+        let (x, h) = match pending_down {
+            Some(delta) => residual_rms_norm_inplace(x, delta, w.dense(&p("attn_norm.weight"))?, eps)?,
+            None => {
+                let normed = rms_norm(&x, w.dense(&p("attn_norm.weight"))?, eps)?;
+                (x, normed)
+            }
+        };
         let (mix, pending) = match (self.cfg.kind(i), read) {
             (LayerKind::LinearAttention, None) => self.linear_attention(ctx, w, i, &h, None)?,
             (LayerKind::FullAttention, None) => self.full_attention(ctx, w, i, &h, None)?,
@@ -921,7 +955,7 @@ impl ZoroModel {
         let (x, h) = residual_rms_norm_inplace(x, &mix, w.dense(&p("post_attention_norm.weight"))?, eps)?;
         let act = w.fused_gate_up_silu(&p("ffn_gate.weight"), &p("ffn_up.weight"), &h)?;
         let down = w.linear(&p("ffn_down.weight"), &act)?;
-        Ok(((x + down)?, pending))
+        Ok((x, down, pending))
     }
 
     /// 출력 게이트가 있는 전체 주의. `attn_q` 의 출력은 헤드마다 [질의 | 게이트] 로 나뉩니다.
@@ -996,6 +1030,7 @@ impl ZoroModel {
 }
 
 /// 잰 장치에서만 추측합니다. 순전파 비용이 행 수에 비례하면 추측이 오히려 손해이기 때문입니다.
+/// CUDA 도 ROCm 과 같이 묶음 검증이 빠르므로 추측 디코딩을 활성화합니다.
 fn speculation_for(device: &Device, has_masks: bool) -> Speculation {
     if (device.is_rocm() || device.is_cuda()) && has_masks {
         ROCM_SPECULATION
